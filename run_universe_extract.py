@@ -487,7 +487,7 @@ def run_universe_extract(
     metric_names = list(metrics_config.keys())
 
     base_columns = ["ticker", "cik", "name", "sector", "end", "fy", "fp", "form", "filed", "accn"]
-    quarter_columns = base_columns + [m for m in metric_names] + [f"{m}_Quarter" for m in metric_names]
+    quarter_columns = base_columns + [m for m in metric_names] + [f"{m}_Quarter" for m in metric_names] + ["balance_sheet_ok", "bs_diff_pct"]
 
     # CIK당 1회만 parse한 결과를 재사용하기 위한 캐시
     cik_to_extracted: Dict[str, Dict[str, Any]] = {}
@@ -583,6 +583,8 @@ def run_universe_extract(
                     for m in metric_names:
                         row[m] = q.get(m)
                         row[f"{m}_Quarter"] = q.get(f"{m}_Quarter")
+                    row["balance_sheet_ok"] = q.get("balance_sheet_ok")
+                    row["bs_diff_pct"] = q.get("bs_diff_pct")
                     out_rows.append(row)
                 continue
 
@@ -606,6 +608,8 @@ def run_universe_extract(
                 for m in metric_names:
                     row[m] = q.get(m)
                     row[f"{m}_Quarter"] = q.get(f"{m}_Quarter")
+                row["balance_sheet_ok"] = q.get("balance_sheet_ok")
+                row["bs_diff_pct"] = q.get("bs_diff_pct")
                 out_rows.append(row)
             continue
 
@@ -659,6 +663,8 @@ def run_universe_extract(
             for m in metric_names:
                 row[m] = q.get(m)
                 row[f"{m}_Quarter"] = q.get(f"{m}_Quarter")
+            row["balance_sheet_ok"] = q.get("balance_sheet_ok")
+            row["bs_diff_pct"] = q.get("bs_diff_pct")
             out_rows.append(row)
 
     # ---------- Post-retry: fetch_error 항목만 CIK별 1회 재시도 (PATCH: 들여쓰기/구조 정리, 404 제외, 캐시 갱신, report_only 분기) ----------
@@ -738,6 +744,8 @@ def run_universe_extract(
                                 for m in metric_names:
                                     row[m] = q.get(m)
                                     row[f"{m}_Quarter"] = q.get(f"{m}_Quarter")
+                                row["balance_sheet_ok"] = q.get("balance_sheet_ok")
+                                row["bs_diff_pct"] = q.get("bs_diff_pct")
                                 out_rows.append(row)
                         r = report_rows[report_idx]
                         report_rows[report_idx] = {
@@ -769,15 +777,18 @@ def run_universe_extract(
             log.info("post-retry round %s 완료: 성공=%s, 실패=%s", round_no, round_ok, round_fail)
         stats["fetch_error_final"] = sum(1 for r in report_rows if r.get("reason") == "fetch_error_final")
 
-    # 저장 (PATCH: report_only면 quarterly 미생성/미저장)
+    # 저장 (PATCH: report_only면 quarterly 미생성/미저장).
+    # 결측→0 오염 방지: fillna(0)/na_rep=0 사용 금지. 결측은 NaN(빈칸) 유지.
     report_columns = ["ticker", "name", "reason", "cik", "error", "http_status", "last_err", "attempts_used"]
     if not report_only:
-        output_quarterly.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_quarterly, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=quarter_columns, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(out_rows)
-        log.info("저장: %s (rows=%s)", output_quarterly, len(out_rows))
+        from csv_export_guard import write_quarterly_csv_no_fillna0
+        write_quarterly_csv_no_fillna0(
+            out_rows,
+            output_quarterly,
+            quarter_columns,
+            sanitize=True,
+            diagnostic=True,
+        )
     with open(output_report, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=report_columns, extrasaction="ignore")
         writer.writeheader()

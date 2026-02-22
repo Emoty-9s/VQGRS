@@ -81,65 +81,91 @@ log = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 TAG_MAP = {
     "Revenue": [
-        "Revenues",
-        "SalesRevenueNet",
+        "Revenues", "SalesRevenueNet", 
         "RevenueFromContractWithCustomerExcludingAssessedTax",
         "RevenueFromContractWithCustomerIncludingAssessedTax",
+        # [유틸리티 특화]
+        "RegulatedAndUnregulatedOperatingRevenue", "UtilityOperatingRevenue",
+        "ElectricUtilityOperatingRevenue", "PublicUtilitiesRevenue", 
+        "GasUtilityOperatingRevenue", "WaterUtilityOperatingRevenue",
+        # [헬스케어/바이오 특화 (매출 없는 바이오텍 대응)]
+        "LicenseAndCollaborationRevenue", "ResearchAndDevelopmentRevenue",
+        "RevenueFromGrants", "ContractWithCustomerLiabilityRevenueRecognized",
+        "HealthCareOrganizationRevenue",
+        # [부동산/리츠 특화]
+        "RentalRevenueGoodsAndServices", "RealEstateRevenueNet", 
+        "RentalIncomeNonoperating",
+        # [에너지 특화]
+        "OilAndGasRevenue",
+        # [금융주]
+        "InterestAndDividendIncomeOperating", "InvestmentIncomeNet", 
+        "BankingRevenue", "NoninterestIncome"
     ],
     "OperatingIncome": [
         "OperatingIncomeLoss",
+        "OperatingProfitLoss",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxes",
+        "RealEstateOperatingIncome"
     ],
     "NetIncome": [
-        "NetIncomeLoss",
-        "ProfitLoss",
+        "NetIncomeLoss", "ProfitLoss", 
+        "NetIncomeLossAvailableToCommonStockholdersBasic"
     ],
     "InterestExpense": [
-        "InterestExpense",
-        "InterestExpenseNonoperating",
-        "InterestAndDebtExpense",
-        "InterestExpenseBorrowings",
-        "InterestExpenseDebt",
-        "InterestCostsIncurred",
-        "InterestPaidNet",
-        "InterestPaid",
+        "InterestExpense", "InterestExpenseNonoperating", 
+        "InterestAndDebtExpense", "InterestExpenseBorrowings",
+        "InterestPaidNet", "InterestPaid"
     ],
     "PretaxIncome": [
         "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
         "IncomeLossFromContinuingOperationsBeforeIncomeTaxes",
+        "IncomeLossFromContinuingOperationsBeforeTax"
     ],
     "IncomeTaxExpense": [
         "IncomeTaxExpenseBenefit",
+        "CurrentIncomeTaxExpenseBenefit"
     ],
     "OCF": [
         "NetCashProvidedByUsedInOperatingActivities",
+        "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"
     ],
     "CAPEX": [
         "PaymentsToAcquirePropertyPlantAndEquipment",
+        "CapitalExpenditures",
+        "PaymentsToAcquireProductiveAssets",
+        # [부동산/리츠 보완]
+        "PaymentsToAcquireRealEstate",
+        "PaymentsToAcquireAndDevelopRealEstate",
+        "PaymentsForCapitalImprovements", 
+        "PaymentsToDevelopRealEstateAssets",
+        # [에너지 보완]
+        "PaymentsToAcquireOilAndGasProperty",
+        "PaymentsForExplorationAndDevelopmentOfOilAndGasProperties"
     ],
-    "Assets": [
-        "Assets",
-    ],
-    "Liabilities": [
-        "Liabilities",
-    ],
+    "Assets": ["Assets", "AssetsTotal"],
+    "Liabilities": ["Liabilities", "LiabilitiesTotal"],  # 총부채만; LiabilitiesCurrent는 별도 metric
     "Equity": [
-        "StockholdersEquity",
+        "StockholdersEquity", 
         "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+        "CommonStockholdersEquity", "PartnersCapital"
     ],
     "Cash": [
         "CashAndCashEquivalentsAtCarryingValue",
+        "CashCashEquivalentsRestrictedCashAndCashEquivalents",
+        "Cash"
     ],
     "SharesOutstanding": [
-        "EntityCommonStockSharesOutstanding",   # dei
-        "CommonStockSharesOutstanding",         # us-gaap
+        "EntityCommonStockSharesOutstanding",
+        "CommonStockSharesOutstanding",
+        "CommonStockSharesIssued",
+        "WeightedAverageNumberOfSharesOutstandingBasic"
     ],
     "WeightedAvgSharesDiluted": [
         "WeightedAverageNumberOfDilutedSharesOutstanding",
-        "WeightedAverageNumberOfSharesOutstandingDiluted",
+        "WeightedAverageNumberOfSharesOutstandingDiluted"
     ],
-    "EPSDiluted": [
-        "EarningsPerShareDiluted",
-    ],
+    "EPSDiluted": ["EarningsPerShareDiluted"],
     # --- 확장: Income Statement FLOW, unit=USD (후보군 우선순위 = 리스트 순서, 그룹별 slot fallback) ---
     "CostOfRevenue": [["CostOfRevenue"], ["CostOfGoodsAndServicesSold"]],
     "GrossProfit": [["GrossProfit"]],  # derived fallback: Revenue - CostOfRevenue
@@ -147,7 +173,15 @@ TAG_MAP = {
     "SGnA": [["SellingGeneralAndAdministrativeExpense"], ["GeneralAndAdministrativeExpense"]],
     "RD": [["ResearchAndDevelopmentExpense"]],
     # Cashflow / Non-cash FLOW
-    "DepreciationAmortization": [["DepreciationDepletionAndAmortization"], ["DepreciationAndAmortization"]],
+    "DepreciationAmortization": [
+        "DepreciationDepletionAndAmortization", 
+        "DepreciationAndAmortization",
+        # [IT/소프트웨어 및 금융 보완]
+        "AmortizationOfIntangibleAssets",
+        "Depreciation",
+        "AmortizationOfCapitalizedComputerSoftwareCosts",
+        "DepreciationAndAmortizationOfPropertyPlantAndEquipment"
+    ],
     "ShareBasedCompensation": [["ShareBasedCompensation"]],
     # Balance Sheet INSTANT
     "AssetsCurrent": [["AssetsCurrent"]],
@@ -1560,11 +1594,20 @@ def apply_derived_metrics(result: dict) -> None:
             r_rev = _float_val(rev_rows[i] if i < len(rev_rows) else None)
             r_cogs = _float_val(cogs_rows[i] if i < len(cogs_rows) else None)
             gp_val = _float_val(gp_rows[i] if i < len(gp_rows) else None)
-            if gp_val is None and r_rev is not None and r_cogs is not None:
+            # Revenue가 None/0인데 GrossProfit이 존재하면 오염 의심 → 플래그만 남기고 파생 금지
+            if (r_rev is None or abs(r_rev) < 1e-12) and gp_val is not None and gp_val > 0:
+                if isinstance(gp_rows[i], dict):
+                    gp_rows[i]["contamination_flag"] = "GP_PRESENT_REV_MISSING_OR_ZERO"
+                continue
+            # Revenue가 None이거나 0이면 파생 금지 (오염 방지: GrossProfit > Revenue 불가능)
+            if r_rev is None or abs(r_rev) < 1e-12:
+                continue
+            if gp_val is None and r_cogs is not None:
                 derived = r_rev - r_cogs
                 if gp_rows[i] is not None and isinstance(gp_rows[i], dict):
                     gp_rows[i]["val"] = derived
                     gp_rows[i]["derived"] = True
+                    gp_rows[i]["derived_source"] = "REV-COGS"
                     log.info("GrossProfit slot i=%s derived=Revenue-CostOfRevenue val=%s", i, derived)
         if rev_q is not None and cogs_q is not None and result.get(gp_q_key) is not None:
             qlist = result[gp_q_key]
@@ -1572,7 +1615,9 @@ def apply_derived_metrics(result: dict) -> None:
                 rq = _float_val(rev_q[i] if i < len(rev_q) else None)
                 cq = _float_val(cogs_q[i] if i < len(cogs_q) else None)
                 gq = _float_val(qlist[i] if i < len(qlist) else None)
-                if gq is None and rq is not None and cq is not None:
+                if rq is None or abs(rq) < 1e-12:
+                    continue
+                if gq is None and cq is not None:
                     qlist[i] = rq - cq
 
     # OperatingExpenses: tag 없으면 SGnA + RD (slot + _Quarter)
@@ -1592,6 +1637,7 @@ def apply_derived_metrics(result: dict) -> None:
                 if opex_rows[i] is not None and isinstance(opex_rows[i], dict):
                     opex_rows[i]["val"] = derived
                     opex_rows[i]["derived"] = True
+                    opex_rows[i]["derived_source"] = "SGnA+RD"
                     log.info("OperatingExpenses slot i=%s derived=SGnA+RD val=%s", i, derived)
         if result.get(opex_q_key) is not None and (sgna_q is not None or rd_q is not None):
             qlist = result[opex_q_key]
@@ -1615,6 +1661,42 @@ def apply_derived_metrics(result: dict) -> None:
                 diff = (g - o) - oi
                 if abs(diff) > 1e-3:
                     log.debug("OperatingIncome cross-check slot i=%s gross-opex=%s OperatingIncome=%s diff=%s", i, g - o, oi, diff)
+
+
+def validate_balance_sheet_in_result(result: dict, tol: float = 0.01) -> None:
+    """
+    result 내부 슬롯별로 Assets ~= Liabilities + Equity 검증 플래그를 추가한다.
+    - tol: 허용 오차 비율 (기본 1%). bs_diff_pct > tol 이면 balance_sheet_ok=False.
+    - Assets가 None이면 해당 슬롯은 skip(None).
+    """
+    slots = result.get("_slots") or []
+    n = len(slots)
+    if n == 0:
+        return
+
+    assets_rows = result.get("Assets") or []
+    liab_rows = result.get("Liabilities") or []
+    eq_rows = result.get("Equity") or []
+
+    bs_ok_list: list[bool | None] = []
+    bs_diff_list: list[float | None] = []
+
+    for i in range(n):
+        A = _float_val(assets_rows[i] if i < len(assets_rows) else None)
+        L = _float_val(liab_rows[i] if i < len(liab_rows) else None)
+        E = _float_val(eq_rows[i] if i < len(eq_rows) else None)
+
+        if A is None or abs(A) < 1e-12 or L is None or E is None:
+            bs_ok_list.append(None)
+            bs_diff_list.append(None)
+            continue
+
+        diff = abs(A - (L + E)) / abs(A)
+        bs_diff_list.append(diff)
+        bs_ok_list.append(diff <= tol)
+
+    result["balance_sheet_ok"] = bs_ok_list
+    result["bs_diff_pct"] = bs_diff_list
 
 
 def extract_company_metrics(
@@ -1683,6 +1765,7 @@ def extract_company_metrics(
         result[metric] = row_list
     normalize_flow_to_quarter_only(result)
     apply_derived_metrics(result)
+    validate_balance_sheet_in_result(result, tol=0.01)
     # chosen_tags: 가장 많이 채워진 tag (또는 첫 non-null tag)
     chosen_tags = {}
     for metric in config:
@@ -1714,6 +1797,10 @@ def extract_company_metrics(
                 q[qkey] = qvals[i]
             else:
                 q[qkey] = None
+        bs_ok_list = result.get("balance_sheet_ok") or []
+        bs_diff_list = result.get("bs_diff_pct") or []
+        q["balance_sheet_ok"] = bs_ok_list[i] if i < len(bs_ok_list) else None
+        q["bs_diff_pct"] = bs_diff_list[i] if i < len(bs_diff_list) else None
         quarters.append(q)
     return {"cik": cik, "chosen_tags": chosen_tags, "quarters": quarters}
 
@@ -1921,6 +2008,7 @@ def get_latest_quarters(cik: str, N: int = DEFAULT_QUARTERS) -> dict:
         result[item_name] = row_list
     normalize_flow_to_quarter_only(result)
     apply_derived_metrics(result)
+    validate_balance_sheet_in_result(result, tol=0.01)
     return result
 
 
@@ -1932,6 +2020,8 @@ def _print_quarters(data: dict, cik: str) -> None:
     slots = data.get("_slots") or []
     slots_fetch = data.get("_slots_fetch") or slots
     anchor = data.get("_anchor")
+    bs_ok = data.get("balance_sheet_ok") or []
+    bs_diff = data.get("bs_diff_pct") or []
     print(f"\n=== CIK {cik} (슬롯 기반, OUTPUT_N={len(slots)} / FETCH_N={len(slots_fetch)}) ===")
     print(f"  _anchor = {anchor}")
     print(f"  _slots  = {slots}\n")
@@ -1970,6 +2060,12 @@ def _print_quarters(data: dict, cik: str) -> None:
                 slot = slots[i] if i < len(slots) else ""
                 print(f"    slot={slot}  val={val}")
         print()
+    print("  [BALANCE_SHEET_CHECK]")
+    for i, slot in enumerate(slots):
+        ok = bs_ok[i] if i < len(bs_ok) else None
+        diff = bs_diff[i] if i < len(bs_diff) else None
+        print(f"    end={slot}  ok={ok}  diff_pct={diff}")
+    print()
 
 
 # -----------------------------------------------------------------------------

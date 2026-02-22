@@ -1,6 +1,10 @@
-﻿cache/
-output/
+﻿.venv/
+data/
+.companyfacts_cache/
+*.parquet
+*.csv
+*.json
+*.log
+.env
 __pycache__/
 *.pyc
-.env
-.DS_Store
