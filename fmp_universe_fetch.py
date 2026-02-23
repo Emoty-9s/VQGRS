@@ -1,18 +1,16 @@
 # -*- coding: utf-8 -*-
-"""
+r"""
 FMP Premium: universe_list.csv 기반 최근 5년(분기 20개) 재무 + 시장/기술 지표 수집.
 
 - 입력: universe_list.csv (symbol/ticker 컬럼)
-- 출력: fundamentals_quarterly.parquet/csv, market_snapshot.parquet/csv
+- 출력: fundamentals_quarterly.parquet/csv (fiscal_quarter 기준 anchor부터 연속 20회계분기), market_snapshot.parquet/csv
 - 결측은 0으로 치환하지 않음 (NaN 유지).
 - API Key: 환경변수 FMP_API_KEY (코드/로그 노출 금지).
+- 회계분기: FMP fiscalYear(우선)+period(Q1~Q4) → fiscal_quarter. 종목별 최신 분기(anchor)부터 과거 20개만 저장.
 
 실행 예:
-  python fmp_universe_fetch.py --universe /mnt/data/universe_list.csv --outdir ./data --period quarter --limit 20 --max-workers 30
-  python fmp_universe_fetch.py --universe universe_list.csv --outdir ./data --only-symbol AAPL,MSFT --skip-tech
-
-단건 테스트 (AAPL, 재무만):
-  .\.venv\Scripts\python.exe fmp_universe_fetch.py --universe universe_list.csv --outdir ./data --only-symbol AAPL --period quarter --limit 20 --max-workers 1 --skip-tech
+  python fmp_universe_fetch.py --universe .\data\universe_list.csv --outdir .\data --period quarter --limit 20 --max-workers 10
+  python fmp_universe_fetch.py --universe universe_list.csv --outdir .\data --only-symbol AAPL --period quarter --limit 20 --max-workers 1 --skip-tech
 """
 from __future__ import annotations
 
@@ -23,6 +21,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -83,7 +82,8 @@ CF_FIELDS: Dict[str, List[str]] = {
 }
 
 QUARTERLY_COLUMNS = [
-    "ticker_fixed", "ticker_raw", "name_raw", "match_type", "end",
+    "ticker_fixed", "ticker_raw", "name_raw", "match_type",
+    "fiscal_year", "fiscal_period", "fiscal_quarter", "end_date",
     "revenue", "operatingIncome", "netIncome", "interestExpense",
     "totalAssets", "totalLiabilities", "totalStockholdersEquity",
     "totalCurrentAssets", "totalCurrentLiabilities", "investedCapital", "sharesOutstanding",
@@ -94,6 +94,57 @@ SNAPSHOT_COLUMNS = [
     "price", "marketCap", "beta", "sector", "industry",
     "rsi14", "sma20", "sma50", "sma200",
 ]
+
+
+def make_fiscal_quarter_grid(anchor_fq: str, n: int = 20) -> List[str]:
+    """anchor_fq(예: 2025Q3)부터 과거로 연속 n개 회계분기 리스트. [2025Q3, 2025Q2, ...]."""
+    if not anchor_fq or len(anchor_fq) < 6:
+        return []
+    try:
+        y = int(anchor_fq[:4])
+        q_str = anchor_fq[4:].upper()
+        if not q_str.startswith("Q") or len(q_str) < 2:
+            return []
+        q = int(q_str[1])
+        if q < 1 or q > 4:
+            return []
+    except (ValueError, IndexError):
+        return []
+    out: List[str] = []
+    for _ in range(n):
+        out.append(f"{y}Q{q}")
+        q -= 1
+        if q < 1:
+            q = 4
+            y -= 1
+    return out
+
+
+def make_fiscal_quarter_range(anchor_fq: str, stop_fq: str, max_iter: int = 36) -> List[str]:
+    """anchor_fq부터 과거로 연속 fiscal_quarter 리스트 생성. stop_fq 포함되면 종료. 무한루프 방지로 max_iter 제한."""
+    if not anchor_fq or not stop_fq:
+        return []
+    try:
+        y = int(anchor_fq[:4])
+        q_str = anchor_fq[4:].upper()
+        if not q_str.startswith("Q") or len(q_str) < 2:
+            return []
+        q = int(q_str[1])
+        if q < 1 or q > 4:
+            return []
+    except (ValueError, IndexError):
+        return []
+    out: List[str] = []
+    for _ in range(max_iter):
+        fq = f"{y}Q{q}"
+        out.append(fq)
+        if fq == stop_fq:
+            break
+        q -= 1
+        if q < 1:
+            q = 4
+            y -= 1
+    return out
 
 
 def pick_value(d: Dict[str, Any], candidates: List[str]) -> Optional[float]:
@@ -298,24 +349,44 @@ def _rows_to_df(
     rows: List[Dict[str, Any]],
     fields_map: Dict[str, List[str]],
 ) -> pd.DataFrame:
+    """FMP row → fiscal_year(fiscalYear 우선, 없으면 calendarYear), fiscal_period(Q1~Q4), fiscal_quarter, end_date. (ticker_fixed, fiscal_quarter) 기준 end_date 최신 1건만 유지."""
+    required_cols = [
+        "ticker_fixed", "ticker_raw", "name_raw", "match_type",
+        "fiscal_year", "fiscal_period", "fiscal_quarter", "end_date",
+    ] + list(fields_map.keys())
     out: List[Dict[str, Any]] = []
     for r in rows or []:
-        end = r.get("date") or r.get("calendarYear")
-        if not end:
+        end_date = str(r.get("date") or "")[:10]
+        if not end_date or end_date == "None":
             continue
+        fy_raw = r.get("fiscalYear") if r.get("fiscalYear") is not None else r.get("calendarYear")
+        fy_num = pd.to_numeric(str(fy_raw).strip(), errors="coerce") if fy_raw is not None else pd.NA
+        if pd.isna(fy_num):
+            continue
+        fiscal_year = int(fy_num)
+        per = str(r.get("period") or "").strip().upper()
+        if per not in ("Q1", "Q2", "Q3", "Q4"):
+            continue
+        fiscal_quarter = f"{fiscal_year}{per}"
         row: Dict[str, Any] = {
             "ticker_fixed": ticker_fixed,
             "ticker_raw": ticker_raw,
             "name_raw": name_raw,
             "match_type": match_type,
-            "end": str(end)[:10],
+            "fiscal_year": fiscal_year,
+            "fiscal_period": per,
+            "fiscal_quarter": fiscal_quarter,
+            "end_date": end_date,
         }
         for out_key, candidates in fields_map.items():
             row[out_key] = pick_value(r, candidates)
         out.append(row)
+    if not out:
+        return pd.DataFrame(columns=required_cols)
     df = pd.DataFrame(out)
-    if not df.empty:
-        df = df.drop_duplicates(subset=["ticker_fixed", "end"]).sort_values("end", ascending=False)
+    df = df.reindex(columns=required_cols)
+    df = df.sort_values("end_date", ascending=False)
+    df = df.drop_duplicates(subset=["ticker_fixed", "fiscal_quarter"], keep="first")
     return df
 
 
@@ -324,8 +395,9 @@ def merge_quarterly(
     income: List[Dict[str, Any]],
     bs: List[Dict[str, Any]],
     cf: List[Dict[str, Any]],
-    limit: int,
+    years_back: int,
 ) -> pd.DataFrame:
+    """boundary 기반: anchor(최신 end_date)의 연도 - years_back 을 1월 1일로 boundary. end_date>=boundary 전부 + end_date<boundary 1개 포함, 연속 fiscal_quarter 그리드."""
     tf = str(row_meta.get("ticker_fixed") or "").strip().upper()
     tr = str(row_meta.get("ticker_raw") or "").strip()
     nr = str(row_meta.get("name_raw") or "").strip()
@@ -333,11 +405,58 @@ def merge_quarterly(
     df_i = _rows_to_df(tf, tr, nr, mt, income, INCOME_FIELDS)
     df_b = _rows_to_df(tf, tr, nr, mt, bs, BS_FIELDS)
     df_c = _rows_to_df(tf, tr, nr, mt, cf, CF_FIELDS)
-    df = df_i.merge(df_b, on=["ticker_fixed", "ticker_raw", "name_raw", "match_type", "end"], how="outer").merge(
-        df_c, on=["ticker_fixed", "ticker_raw", "name_raw", "match_type", "end"], how="outer"
-    )
-    df = df.sort_values("end", ascending=False).head(limit)
-    return df
+    if df_i.empty and df_b.empty and df_c.empty:
+        return pd.DataFrame(columns=QUARTERLY_COLUMNS)
+    df = df_i.merge(df_b, on=["ticker_fixed", "fiscal_quarter"], how="outer", suffixes=("", "_b"))
+    if "end_date_b" in df.columns:
+        df["end_date"] = df["end_date"].fillna(df["end_date_b"])
+    df = df.drop(columns=[c for c in df.columns if c.endswith("_b")], errors="ignore")
+    df = df.merge(df_c, on=["ticker_fixed", "fiscal_quarter"], how="outer", suffixes=("", "_c"))
+    if "end_date_c" in df.columns:
+        df["end_date"] = df["end_date"].fillna(df["end_date_c"])
+    df = df.drop(columns=[c for c in df.columns if c.endswith("_c")], errors="ignore")
+    if "fiscal_quarter" not in df.columns:
+        df["fiscal_quarter"] = pd.NA
+    if "end_date" not in df.columns:
+        df["end_date"] = pd.NA
+    df["_end_dt"] = pd.to_datetime(df["end_date"], errors="coerce")
+    valid = df.dropna(subset=["_end_dt", "fiscal_quarter"])
+    if valid.empty:
+        return pd.DataFrame(columns=QUARTERLY_COLUMNS)
+    anchor_row = valid.loc[valid["_end_dt"].idxmax()]
+    anchor_dt = anchor_row["_end_dt"]
+    anchor_fq = str(anchor_row["fiscal_quarter"])
+    boundary_dt = datetime(anchor_dt.year - years_back, 1, 1)
+    keep_main = df[df["_end_dt"] >= boundary_dt].copy()
+    pre = df[df["_end_dt"] < boundary_dt]
+    if pre.empty:
+        keep = keep_main
+    else:
+        pre_one = pre.loc[pre["_end_dt"].idxmax()]
+        keep = pd.concat([keep_main, pd.DataFrame([pre_one])], ignore_index=True)
+    keep = keep.dropna(subset=["fiscal_quarter"])
+    keep = keep.sort_values("_end_dt", ascending=False).drop_duplicates(subset=["ticker_fixed", "fiscal_quarter"], keep="first")
+    if keep.empty:
+        return pd.DataFrame(columns=QUARTERLY_COLUMNS)
+    stop_row = keep.loc[keep["_end_dt"].idxmin()]
+    stop_fq = str(stop_row["fiscal_quarter"])
+    max_iter = years_back * 4 + 16
+    grid = make_fiscal_quarter_range(anchor_fq, stop_fq, max_iter=max_iter)
+    if not grid:
+        return pd.DataFrame(columns=QUARTERLY_COLUMNS)
+    keep_clean = keep.drop(columns=["_end_dt"], errors="ignore")
+    base = pd.DataFrame({"ticker_fixed": [tf] * len(grid), "fiscal_quarter": grid})
+    merged = base.merge(keep_clean, on=["ticker_fixed", "fiscal_quarter"], how="left")
+    merged["fiscal_year"] = pd.to_numeric(merged["fiscal_quarter"].astype(str).str[:4], errors="coerce")
+    merged["fiscal_period"] = merged["fiscal_quarter"].astype(str).str[4:]
+    merged["ticker_raw"] = tr
+    merged["name_raw"] = nr
+    merged["match_type"] = mt
+    if "end_date" not in merged.columns:
+        merged["end_date"] = pd.NA
+    merged["_ord"] = merged["fiscal_quarter"].map({s: i for i, s in enumerate(grid)})
+    merged = merged.sort_values("_ord").drop(columns=["_ord"])
+    return merged
 
 
 def read_universe(path: str | Path) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -400,6 +519,7 @@ def process_symbol(
     api_key: str,
     period: str,
     limit: int,
+    years_back: int,
     skip_market: bool,
     skip_tech: bool,
     call_counter: Dict[str, Any],
@@ -409,20 +529,21 @@ def process_symbol(
     sym = str(row.get("ticker_fixed") or "").strip().upper()
     if not sym:
         raise RuntimeError("row has no ticker_fixed")
+    fetch_limit = limit + 8
     raw: Dict[str, Any] = {} if save_raw_dir else {}
     income: List[Dict[str, Any]] = []
     bs: List[Dict[str, Any]] = []
     cf: List[Dict[str, Any]] = []
     try:
-        income = fetch_income(session, rl, api_key, sym, period, limit, call_counter)
+        income = fetch_income(session, rl, api_key, sym, period, fetch_limit, call_counter)
     except Exception as e:
         log.debug("%s income: %s", sym, e)
     try:
-        bs = fetch_balance(session, rl, api_key, sym, period, limit, call_counter)
+        bs = fetch_balance(session, rl, api_key, sym, period, fetch_limit, call_counter)
     except Exception as e:
         log.debug("%s balance: %s", sym, e)
     try:
-        cf = fetch_cashflow(session, rl, api_key, sym, period, limit, call_counter)
+        cf = fetch_cashflow(session, rl, api_key, sym, period, fetch_limit, call_counter)
     except Exception as e:
         log.debug("%s cashflow: %s", sym, e)
     if not income and not bs:
@@ -431,7 +552,7 @@ def process_symbol(
         raw["income"] = income
         raw["balance"] = bs
         raw["cashflow"] = cf
-    qdf = merge_quarterly(row, income, bs, cf, limit)
+    qdf = merge_quarterly(row, income, bs, cf, years_back)
 
     market_row: Optional[Dict[str, Any]] = None
     if not skip_market:
@@ -569,12 +690,13 @@ def main() -> None:
     ap.add_argument("--universe", required=True, help="universe_list.csv 경로")
     ap.add_argument("--outdir", required=True, help="출력 디렉터리")
     ap.add_argument("--period", default="quarter", help="period=quarter")
-    ap.add_argument("--limit", type=int, default=20, help="분기 개수 (최근 5년=20)")
+    ap.add_argument("--limit", type=int, default=20, help="FMP fetch 시 가져올 최소 분기 수 (내부적으로 limit+8 사용)")
+    ap.add_argument("--years-back", type=int, default=5, help="anchor 연도 기준 boundary (years_back년 전 1월 1일). end_date>=boundary 전부 + 이전 1개 포함")
     ap.add_argument("--max-workers", type=int, default=1, help="동시 스레드 수 (1=순차, 20~50 권장)")
     ap.add_argument("--only-symbol", default="", help="테스트용: AAPL,MSFT 처럼 일부만")
     ap.add_argument("--skip-market", action="store_true", help="시장/기술 수집 생략")
     ap.add_argument("--skip-tech", action="store_true", help="RSI/SMA 수집 생략")
-    ap.add_argument("--use-cache", action="store_true", help="이미 저장된 symbol은 재호출 스킵")
+    ap.add_argument("--use-cache", action="store_true", help="이미 저장된 symbol은 재호출 스킵 (quarterly는 fiscal_quarter 스키마일 때만 병합)")
     ap.add_argument("--save-raw", action="store_true", help="raw JSON 응답 저장 (outdir/raw/)")
     args = ap.parse_args()
 
@@ -634,6 +756,7 @@ def main() -> None:
             qdf, mrow, _ = process_symbol(
                 row, session, rl, api_key,
                 args.period, args.limit,
+                args.years_back,
                 args.skip_market, args.skip_tech,
                 call_counter, save_raw_dir,
             )
@@ -698,24 +821,44 @@ def main() -> None:
 
     if skipped_ticker_fixed:
         existing_q_df, existing_m_rows = load_cached_data_for_symbols(outdir, skipped_ticker_fixed, args.skip_market)
-        if not existing_q_df.empty:
+        if not existing_q_df.empty and "fiscal_quarter" in existing_q_df.columns:
             all_quarterly.append(existing_q_df)
             key_col = "ticker_fixed" if "ticker_fixed" in existing_q_df.columns else "symbol"
             quarter_counts.extend(existing_q_df.groupby(key_col).size().tolist())
+        elif not existing_q_df.empty:
+            log.warning("캐시된 quarterly는 이전 스키마(end 기준)라 사용하지 않습니다. 해당 종목은 재수집하세요.")
         market_rows = existing_m_rows + market_rows
 
     elapsed = time.time() - start_time
 
-    # 저장 (결측은 0으로 채우지 않음. NaN 유지)
+    # 저장 (결측은 0으로 채우지 않음. NaN 유지). (ticker_fixed, fiscal_quarter) 기준 end_date 최신 1건만 유지. NA인 fiscal_quarter는 dedupe 제외
     if all_quarterly:
         dfq = pd.concat(all_quarterly, ignore_index=True)
-        dfq = dfq.reindex(columns=QUARTERLY_COLUMNS, copy=False)
+        dfq = dfq.sort_values(["ticker_fixed", "end_date"], ascending=[True, False], na_position="last")
+        has_fq = dfq["fiscal_quarter"].notna() if "fiscal_quarter" in dfq.columns else pd.Series(False, index=dfq.index)
+        dfq1 = dfq[has_fq].drop_duplicates(subset=["ticker_fixed", "fiscal_quarter"], keep="first")
+        dfq2 = dfq[~has_fq]
+        dfq = pd.concat([dfq1, dfq2], ignore_index=True)
+        for c in ("fiscal_year", "fiscal_period", "fiscal_quarter", "end_date"):
+            if c not in dfq.columns:
+                dfq[c] = pd.NA
+        dfq = dfq.reindex(columns=QUARTERLY_COLUMNS)
         outdir.mkdir(parents=True, exist_ok=True)
         dfq.to_parquet(outdir / "fundamentals_quarterly.parquet", index=False)
         dfq.to_csv(outdir / "fundamentals_quarterly.csv", index=False)
+        if not dfq.empty and "ticker_fixed" in dfq.columns:
+            per_ticker = dfq.groupby("ticker_fixed").size()
+            min_r, max_r = int(per_ticker.min()), int(per_ticker.max())
+            log.info("fundamentals_quarterly: ticker_fixed별 행 수 분포 min=%s max=%s", min_r, max_r)
+            aapl = dfq[dfq["ticker_fixed"] == "AAPL"]
+            if not aapl.empty:
+                log.info(
+                    "AAPL 상위 6개 fiscal_quarter/end_date: %s",
+                    aapl[["fiscal_quarter", "end_date"]].head(6).to_dict("records"),
+                )
     if market_rows:
         dfm = pd.DataFrame(market_rows)
-        dfm = dfm.reindex(columns=SNAPSHOT_COLUMNS, copy=False)
+        dfm = dfm.reindex(columns=SNAPSHOT_COLUMNS)
         dfm.to_parquet(outdir / "market_snapshot.parquet", index=False)
         dfm.to_csv(outdir / "market_snapshot.csv", index=False)
 
