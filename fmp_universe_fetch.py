@@ -21,7 +21,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -47,8 +47,24 @@ PATH_QUOTE = "/stable/quote"
 PATH_PROFILE = "/stable/profile"  # stable 사용 (v3 대신)
 
 # 기술 지표: legacy (stable 경로로 바꾸려면 여기만 수정)
-# 예: stable RSI = /stable/technical-indicators/rsi?symbol=AAPL&periodLength=10&timeframe=1day
-PATH_TECH_DAILY_LEGACY = "/api/v3/technical_indicator/daily"  # /daily/{symbol}?type=rsi&period=14
+PATH_TECH_DAILY_LEGACY = "/api/v3/technical_indicator/daily"
+
+# Stable EOD / Ownership / Analyst / Earnings / Calendars / Macro
+PATH_EOD = "/stable/historical-price-eod/full"
+PATH_SHARES_FLOAT = "/stable/shares-float"
+PATH_POSITIONS_SUMMARY = "/stable/positions-summary"
+PATH_ANALYST_ESTIMATES = "/stable/analyst-estimates"
+PATH_PRICE_TARGET_SUMMARY = "/stable/price-target-summary"
+PATH_PRICE_TARGET_CONSENSUS = "/stable/price-target-consensus"
+PATH_GRADES_SUMMARY = "/stable/grades-summary"
+PATH_EARNINGS_COMPANY = "/stable/earnings-company"
+PATH_EARNINGS_CALENDAR = "/stable/earnings-calendar"
+PATH_DIVIDENDS_CALENDAR = "/stable/dividends-calendar"
+PATH_IPOS_CALENDAR = "/stable/ipos-calendar"
+PATH_SPLITS_CALENDAR = "/stable/splits-calendar"
+PATH_TREASURY_RATES = "/stable/treasury-rates"
+PATH_ECONOMIC_INDICATORS = "/stable/economic-indicators"
+PATH_ECONOMIC_CALENDAR = "/stable/economic-calendar"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -92,8 +108,21 @@ QUARTERLY_COLUMNS = [
 SNAPSHOT_COLUMNS = [
     "ticker_fixed", "ticker_raw", "name_raw", "asof",
     "price", "marketCap", "beta", "sector", "industry",
+    "volAvg20",
     "rsi14", "sma20", "sma50", "sma200",
 ]
+PRICE_EOD_COLUMNS = ["ticker_fixed", "date", "open", "high", "low", "close", "volume"]
+OWNERSHIP_COLUMNS = ["ticker_fixed", "asof", "floatShares", "positionsSummaryCount"]
+ANALYST_ESTIMATES_COLUMNS = ["ticker_fixed", "asof", "epsNextQ", "epsNextY", "targetPrice", "recomScore"]
+EARNINGS_COLUMNS = [
+    "ticker_fixed", "date", "epsEstimated", "epsActual", "epsSurprise", "epsSurprisePct",
+    "revenue", "revenueEstimated", "time",
+]
+CALENDARS_COLUMNS = ["calendar_type", "date", "symbol"]
+MACRO_COLUMNS = ["series_type", "name", "date", "value"]
+
+# economic-indicators 기본 name 리스트 (--econ-names 미지정 시)
+DEFAULT_ECON_NAMES = ["CPI", "GDP", "unemploymentRate"]
 
 
 def make_fiscal_quarter_grid(anchor_fq: str, n: int = 20) -> List[str]:
@@ -341,6 +370,210 @@ def fetch_technical_daily(
     return data if isinstance(data, list) else []
 
 
+def fetch_eod(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    symbol: str,
+    from_date: str,
+    to_date: str,
+    call_counter: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """EOD OHLCV. /stable/historical-price-eod/full?from=...&to=... (경로/쿼리는 상수만 수정)."""
+    data = fmp_get(
+        session, rl, PATH_EOD,
+        {"symbol": symbol, "from": from_date, "to": to_date},
+        api_key,
+        call_counter=call_counter,
+        allow_404_empty=True,
+    )
+    return data if isinstance(data, list) else []
+
+
+def fetch_shares_float(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    symbol: str,
+    call_counter: Optional[Dict[str, Any]] = None,
+) -> Any:
+    data = fmp_get(
+        session, rl, PATH_SHARES_FLOAT, {"symbol": symbol}, api_key,
+        call_counter=call_counter, allow_404_empty=True,
+    )
+    return data
+
+
+def fetch_positions_summary(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    symbol: str,
+    call_counter: Optional[Dict[str, Any]] = None,
+) -> Any:
+    data = fmp_get(
+        session, rl, PATH_POSITIONS_SUMMARY, {"symbol": symbol}, api_key,
+        call_counter=call_counter, allow_404_empty=True,
+    )
+    return data
+
+
+def fetch_analyst_estimates(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    symbol: str,
+    call_counter: Optional[Dict[str, Any]] = None,
+) -> Any:
+    data = fmp_get(
+        session, rl, PATH_ANALYST_ESTIMATES, {"symbol": symbol}, api_key,
+        call_counter=call_counter, allow_404_empty=True,
+    )
+    return data
+
+
+def fetch_price_target_summary(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    symbol: str,
+    call_counter: Optional[Dict[str, Any]] = None,
+) -> Any:
+    data = fmp_get(
+        session, rl, PATH_PRICE_TARGET_SUMMARY, {"symbol": symbol}, api_key,
+        call_counter=call_counter, allow_404_empty=True,
+    )
+    return data
+
+
+def fetch_price_target_consensus(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    symbol: str,
+    call_counter: Optional[Dict[str, Any]] = None,
+) -> Any:
+    data = fmp_get(
+        session, rl, PATH_PRICE_TARGET_CONSENSUS, {"symbol": symbol}, api_key,
+        call_counter=call_counter, allow_404_empty=True,
+    )
+    return data
+
+
+def fetch_grades_summary(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    symbol: str,
+    call_counter: Optional[Dict[str, Any]] = None,
+) -> Any:
+    data = fmp_get(
+        session, rl, PATH_GRADES_SUMMARY, {"symbol": symbol}, api_key,
+        call_counter=call_counter, allow_404_empty=True,
+    )
+    return data
+
+
+def fetch_earnings_company(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    symbol: str,
+    limit: int,
+    call_counter: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    data = fmp_get(
+        session, rl, PATH_EARNINGS_COMPANY,
+        {"symbol": symbol, "limit": limit},
+        api_key,
+        call_counter=call_counter,
+        allow_404_empty=True,
+    )
+    return data if isinstance(data, list) else []
+
+
+def fetch_calendars_once(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    from_date: str,
+    to_date: str,
+    call_counter: Optional[Dict[str, Any]] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """시장 전체 캘린더 1회 수집. earnings, dividends, ipos, splits."""
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for name, path in [
+        ("earnings", PATH_EARNINGS_CALENDAR),
+        ("dividends", PATH_DIVIDENDS_CALENDAR),
+        ("ipos", PATH_IPOS_CALENDAR),
+        ("splits", PATH_SPLITS_CALENDAR),
+    ]:
+        try:
+            data = fmp_get(
+                session, rl, path,
+                {"from": from_date, "to": to_date},
+                api_key,
+                call_counter=call_counter,
+                allow_404_empty=True,
+            )
+            out[name] = data if isinstance(data, list) else []
+        except Exception as e:
+            log.debug("calendars %s: %s", name, e)
+            out[name] = []
+    return out
+
+
+def fetch_macro_once(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    from_date: str,
+    to_date: str,
+    economic_names: Optional[List[str]] = None,
+    call_counter: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """시장 전체 매크로 1회 수집. treasury-rates, economic-indicators, economic-calendar."""
+    out: Dict[str, Any] = {"treasury": [], "economic_indicators": [], "economic_calendar": []}
+    try:
+        data = fmp_get(
+            session, rl, PATH_TREASURY_RATES,
+            {"from": from_date, "to": to_date},
+            api_key,
+            call_counter=call_counter,
+            allow_404_empty=True,
+        )
+        out["treasury"] = data if isinstance(data, list) else []
+    except Exception as e:
+        log.debug("treasury-rates: %s", e)
+    for nm in (economic_names or DEFAULT_ECON_NAMES)[:15]:
+        try:
+            data = fmp_get(
+                session, rl, PATH_ECONOMIC_INDICATORS,
+                {"name": nm, "from": from_date, "to": to_date},
+                api_key,
+                call_counter=call_counter,
+                allow_404_empty=True,
+            )
+            if isinstance(data, list) and data:
+                for r in data:
+                    r["_indicator_name"] = nm
+                out["economic_indicators"].extend(data)
+        except Exception as e:
+            log.debug("economic %s: %s", nm, e)
+    try:
+        data = fmp_get(
+            session, rl, PATH_ECONOMIC_CALENDAR,
+            {"from": from_date, "to": to_date},
+            api_key,
+            call_counter=call_counter,
+            allow_404_empty=True,
+        )
+        out["economic_calendar"] = data if isinstance(data, list) else []
+    except Exception as e:
+        log.debug("economic-calendar: %s", e)
+    return out
+
+
 def _rows_to_df(
     ticker_fixed: str,
     ticker_raw: str,
@@ -524,8 +757,15 @@ def process_symbol(
     skip_tech: bool,
     call_counter: Dict[str, Any],
     save_raw_dir: Optional[Path],
-) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """한 종목 재무 + 시장/기술 수집. row["ticker_fixed"]로 FMP 호출. (qdf, market_row, raw_dict)."""
+    from_date: str = "",
+    to_date: str = "",
+    fetch_eod_flag: bool = True,
+    fetch_ownership_flag: bool = True,
+    fetch_analyst_flag: bool = True,
+    fetch_earnings_flag: bool = True,
+    earnings_limit: int = 60,
+) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]], Optional[pd.DataFrame], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
+    """한 종목 재무 + 시장/기술 + EOD/소유/애널/실적 수집. (qdf, market_row, eod_df, ownership_row, analyst_row, earnings_df, raw_dict)."""
     sym = str(row.get("ticker_fixed") or "").strip().upper()
     if not sym:
         raise RuntimeError("row has no ticker_fixed")
@@ -554,6 +794,122 @@ def process_symbol(
         raw["cashflow"] = cf
     qdf = merge_quarterly(row, income, bs, cf, years_back)
 
+    eod_df: Optional[pd.DataFrame] = None
+    if not skip_market and fetch_eod_flag and from_date and to_date:
+        try:
+            eod_raw = fetch_eod(session, rl, api_key, sym, from_date, to_date, call_counter)
+            if save_raw_dir:
+                raw["eod"] = eod_raw
+            if eod_raw:
+                rows_eod = []
+                for r in eod_raw:
+                    d = str(r.get("date") or "")[:10]
+                    if not d:
+                        continue
+                    rows_eod.append({
+                        "ticker_fixed": sym,
+                        "date": d,
+                        "open": pick_value(r, ["open", "Open"]),
+                        "high": pick_value(r, ["high", "High"]),
+                        "low": pick_value(r, ["low", "Low"]),
+                        "close": pick_value(r, ["close", "Close"]),
+                        "volume": pick_value(r, ["volume", "Volume"]),
+                    })
+                if rows_eod:
+                    eod_df = pd.DataFrame(rows_eod)
+                    eod_df = eod_df.drop_duplicates(subset=["ticker_fixed", "date"], keep="first")
+        except Exception as e:
+            log.debug("%s eod: %s", sym, e)
+
+    ownership_row: Optional[Dict[str, Any]] = None
+    if fetch_ownership_flag:
+        try:
+            sf = fetch_shares_float(session, rl, api_key, sym, call_counter)
+            if save_raw_dir:
+                raw["shares_float"] = sf
+            if sf and isinstance(sf, list) and sf:
+                r0 = sf[0]
+                ownership_row = {
+                    "ticker_fixed": sym,
+                    "asof": str(r0.get("date") or r0.get("asof") or "")[:10] or time.strftime("%Y-%m-%d"),
+                    "floatShares": pick_value(r0, ["floatShares", "sharesFloat", "float", "float_shares"]),
+                    "positionsSummaryCount": pick_value(r0, ["positionsSummaryCount", "count"]),
+                }
+            ps = fetch_positions_summary(session, rl, api_key, sym, call_counter)
+            if save_raw_dir:
+                raw["positions_summary"] = ps
+            if ownership_row is None and ps and isinstance(ps, list) and ps:
+                ownership_row = {
+                    "ticker_fixed": sym,
+                    "asof": time.strftime("%Y-%m-%d"),
+                    "floatShares": None,
+                    "positionsSummaryCount": float(len(ps)) if ps else None,
+                }
+        except Exception as e:
+            log.debug("%s ownership: %s", sym, e)
+
+    analyst_row: Optional[Dict[str, Any]] = None
+    if fetch_analyst_flag:
+        try:
+            ae = fetch_analyst_estimates(session, rl, api_key, sym, call_counter)
+            if save_raw_dir:
+                raw["analyst_estimates"] = ae
+            pt_cons = fetch_price_target_consensus(session, rl, api_key, sym, call_counter)
+            gr = fetch_grades_summary(session, rl, api_key, sym, call_counter)
+            if save_raw_dir:
+                raw["price_target_consensus"] = pt_cons
+                raw["grades_summary"] = gr
+            d = (ae[0] if isinstance(ae, list) and ae else {}) or {}
+            eps_next_q = pick_value(d, ["epsNextQ", "epsNextQuarter", "eps", "estimatedEpsNextQuarter", "consensusEpsNextQuarter", "nextQuarterEps"])
+            eps_next_y = pick_value(d, ["epsNextY", "epsNextYear", "epsNextAnnual", "estimatedEpsNextYear", "consensusEpsNextYear", "nextYearEps"])
+            pt_d = (pt_cons[0] if isinstance(pt_cons, list) and pt_cons else pt_cons) if isinstance(pt_cons, (list, dict)) else {}
+            target_price = pick_value(pt_d, ["targetConsensus", "consensus", "priceTarget", "targetPrice", "median"]) if isinstance(pt_d, dict) else None
+            gr_d = (gr[0] if isinstance(gr, list) and gr else gr) if isinstance(gr, (list, dict)) else {}
+            recom_score = pick_value(gr_d, ["score"]) or pick_str(gr_d, ["consensus", "rating", "recommendation"]) if isinstance(gr_d, dict) else None
+            analyst_row = {
+                "ticker_fixed": sym,
+                "asof": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "epsNextQ": eps_next_q,
+                "epsNextY": eps_next_y,
+                "targetPrice": target_price,
+                "recomScore": recom_score,
+            }
+        except Exception as e:
+            log.debug("%s analyst: %s", sym, e)
+
+    earnings_df: Optional[pd.DataFrame] = None
+    if fetch_earnings_flag:
+        try:
+            ec = fetch_earnings_company(session, rl, api_key, sym, earnings_limit, call_counter)
+            if save_raw_dir:
+                raw["earnings_company"] = ec
+            if ec:
+                rows_earn = []
+                for r in ec:
+                    d = str(r.get("date") or r.get("fiscalDateEnding") or "")[:10]
+                    eps_est = pick_value(r, ["epsEstimated", "estimatedEps", "epsEstimate", "estimate"])
+                    eps_act = pick_value(r, ["epsActual", "eps", "actualEps", "reportedEps"])
+                    surprise = None
+                    surprise_pct = None
+                    if eps_est is not None and eps_act is not None:
+                        surprise = eps_act - eps_est
+                        surprise_pct = (surprise / abs(eps_est) * 100) if eps_est != 0 else None
+                    rows_earn.append({
+                        "ticker_fixed": sym,
+                        "date": d or "",
+                        "epsEstimated": eps_est,
+                        "epsActual": eps_act,
+                        "epsSurprise": surprise,
+                        "epsSurprisePct": surprise_pct,
+                        "revenue": pick_value(r, ["revenue", "Revenue"]),
+                        "revenueEstimated": pick_value(r, ["revenueEstimated", "estimatedRevenue"]),
+                        "time": pick_str(r, ["time", "period"]),
+                    })
+                if rows_earn:
+                    earnings_df = pd.DataFrame(rows_earn)
+        except Exception as e:
+            log.debug("%s earnings: %s", sym, e)
+
     market_row: Optional[Dict[str, Any]] = None
     if not skip_market:
         quote: List[Dict[str, Any]] = []
@@ -576,6 +932,14 @@ def process_symbol(
         beta = pick_value(p0, ["beta"]) or pick_value(q0, ["beta"])
         sector = pick_str(p0, ["sector"])
         industry = pick_str(p0, ["industry"])
+        vol_avg_20 = None
+        if eod_df is not None and not eod_df.empty and "volume" in eod_df.columns and "date" in eod_df.columns:
+            ed = eod_df.sort_values("date", ascending=False)
+            vol = ed["volume"].dropna()
+            if len(vol) >= 20:
+                vol_avg_20 = float(vol.iloc[:20].mean())
+            elif len(vol) > 0:
+                vol_avg_20 = float(vol.mean())
         rsi14 = sma20 = sma50 = sma200 = None
         if not skip_tech:
             try:
@@ -611,6 +975,7 @@ def process_symbol(
             "beta": beta,
             "sector": sector,
             "industry": industry,
+            "volAvg20": vol_avg_20,
             "rsi14": rsi14,
             "sma20": sma20,
             "sma50": sma50,
@@ -621,7 +986,7 @@ def process_symbol(
         (save_raw_dir / f"{sym}.raw.json").write_text(
             json.dumps(raw, default=str), encoding="utf-8"
         )
-    return (qdf, market_row, raw if save_raw_dir else None)
+    return (qdf, market_row, eod_df, ownership_row, analyst_row, earnings_df, raw if save_raw_dir else None)
 
 
 def load_cached_symbols(outdir: Path) -> Tuple[Set[str], Set[str]]:
@@ -694,10 +1059,21 @@ def main() -> None:
     ap.add_argument("--years-back", type=int, default=5, help="anchor 연도 기준 boundary (years_back년 전 1월 1일). end_date>=boundary 전부 + 이전 1개 포함")
     ap.add_argument("--max-workers", type=int, default=1, help="동시 스레드 수 (1=순차, 20~50 권장)")
     ap.add_argument("--only-symbol", default="", help="테스트용: AAPL,MSFT 처럼 일부만")
-    ap.add_argument("--skip-market", action="store_true", help="시장/기술 수집 생략")
+    ap.add_argument("--skip-market", action="store_true", help="시장/기술/EOD 수집 생략")
     ap.add_argument("--skip-tech", action="store_true", help="RSI/SMA 수집 생략")
     ap.add_argument("--use-cache", action="store_true", help="이미 저장된 symbol은 재호출 스킵 (quarterly는 fiscal_quarter 스키마일 때만 병합)")
     ap.add_argument("--save-raw", action="store_true", help="raw JSON 응답 저장 (outdir/raw/)")
+    ap.add_argument("--fetch-eod", action="store_true", default=True, help="EOD OHLCV 수집 (기본 on, --skip-market이면 무시)")
+    ap.add_argument("--skip-eod", action="store_false", dest="fetch_eod", help="EOD 수집 생략")
+    ap.add_argument("--fetch-ownership", action="store_true", default=True, help="소유/수급 수집 (기본 on)")
+    ap.add_argument("--fetch-analyst", action="store_true", default=True, help="애널 추정/가격목표/등급 수집 (기본 on)")
+    ap.add_argument("--fetch-earnings", action="store_true", default=True, help="실적 시계열 수집 (기본 on)")
+    ap.add_argument("--fetch-calendars", action="store_true", default=False, help="시장 캘린더 1회 수집 (기본 off)")
+    ap.add_argument("--fetch-macro", action="store_true", default=False, help="매크로 1회 수집 (기본 off)")
+    ap.add_argument("--macro-from", default="", help="매크로 기간 시작 YYYY-MM-DD (미지정 시 years_back 기준)")
+    ap.add_argument("--macro-to", default="", help="매크로 기간 종료 YYYY-MM-DD (미지정 시 오늘)")
+    ap.add_argument("--econ-names", default="", help="economic-indicators name 리스트 (쉼표 구분, 예: CPI,GDP,unemploymentRate)")
+    ap.add_argument("--earnings-limit", type=int, default=60, help="실적 수집 limit")
     args = ap.parse_args()
 
     api_key = os.environ.get(API_KEY_ENV) or ""
@@ -709,6 +1085,15 @@ def main() -> None:
     save_raw_dir: Optional[Path] = outdir / "raw" if args.save_raw else None
     if save_raw_dir:
         save_raw_dir.mkdir(parents=True, exist_ok=True)
+
+    today = date.today()
+    to_date = today.isoformat()
+    from_d = today - timedelta(days=args.years_back * 365)
+    from_date = from_d.isoformat()
+    macro_from = (args.macro_from.strip()[:10]) if getattr(args, "macro_from", "") else from_date
+    macro_to = (args.macro_to.strip()[:10]) if getattr(args, "macro_to", "") else to_date
+    econ_names_raw = getattr(args, "econ_names", "") or ""
+    econ_names_list: List[str] = [s.strip() for s in econ_names_raw.split(",") if s.strip()] if econ_names_raw else DEFAULT_ECON_NAMES
 
     rows, skipped_rows = read_universe(args.universe)
     if skipped_rows:
@@ -734,6 +1119,10 @@ def main() -> None:
 
     all_quarterly: List[pd.DataFrame] = []
     market_rows: List[Dict[str, Any]] = []
+    eod_dfs: List[pd.DataFrame] = []
+    ownership_rows: List[Dict[str, Any]] = []
+    analyst_rows: List[Dict[str, Any]] = []
+    earnings_dfs: List[pd.DataFrame] = []
     fetch_failures: List[Dict[str, Any]] = []
     ok = 0
     fail = 0
@@ -750,40 +1139,58 @@ def main() -> None:
         if args.use_cache and tf in cached_q and (args.skip_market or tf in cached_s):
             skipped_ticker_fixed.add(tf)
 
-    def fetch_one(row: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[pd.DataFrame], Optional[Dict[str, Any]], Optional[Exception]]:
+    def fetch_one(row: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[pd.DataFrame], Optional[Dict[str, Any]], Optional[pd.DataFrame], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[pd.DataFrame], Optional[Exception]]:
         session = make_session()
         try:
-            qdf, mrow, _ = process_symbol(
+            qdf, mrow, eod_df, ownership_row, analyst_row, earnings_df, _ = process_symbol(
                 row, session, rl, api_key,
                 args.period, args.limit,
                 args.years_back,
                 args.skip_market, args.skip_tech,
                 call_counter, save_raw_dir,
+                from_date, to_date,
+                fetch_eod_flag=getattr(args, "fetch_eod", True),
+                fetch_ownership_flag=getattr(args, "fetch_ownership", True),
+                fetch_analyst_flag=getattr(args, "fetch_analyst", True),
+                fetch_earnings_flag=getattr(args, "fetch_earnings", True),
+                earnings_limit=getattr(args, "earnings_limit", 60),
             )
-            return (row, qdf, mrow, None)
+            return (row, qdf, mrow, eod_df, ownership_row, analyst_row, earnings_df, None)
         except Exception as e:
-            return (row, None, None, e)
+            return (row, None, None, None, None, None, None, e)
+
+    def _collect(r: Dict[str, Any], qdf: Any, mrow: Any, eod_df: Any, ownership_row: Any, analyst_row: Any, earnings_df: Any, err: Any) -> None:
+        nonlocal ok, fail
+        tf = (r.get("ticker_fixed") or "").upper()
+        if err is not None:
+            fail += 1
+            fetch_failures.append({
+                "ticker_fixed": tf,
+                "ticker_raw": r.get("ticker_raw", tf),
+                "error": str(err),
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            log.warning("[FAIL] %s err=%s", tf, err)
+        else:
+            if qdf is not None and not qdf.empty:
+                all_quarterly.append(qdf)
+                quarter_counts.append(len(qdf))
+            if mrow is not None:
+                market_rows.append(mrow)
+            if eod_df is not None and not eod_df.empty:
+                eod_dfs.append(eod_df)
+            if ownership_row is not None:
+                ownership_rows.append(ownership_row)
+            if analyst_row is not None:
+                analyst_rows.append(analyst_row)
+            if earnings_df is not None and not earnings_df.empty:
+                earnings_dfs.append(earnings_df)
+            ok += 1
 
     if args.max_workers <= 1:
         for idx, row in enumerate(to_fetch, 1):
-            row, qdf, market_row, err = fetch_one(row)
-            tf = (row.get("ticker_fixed") or "").upper()
-            if err is not None:
-                fail += 1
-                fetch_failures.append({
-                    "ticker_fixed": tf,
-                    "ticker_raw": row.get("ticker_raw", tf),
-                    "error": str(err),
-                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-                })
-                log.warning("[FAIL] %s err=%s", tf, err)
-            else:
-                if qdf is not None and not qdf.empty:
-                    all_quarterly.append(qdf)
-                    quarter_counts.append(len(qdf))
-                if market_row is not None:
-                    market_rows.append(market_row)
-                ok += 1
+            row, qdf, mrow, eod_df, ownership_row, analyst_row, earnings_df, err = fetch_one(row)
+            _collect(row, qdf, mrow, eod_df, ownership_row, analyst_row, earnings_df, err)
             if idx % 50 == 0:
                 log.info("[progress] %s/%s ok=%s fail=%s calls=%s", idx, len(to_fetch), ok, fail, call_counter.get("count", 0))
     else:
@@ -792,24 +1199,8 @@ def main() -> None:
             futures = {executor.submit(fetch_one, r): r for r in to_fetch}
             for fut in as_completed(futures):
                 completed += 1
-                row, qdf, market_row, err = fut.result()
-                tf = (row.get("ticker_fixed") or "").upper()
-                if err is not None:
-                    fail += 1
-                    fetch_failures.append({
-                        "ticker_fixed": tf,
-                        "ticker_raw": row.get("ticker_raw", tf),
-                        "error": str(err),
-                        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    })
-                    log.warning("[FAIL] %s err=%s", tf, err)
-                else:
-                    if qdf is not None and not qdf.empty:
-                        all_quarterly.append(qdf)
-                        quarter_counts.append(len(qdf))
-                    if market_row is not None:
-                        market_rows.append(market_row)
-                    ok += 1
+                row, qdf, mrow, eod_df, ownership_row, analyst_row, earnings_df, err = fut.result()
+                _collect(row, qdf, mrow, eod_df, ownership_row, analyst_row, earnings_df, err)
                 if completed % 50 == 0:
                     log.info("[progress] %s/%s ok=%s fail=%s calls=%s", completed, len(to_fetch), ok, fail, call_counter.get("count", 0))
     ok += len(skipped_ticker_fixed)
@@ -861,6 +1252,81 @@ def main() -> None:
         dfm = dfm.reindex(columns=SNAPSHOT_COLUMNS)
         dfm.to_parquet(outdir / "market_snapshot.parquet", index=False)
         dfm.to_csv(outdir / "market_snapshot.csv", index=False)
+
+    if eod_dfs:
+        dfe = pd.concat(eod_dfs, ignore_index=True)
+        dfe = dfe.drop_duplicates(subset=["ticker_fixed", "date"], keep="first")
+        dfe = dfe.reindex(columns=PRICE_EOD_COLUMNS)
+        dfe.to_parquet(outdir / "price_eod.parquet", index=False)
+        dfe.to_csv(outdir / "price_eod.csv", index=False)
+        log.info("price_eod: %s rows", len(dfe))
+    if ownership_rows:
+        dfo = pd.DataFrame(ownership_rows).reindex(columns=OWNERSHIP_COLUMNS)
+        dfo.to_parquet(outdir / "ownership.parquet", index=False)
+        dfo.to_csv(outdir / "ownership.csv", index=False)
+        log.info("ownership: %s rows", len(dfo))
+    if analyst_rows:
+        dfa = pd.DataFrame(analyst_rows).reindex(columns=ANALYST_ESTIMATES_COLUMNS)
+        dfa.to_parquet(outdir / "analyst_estimates.parquet", index=False)
+        dfa.to_csv(outdir / "analyst_estimates.csv", index=False)
+        log.info("analyst_estimates: %s rows", len(dfa))
+    if earnings_dfs:
+        dfearn = pd.concat(earnings_dfs, ignore_index=True)
+        dfearn = dfearn.reindex(columns=EARNINGS_COLUMNS)
+        dfearn.to_parquet(outdir / "earnings.parquet", index=False)
+        dfearn.to_csv(outdir / "earnings.csv", index=False)
+        log.info("earnings: %s rows", len(dfearn))
+
+    if getattr(args, "fetch_calendars", False):
+        session_cal = make_session()
+        cal_data = fetch_calendars_once(session_cal, rl, api_key, from_date, to_date, call_counter)
+        cal_rows: List[Dict[str, Any]] = []
+        for cal_type, lst in cal_data.items():
+            for r in lst or []:
+                row_cal = {"calendar_type": cal_type, "date": str(r.get("date") or "")[:10], "symbol": r.get("symbol")}
+                for k, v in r.items():
+                    if k not in row_cal and v is not None:
+                        row_cal[k] = v
+                cal_rows.append(row_cal)
+        if cal_rows:
+            dfcal = pd.DataFrame(cal_rows)
+            for c in CALENDARS_COLUMNS:
+                if c not in dfcal.columns:
+                    dfcal[c] = pd.NA
+            dfcal.to_parquet(outdir / "calendars.parquet", index=False)
+            dfcal.to_csv(outdir / "calendars.csv", index=False)
+            log.info("calendars: %s rows", len(dfcal))
+
+    if getattr(args, "fetch_macro", False):
+        session_macro = make_session()
+        macro_data = fetch_macro_once(session_macro, rl, api_key, macro_from, macro_to, economic_names=econ_names_list, call_counter=call_counter)
+        macro_rows: List[Dict[str, Any]] = []
+        for r in macro_data.get("treasury") or []:
+            macro_rows.append({
+                "series_type": "treasury",
+                "name": r.get("name") or r.get("symbol") or "",
+                "date": str(r.get("date") or "")[:10],
+                "value": pick_value(r, ["value", "close", "rate", "yield"]),
+            })
+        for r in macro_data.get("economic_indicators") or []:
+            macro_rows.append({
+                "series_type": "econ_indicator",
+                "name": r.get("_indicator_name") or r.get("name") or "",
+                "date": str(r.get("date") or "")[:10],
+                "value": pick_value(r, ["value", "close", "actual"]),
+            })
+        for r in macro_data.get("economic_calendar") or []:
+            macro_rows.append({
+                "series_type": "econ_calendar",
+                "name": r.get("name") or r.get("event") or "",
+                "date": str(r.get("date") or "")[:10],
+                "value": pick_value(r, ["value", "actual", "previous"]),
+            })
+        if macro_rows:
+            dfmacro = pd.DataFrame(macro_rows).reindex(columns=MACRO_COLUMNS)
+            dfmacro.to_parquet(outdir / "macro.parquet", index=False)
+            dfmacro.to_csv(outdir / "macro.csv", index=False)
+            log.info("macro: %s rows", len(dfmacro))
 
     # 요약
     total_calls = call_counter.get("count", 0)
