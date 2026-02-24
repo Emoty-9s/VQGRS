@@ -11,6 +11,10 @@ FMP Premium: universe_list.csv 기반 최근 5년(분기 20개) 재무 + 시장/
 실행 예:
   python fmp_universe_fetch.py --universe .\data\universe_list.csv --outdir .\data --period quarter --limit 20 --max-workers 10
   python fmp_universe_fetch.py --universe universe_list.csv --outdir .\data --only-symbol AAPL --period quarter --limit 20 --max-workers 1 --skip-tech
+
+Corporate actions만 수집 (유니버스 티커, 2020-01-01~오늘 earnings/dividends/splits):
+  python fmp_universe_fetch.py --universe universe_list.csv --outdir .\data --actions-only
+  python fmp_universe_fetch.py --universe universe_list.csv --outdir .\data --fetch-actions --actions-from 2020-01-01 --actions-to 2025-12-31
 """
 from __future__ import annotations
 
@@ -59,7 +63,9 @@ PATH_PRICE_TARGET_CONSENSUS = "/stable/price-target-consensus"
 PATH_GRADES_SUMMARY = "/stable/grades-summary"
 PATH_EARNINGS_COMPANY = "/stable/earnings-company"
 PATH_EARNINGS_CALENDAR = "/stable/earnings-calendar"
+PATH_DIVIDENDS_COMPANY = "/stable/dividends"
 PATH_DIVIDENDS_CALENDAR = "/stable/dividends-calendar"
+PATH_SPLITS_COMPANY = "/stable/splits"
 PATH_IPOS_CALENDAR = "/stable/ipos-calendar"
 PATH_SPLITS_CALENDAR = "/stable/splits-calendar"
 PATH_TREASURY_RATES = "/stable/treasury-rates"
@@ -492,6 +498,42 @@ def fetch_earnings_company(
     return data if isinstance(data, list) else []
 
 
+def fetch_dividends_company(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    symbol: str,
+    call_counter: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """회사별 배당. /stable/dividends?symbol=..."""
+    data = fmp_get(
+        session, rl, PATH_DIVIDENDS_COMPANY,
+        {"symbol": symbol},
+        api_key,
+        call_counter=call_counter,
+        allow_404_empty=True,
+    )
+    return data if isinstance(data, list) else []
+
+
+def fetch_splits_company(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    symbol: str,
+    call_counter: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """회사별 주식 분할. /stable/splits?symbol=..."""
+    data = fmp_get(
+        session, rl, PATH_SPLITS_COMPANY,
+        {"symbol": symbol},
+        api_key,
+        call_counter=call_counter,
+        allow_404_empty=True,
+    )
+    return data if isinstance(data, list) else []
+
+
 def fetch_calendars_once(
     session: requests.Session,
     rl: RateLimiter,
@@ -764,35 +806,41 @@ def process_symbol(
     fetch_analyst_flag: bool = True,
     fetch_earnings_flag: bool = True,
     earnings_limit: int = 60,
-) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]], Optional[pd.DataFrame], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
-    """한 종목 재무 + 시장/기술 + EOD/소유/애널/실적 수집. (qdf, market_row, eod_df, ownership_row, analyst_row, earnings_df, raw_dict)."""
+    skip_financials: bool = False,
+    fetch_actions_flag: bool = False,
+    actions_from: str = "",
+    actions_to: str = "",
+) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, Any]], Optional[pd.DataFrame], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
+    """한 종목 재무 + 시장/기술 + EOD/소유/애널/실적 수집. (qdf, market_row, eod_df, ownership_row, analyst_row, earnings_df, earnings_actions_df, dividends_df, splits_df, raw_dict)."""
     sym = str(row.get("ticker_fixed") or "").strip().upper()
     if not sym:
         raise RuntimeError("row has no ticker_fixed")
     fetch_limit = limit + 8
     raw: Dict[str, Any] = {} if save_raw_dir else {}
-    income: List[Dict[str, Any]] = []
-    bs: List[Dict[str, Any]] = []
-    cf: List[Dict[str, Any]] = []
-    try:
-        income = fetch_income(session, rl, api_key, sym, period, fetch_limit, call_counter)
-    except Exception as e:
-        log.debug("%s income: %s", sym, e)
-    try:
-        bs = fetch_balance(session, rl, api_key, sym, period, fetch_limit, call_counter)
-    except Exception as e:
-        log.debug("%s balance: %s", sym, e)
-    try:
-        cf = fetch_cashflow(session, rl, api_key, sym, period, fetch_limit, call_counter)
-    except Exception as e:
-        log.debug("%s cashflow: %s", sym, e)
-    if not income and not bs:
-        raise RuntimeError("no_financials: income and balance both empty")
-    if save_raw_dir:
-        raw["income"] = income
-        raw["balance"] = bs
-        raw["cashflow"] = cf
-    qdf = merge_quarterly(row, income, bs, cf, years_back)
+    qdf: Optional[pd.DataFrame] = None
+    if not skip_financials:
+        income: List[Dict[str, Any]] = []
+        bs: List[Dict[str, Any]] = []
+        cf: List[Dict[str, Any]] = []
+        try:
+            income = fetch_income(session, rl, api_key, sym, period, fetch_limit, call_counter)
+        except Exception as e:
+            log.debug("%s income: %s", sym, e)
+        try:
+            bs = fetch_balance(session, rl, api_key, sym, period, fetch_limit, call_counter)
+        except Exception as e:
+            log.debug("%s balance: %s", sym, e)
+        try:
+            cf = fetch_cashflow(session, rl, api_key, sym, period, fetch_limit, call_counter)
+        except Exception as e:
+            log.debug("%s cashflow: %s", sym, e)
+        if not income and not bs:
+            raise RuntimeError("no_financials: income and balance both empty")
+        if save_raw_dir:
+            raw["income"] = income
+            raw["balance"] = bs
+            raw["cashflow"] = cf
+        qdf = merge_quarterly(row, income, bs, cf, years_back)
 
     eod_df: Optional[pd.DataFrame] = None
     if not skip_market and fetch_eod_flag and from_date and to_date:
@@ -878,37 +926,107 @@ def process_symbol(
             log.debug("%s analyst: %s", sym, e)
 
     earnings_df: Optional[pd.DataFrame] = None
-    if fetch_earnings_flag:
+    earnings_actions_df: Optional[pd.DataFrame] = None
+    dividends_df: Optional[pd.DataFrame] = None
+    splits_df: Optional[pd.DataFrame] = None
+    _need_ec = fetch_earnings_flag or fetch_actions_flag
+    if _need_ec:
         try:
             ec = fetch_earnings_company(session, rl, api_key, sym, earnings_limit, call_counter)
             if save_raw_dir:
                 raw["earnings_company"] = ec
             if ec:
-                rows_earn = []
-                for r in ec:
-                    d = str(r.get("date") or r.get("fiscalDateEnding") or "")[:10]
-                    eps_est = pick_value(r, ["epsEstimated", "estimatedEps", "epsEstimate", "estimate"])
-                    eps_act = pick_value(r, ["epsActual", "eps", "actualEps", "reportedEps"])
-                    surprise = None
-                    surprise_pct = None
-                    if eps_est is not None and eps_act is not None:
-                        surprise = eps_act - eps_est
-                        surprise_pct = (surprise / abs(eps_est) * 100) if eps_est != 0 else None
-                    rows_earn.append({
-                        "ticker_fixed": sym,
-                        "date": d or "",
-                        "epsEstimated": eps_est,
-                        "epsActual": eps_act,
-                        "epsSurprise": surprise,
-                        "epsSurprisePct": surprise_pct,
-                        "revenue": pick_value(r, ["revenue", "Revenue"]),
-                        "revenueEstimated": pick_value(r, ["revenueEstimated", "estimatedRevenue"]),
-                        "time": pick_str(r, ["time", "period"]),
-                    })
-                if rows_earn:
-                    earnings_df = pd.DataFrame(rows_earn)
+                if fetch_earnings_flag:
+                    rows_earn = []
+                    for r in ec:
+                        d = str(r.get("date") or r.get("fiscalDateEnding") or "")[:10]
+                        eps_est = pick_value(r, ["epsEstimated", "estimatedEps", "epsEstimate", "estimate"])
+                        eps_act = pick_value(r, ["epsActual", "eps", "actualEps", "reportedEps"])
+                        surprise = None
+                        surprise_pct = None
+                        if eps_est is not None and eps_act is not None:
+                            surprise = eps_act - eps_est
+                            surprise_pct = (surprise / abs(eps_est) * 100) if eps_est != 0 else None
+                        rows_earn.append({
+                            "ticker_fixed": sym,
+                            "date": d or "",
+                            "epsEstimated": eps_est,
+                            "epsActual": eps_act,
+                            "epsSurprise": surprise,
+                            "epsSurprisePct": surprise_pct,
+                            "revenue": pick_value(r, ["revenue", "Revenue"]),
+                            "revenueEstimated": pick_value(r, ["revenueEstimated", "estimatedRevenue"]),
+                            "time": pick_str(r, ["time", "period"]),
+                        })
+                    if rows_earn:
+                        earnings_df = pd.DataFrame(rows_earn)
+                if fetch_actions_flag and actions_from and actions_to:
+                    rows_act = []
+                    for r in ec:
+                        d = str(r.get("date") or r.get("fiscalDateEnding") or "")[:10]
+                        if not d or d < actions_from or d > actions_to:
+                            continue
+                        rows_act.append({
+                            "ticker_fixed": sym,
+                            "date": d,
+                            "epsEstimated": pick_value(r, ["epsEstimated", "estimatedEps", "epsEstimate", "estimate"]),
+                            "epsActual": pick_value(r, ["epsActual", "eps", "actualEps", "reportedEps"]),
+                            "revenueEstimated": pick_value(r, ["revenueEstimated", "estimatedRevenue"]),
+                            "revenueActual": pick_value(r, ["revenue", "Revenue"]),
+                            "lastUpdated": r.get("updated") or r.get("lastUpdated") or pd.NA,
+                        })
+                    if rows_act:
+                        earnings_actions_df = pd.DataFrame(rows_act)
         except Exception as e:
             log.debug("%s earnings: %s", sym, e)
+
+    if fetch_actions_flag and actions_from and actions_to:
+        try:
+            div_raw = fetch_dividends_company(session, rl, api_key, sym, call_counter)
+            if save_raw_dir and div_raw:
+                raw["dividends_company"] = div_raw
+            if div_raw:
+                rows_div = []
+                for r in div_raw:
+                    d = str(r.get("date") or r.get("exDividendDate") or r.get("declarationDate") or "")[:10]
+                    if not d or d < actions_from or d > actions_to:
+                        continue
+                    rows_div.append({
+                        "ticker_fixed": sym,
+                        "date": d,
+                        "dividend": r.get("dividend") if "dividend" in r else pick_value(r, ["dividend"]),
+                        "adjDividend": r.get("adjDividend") if "adjDividend" in r else pick_value(r, ["adjDividend"]),
+                        "yield": r.get("yield") if "yield" in r else pick_value(r, ["dividendYield", "yield"]),
+                        "frequency": pick_str(r, ["frequency"]),
+                        "declarationDate": str(r.get("declarationDate") or "")[:10] if r.get("declarationDate") else pd.NA,
+                        "recordDate": str(r.get("recordDate") or "")[:10] if r.get("recordDate") else pd.NA,
+                        "paymentDate": str(r.get("paymentDate") or "")[:10] if r.get("paymentDate") else pd.NA,
+                    })
+                if rows_div:
+                    dividends_df = pd.DataFrame(rows_div)
+        except Exception as e:
+            log.debug("%s dividends: %s", sym, e)
+        try:
+            spl_raw = fetch_splits_company(session, rl, api_key, sym, call_counter)
+            if save_raw_dir and spl_raw:
+                raw["splits_company"] = spl_raw
+            if spl_raw:
+                rows_spl = []
+                for r in spl_raw:
+                    d = str(r.get("date") or "")[:10]
+                    if not d or d < actions_from or d > actions_to:
+                        continue
+                    rows_spl.append({
+                        "ticker_fixed": sym,
+                        "date": d,
+                        "numerator": pick_value(r, ["numerator", "newToOld"]),
+                        "denominator": pick_value(r, ["denominator", "oldToNew"]),
+                        "splitType": pick_str(r, ["splitType", "type"]),
+                    })
+                if rows_spl:
+                    splits_df = pd.DataFrame(rows_spl)
+        except Exception as e:
+            log.debug("%s splits: %s", sym, e)
 
     market_row: Optional[Dict[str, Any]] = None
     if not skip_market:
@@ -986,7 +1104,7 @@ def process_symbol(
         (save_raw_dir / f"{sym}.raw.json").write_text(
             json.dumps(raw, default=str), encoding="utf-8"
         )
-    return (qdf, market_row, eod_df, ownership_row, analyst_row, earnings_df, raw if save_raw_dir else None)
+    return (qdf, market_row, eod_df, ownership_row, analyst_row, earnings_df, earnings_actions_df, dividends_df, splits_df, raw if save_raw_dir else None)
 
 
 def load_cached_symbols(outdir: Path) -> Tuple[Set[str], Set[str]]:
@@ -1074,6 +1192,10 @@ def main() -> None:
     ap.add_argument("--macro-to", default="", help="매크로 기간 종료 YYYY-MM-DD (미지정 시 오늘)")
     ap.add_argument("--econ-names", default="", help="economic-indicators name 리스트 (쉼표 구분, 예: CPI,GDP,unemploymentRate)")
     ap.add_argument("--earnings-limit", type=int, default=60, help="실적 수집 limit")
+    ap.add_argument("--fetch-actions", action="store_true", default=False, help="Corporate actions(earnings/dividends/splits) 수집 및 저장")
+    ap.add_argument("--actions-from", default="2020-01-01", help="actions 기간 시작 YYYY-MM-DD")
+    ap.add_argument("--actions-to", default="", help="actions 기간 종료 YYYY-MM-DD (미지정 시 오늘)")
+    ap.add_argument("--actions-only", action="store_true", default=False, help="actions만 수집 (재무/시장/EOD/ownership/analyst 스킵)")
     args = ap.parse_args()
 
     api_key = os.environ.get(API_KEY_ENV) or ""
@@ -1090,6 +1212,17 @@ def main() -> None:
     to_date = today.isoformat()
     from_d = today - timedelta(days=args.years_back * 365)
     from_date = from_d.isoformat()
+    actions_to = (getattr(args, "actions_to", "") or "").strip()[:10] or to_date
+    actions_from = (getattr(args, "actions_from", "") or "2020-01-01").strip()[:10]
+    if getattr(args, "actions_only", False):
+        args.skip_market = True
+        args.skip_tech = True
+        setattr(args, "fetch_eod", False)
+        setattr(args, "fetch_ownership", False)
+        setattr(args, "fetch_analyst", False)
+        setattr(args, "fetch_earnings", True)
+        if not getattr(args, "fetch_actions", False):
+            setattr(args, "fetch_actions", True)
     macro_from = (args.macro_from.strip()[:10]) if getattr(args, "macro_from", "") else from_date
     macro_to = (args.macro_to.strip()[:10]) if getattr(args, "macro_to", "") else to_date
     econ_names_raw = getattr(args, "econ_names", "") or ""
@@ -1123,6 +1256,9 @@ def main() -> None:
     ownership_rows: List[Dict[str, Any]] = []
     analyst_rows: List[Dict[str, Any]] = []
     earnings_dfs: List[pd.DataFrame] = []
+    earnings_actions_dfs: List[pd.DataFrame] = []
+    dividends_actions_dfs: List[pd.DataFrame] = []
+    splits_actions_dfs: List[pd.DataFrame] = []
     fetch_failures: List[Dict[str, Any]] = []
     ok = 0
     fail = 0
@@ -1130,19 +1266,21 @@ def main() -> None:
     start_time = time.time()
     skipped_ticker_fixed: Set[str] = set()
 
+    actions_only = getattr(args, "actions_only", False)
     to_fetch = [
         r for r in rows
-        if not (args.use_cache and (r.get("ticker_fixed") or "").upper() in cached_q and (args.skip_market or (r.get("ticker_fixed") or "").upper() in cached_s))
+        if actions_only
+        or not (args.use_cache and (r.get("ticker_fixed") or "").upper() in cached_q and (args.skip_market or (r.get("ticker_fixed") or "").upper() in cached_s))
     ]
     for r in rows:
         tf = (r.get("ticker_fixed") or "").upper()
-        if args.use_cache and tf in cached_q and (args.skip_market or tf in cached_s):
+        if not actions_only and args.use_cache and tf in cached_q and (args.skip_market or tf in cached_s):
             skipped_ticker_fixed.add(tf)
 
-    def fetch_one(row: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[pd.DataFrame], Optional[Dict[str, Any]], Optional[pd.DataFrame], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[pd.DataFrame], Optional[Exception]]:
+    def fetch_one(row: Dict[str, Any]):
         session = make_session()
         try:
-            qdf, mrow, eod_df, ownership_row, analyst_row, earnings_df, _ = process_symbol(
+            qdf, mrow, eod_df, ownership_row, analyst_row, earnings_df, earnings_actions_df, dividends_df, splits_df, _ = process_symbol(
                 row, session, rl, api_key,
                 args.period, args.limit,
                 args.years_back,
@@ -1154,12 +1292,16 @@ def main() -> None:
                 fetch_analyst_flag=getattr(args, "fetch_analyst", True),
                 fetch_earnings_flag=getattr(args, "fetch_earnings", True),
                 earnings_limit=getattr(args, "earnings_limit", 60),
+                skip_financials=actions_only,
+                fetch_actions_flag=getattr(args, "fetch_actions", False),
+                actions_from=actions_from,
+                actions_to=actions_to,
             )
-            return (row, qdf, mrow, eod_df, ownership_row, analyst_row, earnings_df, None)
+            return (row, qdf, mrow, eod_df, ownership_row, analyst_row, earnings_df, earnings_actions_df, dividends_df, splits_df, None)
         except Exception as e:
-            return (row, None, None, None, None, None, None, e)
+            return (row, None, None, None, None, None, None, None, None, None, e)
 
-    def _collect(r: Dict[str, Any], qdf: Any, mrow: Any, eod_df: Any, ownership_row: Any, analyst_row: Any, earnings_df: Any, err: Any) -> None:
+    def _collect(r: Dict[str, Any], qdf: Any, mrow: Any, eod_df: Any, ownership_row: Any, analyst_row: Any, earnings_df: Any, earnings_actions_df: Any, dividends_df: Any, splits_df: Any, err: Any) -> None:
         nonlocal ok, fail
         tf = (r.get("ticker_fixed") or "").upper()
         if err is not None:
@@ -1185,12 +1327,18 @@ def main() -> None:
                 analyst_rows.append(analyst_row)
             if earnings_df is not None and not earnings_df.empty:
                 earnings_dfs.append(earnings_df)
+            if earnings_actions_df is not None and not earnings_actions_df.empty:
+                earnings_actions_dfs.append(earnings_actions_df)
+            if dividends_df is not None and not dividends_df.empty:
+                dividends_actions_dfs.append(dividends_df)
+            if splits_df is not None and not splits_df.empty:
+                splits_actions_dfs.append(splits_df)
             ok += 1
 
     if args.max_workers <= 1:
         for idx, row in enumerate(to_fetch, 1):
-            row, qdf, mrow, eod_df, ownership_row, analyst_row, earnings_df, err = fetch_one(row)
-            _collect(row, qdf, mrow, eod_df, ownership_row, analyst_row, earnings_df, err)
+            row, qdf, mrow, eod_df, ownership_row, analyst_row, earnings_df, earnings_actions_df, dividends_df, splits_df, err = fetch_one(row)
+            _collect(row, qdf, mrow, eod_df, ownership_row, analyst_row, earnings_df, earnings_actions_df, dividends_df, splits_df, err)
             if idx % 50 == 0:
                 log.info("[progress] %s/%s ok=%s fail=%s calls=%s", idx, len(to_fetch), ok, fail, call_counter.get("count", 0))
     else:
@@ -1199,8 +1347,8 @@ def main() -> None:
             futures = {executor.submit(fetch_one, r): r for r in to_fetch}
             for fut in as_completed(futures):
                 completed += 1
-                row, qdf, mrow, eod_df, ownership_row, analyst_row, earnings_df, err = fut.result()
-                _collect(row, qdf, mrow, eod_df, ownership_row, analyst_row, earnings_df, err)
+                row, qdf, mrow, eod_df, ownership_row, analyst_row, earnings_df, earnings_actions_df, dividends_df, splits_df, err = fut.result()
+                _collect(row, qdf, mrow, eod_df, ownership_row, analyst_row, earnings_df, earnings_actions_df, dividends_df, splits_df, err)
                 if completed % 50 == 0:
                     log.info("[progress] %s/%s ok=%s fail=%s calls=%s", completed, len(to_fetch), ok, fail, call_counter.get("count", 0))
     ok += len(skipped_ticker_fixed)
@@ -1276,6 +1424,32 @@ def main() -> None:
         dfearn.to_parquet(outdir / "earnings.parquet", index=False)
         dfearn.to_csv(outdir / "earnings.csv", index=False)
         log.info("earnings: %s rows", len(dfearn))
+
+    if getattr(args, "fetch_actions", False):
+        EARNINGS_ACTIONS_COLUMNS = ["ticker_fixed", "date", "epsEstimated", "epsActual", "revenueEstimated", "revenueActual", "lastUpdated"]
+        DIVIDENDS_ACTIONS_COLUMNS = ["ticker_fixed", "date", "dividend", "adjDividend", "yield", "frequency", "declarationDate", "recordDate", "paymentDate"]
+        SPLITS_ACTIONS_COLUMNS = ["ticker_fixed", "date", "numerator", "denominator", "splitType"]
+        if earnings_actions_dfs:
+            dea = pd.concat(earnings_actions_dfs, ignore_index=True)
+            dea = dea.drop_duplicates(subset=["ticker_fixed", "date"], keep="first")
+            dea = dea.reindex(columns=EARNINGS_ACTIONS_COLUMNS)
+            dea.to_parquet(outdir / "earnings_actions.parquet", index=False)
+            dea.to_csv(outdir / "earnings_actions.csv", index=False)
+            log.info("earnings_actions: %s rows", len(dea))
+        if dividends_actions_dfs:
+            dda = pd.concat(dividends_actions_dfs, ignore_index=True)
+            dda = dda.drop_duplicates(subset=["ticker_fixed", "date"], keep="first")
+            dda = dda.reindex(columns=DIVIDENDS_ACTIONS_COLUMNS)
+            dda.to_parquet(outdir / "dividends_actions.parquet", index=False)
+            dda.to_csv(outdir / "dividends_actions.csv", index=False)
+            log.info("dividends_actions: %s rows", len(dda))
+        if splits_actions_dfs:
+            dsa = pd.concat(splits_actions_dfs, ignore_index=True)
+            dsa = dsa.drop_duplicates(subset=["ticker_fixed", "date", "numerator", "denominator"], keep="first")
+            dsa = dsa.reindex(columns=SPLITS_ACTIONS_COLUMNS)
+            dsa.to_parquet(outdir / "splits_actions.parquet", index=False)
+            dsa.to_csv(outdir / "splits_actions.csv", index=False)
+            log.info("splits_actions: %s rows", len(dsa))
 
     if getattr(args, "fetch_calendars", False):
         session_cal = make_session()
