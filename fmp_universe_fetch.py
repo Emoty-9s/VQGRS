@@ -62,6 +62,8 @@ PATH_SPLITS = "/stable/splits"
 PATH_INCOME = "/stable/income-statement"
 PATH_BALANCE = "/stable/balance-sheet-statement"
 PATH_CASHFLOW = "/stable/cash-flow-statement"
+PATH_CASHFLOW_AS_REPORTED = "/stable/cash-flow-statement-as-reported"
+PATH_BALANCE_AS_REPORTED = "/stable/balance-sheet-statement-as-reported"
 PATH_DIVIDENDS = "/stable/dividends"
 PATH_EARNINGS = "/stable/earnings-company"
 PATH_ANALYST_ESTIMATES = "/stable/analyst-estimates"
@@ -614,6 +616,54 @@ def fetch_cashflow(
     return data if isinstance(data, list) else []
 
 
+def fetch_cashflow_as_reported(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    symbol: str,
+    limit: int,
+    call_counter: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[List[Dict[str, Any]]], bool]:
+    """Returns (data_list_or_None, restricted). restricted=True if 402/403 so caller should disable fallback."""
+    status, data, _ = fmp_get(
+        session, rl, PATH_CASHFLOW_AS_REPORTED,
+        {"symbol": symbol, "period": "quarter", "limit": limit},
+        api_key,
+        call_counter=call_counter,
+        allow_404_empty=True,
+        return_status=True,
+    )
+    if status in (402, 403):
+        return (None, True)
+    if status >= 400:
+        return (None, False)
+    return (data if isinstance(data, list) else [], False)
+
+
+def fetch_balance_as_reported(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    symbol: str,
+    limit: int,
+    call_counter: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[List[Dict[str, Any]]], bool]:
+    """Returns (data_list_or_None, restricted). restricted=True if 402/403 so caller should disable fallback."""
+    status, data, _ = fmp_get(
+        session, rl, PATH_BALANCE_AS_REPORTED,
+        {"symbol": symbol, "period": "quarter", "limit": limit},
+        api_key,
+        call_counter=call_counter,
+        allow_404_empty=True,
+        return_status=True,
+    )
+    if status in (402, 403):
+        return (None, True)
+    if status >= 400:
+        return (None, False)
+    return (data if isinstance(data, list) else [], False)
+
+
 def fetch_dividends(
     session: requests.Session,
     rl: RateLimiter,
@@ -913,6 +963,146 @@ def compute_adjclose_from_events(
     return out
 
 
+def _norm_period(x: Any) -> str:
+    """period 정규화: 매칭 깨짐 방지 (None/NA/<NA>/nan/None → "")."""
+    if x is None or pd.isna(x):
+        return ""
+    s = str(x).strip()
+    return "" if s in ("<NA>", "nan", "None") else s
+
+
+def _to_float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            s = v.strip().replace(",", "")
+            if not s:
+                return None
+            return float(s)
+        if isinstance(v, (int, float)):
+            return float(v)
+        return None
+    except Exception:
+        return None
+
+
+def _iter_as_reported_line_items(row: Dict[str, Any]) -> List[Tuple[str, float]]:
+    data = row.get("data")
+    out: List[Tuple[str, float]] = []
+
+    # 실제 응답: dict 케이스 (paymentsofdividends, commonstocksharesoutstanding 등)
+    if isinstance(data, dict):
+        for k, v in data.items():
+            name = str(k).strip()
+            if not name:
+                continue
+            vv = _to_float(v)
+            if vv is None:
+                continue
+            out.append((name, vv))
+        return out
+
+    # list 케이스 (다른 심볼/엔드포인트에서 list로 올 때)
+    if isinstance(data, list):
+        name_keys = ("name", "label", "account", "lineItem", "title", "concept", "tag")
+        value_keys = ("value", "amount", "val", "number", "raw", "usd", "valueUSD")
+        for it in data:
+            if not isinstance(it, dict):
+                continue
+            nm = None
+            for nk in name_keys:
+                if nk in it and it[nk] is not None and str(it[nk]).strip():
+                    nm = str(it[nk]).strip()
+                    break
+            if not nm:
+                continue
+            vv = None
+            for vk in value_keys:
+                if vk in it:
+                    vv = _to_float(it.get(vk))
+                    if vv is not None:
+                        break
+            if vv is None and isinstance(it.get("value"), dict):
+                vv = _to_float(it["value"].get("raw")) or _to_float(it["value"].get("value"))
+            if vv is not None:
+                out.append((nm, vv))
+        return out
+
+    return []
+
+
+def _extract_dividends_paid_from_as_reported(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], float]:
+    result: Dict[Tuple[str, str], float] = {}
+
+    for r in rows:
+        d = pick_date10(r, ["date", "fiscalDateEnding", "fillingDate", "filingDate"])
+        if not d:
+            continue
+        per = _norm_period(pick_text(r, ["period"]))
+
+        # 1순위: paymentsofdividends 정확키
+        val_map = r.get("data") if isinstance(r.get("data"), dict) else None
+        if isinstance(val_map, dict) and "paymentsofdividends" in val_map:
+            v = _to_float(val_map.get("paymentsofdividends"))
+            if v is not None:
+                result[(d, per)] = v
+                if per:
+                    result[(d, "")] = v
+                continue
+
+        # 2순위: 라인아이템 스캔
+        candidates: List[Tuple[str, float]] = []
+        for name, val in _iter_as_reported_line_items(r):
+            nl = name.lower()
+            if "dividend" in nl and ("paid" in nl or "payment" in nl or "payments" in nl):
+                candidates.append((name, val))
+
+        if candidates:
+            best = min(candidates, key=lambda x: (0 if x[1] < 0 else 1, -abs(x[1])))
+            result[(d, per)] = best[1]
+            if per:
+                result[(d, "")] = best[1]
+
+    return result
+
+
+def _extract_shares_outstanding_from_as_reported(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], float]:
+    result: Dict[Tuple[str, str], float] = {}
+
+    for r in rows:
+        d = pick_date10(r, ["date", "fiscalDateEnding", "fillingDate", "filingDate"])
+        if not d:
+            continue
+        per = _norm_period(pick_text(r, ["period"]))
+
+        # 1순위: commonstocksharesoutstanding 정확키
+        val_map = r.get("data") if isinstance(r.get("data"), dict) else None
+        if isinstance(val_map, dict) and "commonstocksharesoutstanding" in val_map:
+            v = _to_float(val_map.get("commonstocksharesoutstanding"))
+            if v is not None and v > 0:
+                result[(d, per)] = v
+                if per:
+                    result[(d, "")] = v
+                continue
+
+        # 2순위: 라인아이템 스캔
+        candidates: List[float] = []
+        for name, val in _iter_as_reported_line_items(r):
+            nl = name.lower().replace(" ", "").replace("_", "")
+            if "commonstocksharesoutstanding" in nl or ("shares" in nl and "outstanding" in nl):
+                if val is not None and val > 0:
+                    candidates.append(val)
+
+        if candidates:
+            best = max(candidates)
+            result[(d, per)] = best
+            if per:
+                result[(d, "")] = best
+
+    return result
+
+
 def build_financials_quarterly(
     income: List[Dict[str, Any]],
     balance: List[Dict[str, Any]],
@@ -922,6 +1112,7 @@ def build_financials_quarterly(
 ) -> pd.DataFrame:
     sym = symbol.strip().upper()
     by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    # A) weightedAverageSharesDiluted: Income에 존재. cashflow는 fallback만 (현재 100% NaN 원인: income 미파싱, cashflow 키명 상이)
     for r in income:
         d = pick_date10(r, ["date", "fiscalDateEnding", "fillingDate"])
         per = pick_text(r, ["period"])
@@ -938,7 +1129,9 @@ def build_financials_quarterly(
             "EBITDA": pick(r, ["ebitda", "EBITDA"]),
             "incomeBeforeTax": pick(r, ["incomeBeforeTax", "incomeBeforeTax"]),
             "incomeTaxExpense": pick(r, ["incomeTaxExpense", "incomeTaxExpense"]),
+            "weightedAverageSharesDiluted": pick(r, ["weightedAverageShsOutDil", "weightedAverageShsOutDiluted", "weightedAverageSharesDiluted"]),
         })
+    # B) sharesOutstanding: balance 후보 키 확대 (commonStockSharesOutstanding 100% 비어있음 대응)
     for r in balance:
         d = pick_date10(r, ["date", "fiscalDateEnding", "fillingDate"])
         per = pick_text(r, ["period"])
@@ -957,8 +1150,9 @@ def build_financials_quarterly(
             "totalStockholdersEquity": pick(r, ["totalStockholdersEquity", "totalEquity", "stockholdersEquity"]),
             "totalDebt": pick(r, ["totalDebt"]),
             "longTermDebt": pick(r, ["longTermDebt"]),
-            "sharesOutstanding": pick(r, ["commonStockSharesOutstanding", "sharesOutstanding"]),
+            "sharesOutstanding": pick(r, ["commonStockSharesOutstanding", "commonStockSharesIssued", "sharesOutstanding", "ordinarySharesNumber"]),
         })
+    # C) dividendsPaid: cashflow 후보 키 확대; weightedAverageSharesDiluted는 income 없을 때만 fallback (현재 100% NaN: cashflow에 dividendsPaid/weighted 키 없음)
     for r in cashflow:
         d = pick_date10(r, ["date", "fiscalDateEnding", "fillingDate"])
         per = pick_text(r, ["period"])
@@ -967,12 +1161,14 @@ def build_financials_quarterly(
         key = (d, per if per is not None else "")
         if key not in by_key:
             by_key[key] = {"symbol": sym, "fiscalDate": d, "period": per if per is not None else pd.NA}
-        by_key[key].update({
+        cf_update: Dict[str, Any] = {
             "freeCashFlow": pick(r, ["freeCashFlow", "freeCashFlow"]),
-            # dividendsPaid: raw 저장(부호 유지). payout 등 현금유출 총액 계산 시 abs(dividendsPaid) 사용.
-            "dividendsPaid": pick(r, ["dividendsPaid"]),
-            "weightedAverageSharesDiluted": pick(r, ["weightedAverageShsOutDil", "weightedAverageSharesDiluted"]),
-        })
+            "dividendsPaid": pick(r, ["dividendsPaid", "cashDividendsPaid", "dividendsPaidCommonStock", "dividendPaid", "paymentsOfDividends"]),
+        }
+        existing_dil = by_key[key].get("weightedAverageSharesDiluted")
+        if existing_dil is None or (isinstance(existing_dil, float) and pd.isna(existing_dil)):
+            cf_update["weightedAverageSharesDiluted"] = pick(r, ["weightedAverageShsOutDil", "weightedAverageSharesDiluted"])
+        by_key[key].update(cf_update)
     if not by_key:
         return pd.DataFrame(columns=FINANCIALS_QUARTERLY_COLUMNS)
     df = pd.DataFrame(list(by_key.values()))
@@ -980,6 +1176,69 @@ def build_financials_quarterly(
         if c not in df.columns:
             df[c] = pd.NA
     return df.reindex(columns=FINANCIALS_QUARTERLY_COLUMNS)
+
+
+def enrich_financials_quarterly_from_as_reported(
+    df: pd.DataFrame,
+    symbol: str,
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    call_counter: Dict[str, Any],
+    as_reported_state: Dict[str, Any],
+    limit: int = 80,
+) -> pd.DataFrame:
+    """dividendsPaid/sharesOutstanding 결측 시 as-reported API로 보강. 402/403이면 1회 경고 후 fallback 비활성화."""
+    if df.empty or "fiscalDate" not in df.columns:
+        return df
+    lock = as_reported_state.get("lock")
+    if lock is None:
+        return df
+
+    need_div = df["dividendsPaid"].isna().any() if "dividendsPaid" in df.columns else False
+    need_shares = df["sharesOutstanding"].isna().any() if "sharesOutstanding" in df.columns else False
+
+    if need_div and not as_reported_state.get("disabled_cashflow", False):
+        cf_ar, restricted = fetch_cashflow_as_reported(session, rl, api_key, symbol, limit, call_counter)
+        if restricted:
+            with lock:
+                as_reported_state["disabled_cashflow"] = True
+                if not as_reported_state.get("warned_cashflow", False):
+                    log.warning("cash-flow-statement-as-reported 402/403; dividendsPaid as-reported fallback disabled for this run")
+                    as_reported_state["warned_cashflow"] = True
+        elif cf_ar:
+            div_map = _extract_dividends_paid_from_as_reported(cf_ar)
+            for idx, row in df.iterrows():
+                fd = str(row.get("fiscalDate", ""))[:10]
+                per = _norm_period(row.get("period"))
+                key = (fd, per)
+                val = div_map.get(key)
+                if val is None and per:
+                    val = div_map.get((fd, ""))
+                if val is not None and pd.isna(row.get("dividendsPaid")):
+                    df.at[idx, "dividendsPaid"] = val
+
+    if need_shares and not as_reported_state.get("disabled_balance", False):
+        bal_ar, restricted = fetch_balance_as_reported(session, rl, api_key, symbol, limit, call_counter)
+        if restricted:
+            with lock:
+                as_reported_state["disabled_balance"] = True
+                if not as_reported_state.get("warned_balance", False):
+                    log.warning("balance-sheet-statement-as-reported 402/403; sharesOutstanding as-reported fallback disabled for this run")
+                    as_reported_state["warned_balance"] = True
+        elif bal_ar:
+            shares_map = _extract_shares_outstanding_from_as_reported(bal_ar)
+            for idx, row in df.iterrows():
+                fd = str(row.get("fiscalDate", ""))[:10]
+                per = _norm_period(row.get("period"))
+                key = (fd, per)
+                val = shares_map.get(key)
+                if val is None and per:
+                    val = shares_map.get((fd, ""))
+                if val is not None and pd.isna(row.get("sharesOutstanding")):
+                    df.at[idx, "sharesOutstanding"] = val
+
+    return df
 
 
 def build_dividends_events(
@@ -1699,6 +1958,13 @@ def run_watermark_tables(
     to_date_fin = today
     cutoff_dt = date.fromisoformat(CUTOFF_DATE[:10])
     fin_date_keys = ["date", "fiscalDateEnding", "fillingDate"]
+    as_reported_state_fin: Dict[str, Any] = {
+        "disabled_cashflow": False,
+        "disabled_balance": False,
+        "warned_cashflow": False,
+        "warned_balance": False,
+        "lock": threading.Lock(),
+    }
 
     collected_fin: List[pd.DataFrame] = []
     succeeded_fin: List[str] = []
@@ -1722,6 +1988,7 @@ def run_watermark_tables(
         bal_f = filter_rows_by_date_range(bal or [], fin_date_keys, from_date_fin, to_date_fin)
         cf_f = filter_rows_by_date_range(cf or [], fin_date_keys, from_date_fin, to_date_fin)
         new_df = build_financials_quarterly(inc_f, bal_f, cf_f, sym, from_date_fin)
+        new_df = enrich_financials_quarterly_from_as_reported(new_df, sym, session, rl, api_key, call_counter, as_reported_state_fin, 200)
         existing_slice = existing_fin.loc[existing_fin["symbol"] == sym] if not existing_fin.empty else pd.DataFrame()
         changed = detect_changes(new_df, existing_slice, FINANCIALS_PK, FINANCIALS_COMPARE_COLUMNS)
         new_max_date = None
@@ -1928,14 +2195,24 @@ def run_backfill(
         upsert_table(outdir, "prices_eod", new_eod, ["symbol", "date"], PRICES_EOD_COLUMNS)
         log_prices_eod_adjclose_observability(outdir, df=new_eod)
 
-    # (3) financials_quarterly
+    # (3) financials_quarterly (dividendsPaid/sharesOutstanding as-reported fallback 공유 상태)
+    as_reported_state: Dict[str, Any] = {
+        "disabled_cashflow": False,
+        "disabled_balance": False,
+        "warned_cashflow": False,
+        "warned_balance": False,
+        "lock": threading.Lock(),
+    }
+
     def _fin_one(sym: str) -> pd.DataFrame:
         sess = make_session()
         try:
             inc = fetch_income(sess, rl, api_key, sym, 80, call_counter)
             bal = fetch_balance(sess, rl, api_key, sym, 80, call_counter)
             cf = fetch_cashflow(sess, rl, api_key, sym, 80, call_counter)
-            return build_financials_quarterly(inc, bal, cf, sym, CUTOFF_DATE)
+            df = build_financials_quarterly(inc, bal, cf, sym, CUTOFF_DATE)
+            df = enrich_financials_quarterly_from_as_reported(df, sym, sess, rl, api_key, call_counter, as_reported_state, 80)
+            return df
         except Exception as e:
             log.debug("%s financials: %s", sym, e)
             return pd.DataFrame(columns=FINANCIALS_QUARTERLY_COLUMNS)
@@ -2106,6 +2383,37 @@ def run_backfill(
                 upsert_table(outdir, "index_membership", idx_df, ["indexSymbol", "asOfDate", "memberSymbol"], INDEX_MEMBERSHIP_COLUMNS)
         except Exception as e:
             log.debug("index_membership %s: %s", idx_sym, e)
+
+
+def run_debug_financials_fields(
+    symbol: str,
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    call_counter: Dict[str, Any],
+) -> None:
+    """--debug-financials-fields: 1개 심볼에 대해 income/balance/cashflow 키 목록 및 financials_quarterly 3필드 non-null count 로깅. API key 미노출."""
+    sym = symbol.strip().upper()
+    try:
+        inc = fetch_income(session, rl, api_key, sym, 5, call_counter)
+        bal = fetch_balance(session, rl, api_key, sym, 5, call_counter)
+        cf = fetch_cashflow(session, rl, api_key, sym, 5, call_counter)
+    except Exception as e:
+        log.info("[debug-financials-fields] fetch failed for %s: %s", sym, _safe_log_message(e))
+        return
+    for name, rows in [("income", inc), ("balance", bal), ("cashflow", cf)]:
+        keys = list(rows[0].keys()) if isinstance(rows, list) and rows else []
+        keys_safe = [k if "apikey" not in k.lower() else "***" for k in keys]
+        log.info("[debug-financials-fields] %s first_row keys: %s", name, keys_safe)
+    df = build_financials_quarterly(inc or [], bal or [], cf or [], sym, CUTOFF_DATE)
+    as_reported_state: Dict[str, Any] = {"disabled_cashflow": False, "disabled_balance": False, "warned_cashflow": False, "warned_balance": False, "lock": threading.Lock()}
+    df = enrich_financials_quarterly_from_as_reported(df, sym, session, rl, api_key, call_counter, as_reported_state, 5)
+    for col in ["weightedAverageSharesDiluted", "dividendsPaid", "sharesOutstanding"]:
+        if col in df.columns:
+            n = int(df[col].notna().sum())
+            log.info("[debug-financials-fields] financials_quarterly %s non-null count: %s", col, n)
+        else:
+            log.info("[debug-financials-fields] financials_quarterly %s: column missing", col)
 
 
 def run_daily(
@@ -2346,6 +2654,7 @@ def main() -> None:
     ap.add_argument("--weekly-skip-insider", action="store_true", help="Weekly mode: do not run insider (no-op when default is already off)")
     ap.add_argument("--weekly-dividends-full-refresh", action="store_true", help="Weekly mode: when dividends API limit is unsupported, perform full refresh (default: skip dividends in that case)")
     ap.add_argument("--monthly-financials-cap", type=int, default=None, metavar="N", help="Cap symbols for monthly (day=1) financials refresh (default: no cap, current shard only)")
+    ap.add_argument("--debug-financials-fields", action="store_true", help="Log income/balance/cashflow top-level keys and financials_quarterly 3-field non-null counts for one symbol (API key not logged)")
     ap.add_argument("--save-raw", action="store_true", help="Optional: save raw JSON")
     args = ap.parse_args()
 
@@ -2372,6 +2681,14 @@ def main() -> None:
     rl = RateLimiter(MIN_INTERVAL)
     call_counter: Dict[str, Any] = {"count": 0, "lock": threading.Lock()}
     session = make_session()
+
+    if getattr(args, "debug_financials_fields", False) and universe:
+        debug_sym = (getattr(args, "only_symbol", "") or "").strip()
+        if debug_sym:
+            debug_sym = debug_sym.split(",")[0].strip().upper()
+        if not debug_sym:
+            debug_sym = universe[0]
+        run_debug_financials_fields(debug_sym, session, rl, api_key, call_counter)
 
     index_symbols_list: Optional[List[str]] = None
     if getattr(args, "index_symbols", ""):
