@@ -26,12 +26,31 @@ DEFAULT_OUT = "factors_latest"
 
 
 def load_prices(data_dir: Path) -> pd.DataFrame:
+    """prices_eod.parquet. Finviz 근사: adjClose 있으면 close 대신 사용(Perf/Beta 등 조정종가 기준)."""
     cols = ["symbol", "date", "open", "high", "low", "close", "volume"]
     path = data_dir / "prices_eod.parquet"
     if not path.exists():
         return pd.DataFrame(columns=cols)
-    df = pd.read_parquet(path, columns=cols)
+    df = pd.read_parquet(path)
+    use_cols = [c for c in cols + ["adjClose"] if c in df.columns]
+    df = df[use_cols]
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df = df.dropna(subset=["date"])
+    if "adjClose" in df.columns:
+        df["close"] = pd.to_numeric(df["adjClose"], errors="coerce").fillna(pd.to_numeric(df["close"], errors="coerce"))
+    return df
+
+
+def load_sp500_prices(data_dir: Path) -> pd.DataFrame:
+    """sp500_prices.parquet: ^GSPC 일봉. 기대 컬럼: symbol, date, close (open/high/low/adjClose/volume 있어도 OK)."""
+    path = data_dir / "sp500_prices.parquet"
+    if not path.exists():
+        return pd.DataFrame(columns=["symbol", "date", "close"])
+    df = pd.read_parquet(path)
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    if "symbol" in df.columns:
+        df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
     return df.dropna(subset=["date"])
 
 
@@ -40,6 +59,8 @@ def load_financials(data_dir: Path) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
     df = pd.read_parquet(path)
+    if "symbol" in df.columns:
+        df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
     if "fiscalDate" in df.columns:
         df["fiscalDate"] = pd.to_datetime(df["fiscalDate"], errors="coerce").dt.strftime("%Y-%m-%d")
     return df
@@ -61,6 +82,8 @@ def load_shares(data_dir: Path) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame(columns=["symbol", "asOfDate", "sharesOutstanding", "sharesFloat"])
     df = pd.read_parquet(path)
+    if "symbol" in df.columns:
+        df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
     df["asOfDate"] = pd.to_datetime(df["asOfDate"], errors="coerce").dt.strftime("%Y-%m-%d")
     return df
 
@@ -82,6 +105,41 @@ def load_targets(data_dir: Path) -> pd.DataFrame:
         return pd.DataFrame(columns=["symbol", "asOfDate", "targetPrice"])
     df = pd.read_parquet(path)
     df["asOfDate"] = pd.to_datetime(df["asOfDate"], errors="coerce").dt.strftime("%Y-%m-%d")
+    return df
+
+
+def load_company_facts(data_dir: Path) -> pd.DataFrame:
+    """company_facts_snapshot: employees, ipoDate, sharesOutstanding_* (Finviz-style)."""
+    path = data_dir / "company_facts_snapshot.parquet"
+    if not path.exists():
+        return pd.DataFrame(columns=["symbol", "asOfDate", "employees", "ipoDate", "sharesOutstanding_shares", "sharesOutstanding_profile"])
+    df = pd.read_parquet(path)
+    if "symbol" in df.columns:
+        df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+    if "asOfDate" in df.columns:
+        df["asOfDate"] = pd.to_datetime(df["asOfDate"], errors="coerce").dt.strftime("%Y-%m-%d")
+    return df
+
+
+def load_insider_holdings(data_dir: Path) -> pd.DataFrame:
+    path = data_dir / "insider_holdings_snapshot.parquet"
+    if not path.exists():
+        return pd.DataFrame(columns=["symbol", "asOfDate", "reportingName", "securitiesOwned"])
+    df = pd.read_parquet(path)
+    if "symbol" in df.columns:
+        df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+    if "asOfDate" in df.columns:
+        df["asOfDate"] = pd.to_datetime(df["asOfDate"], errors="coerce").dt.strftime("%Y-%m-%d")
+    return df
+
+
+def load_insider_transactions(data_dir: Path) -> pd.DataFrame:
+    path = data_dir / "insider_transactions.parquet"
+    if not path.exists():
+        return pd.DataFrame(columns=["symbol", "transactionDate", "acquisitionOrDisposition", "transactionType", "securitiesTransacted"])
+    df = pd.read_parquet(path)
+    if "symbol" in df.columns:
+        df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
     return df
 
 
@@ -304,8 +362,402 @@ def latest_index_member(index_df: pd.DataFrame) -> pd.Series:
 
 
 # -----------------------------------------------------------------------------
+# Finviz-style: company_facts (Employees, IPO Date), Insider Own/Trans
+# -----------------------------------------------------------------------------
+
+
+def build_company_facts_lookup(cf: pd.DataFrame) -> Dict[str, List[Dict[str, Any]]]:
+    """symbol -> list of rows sorted by asOfDate desc (newest first). Used for asOfDate <= price_date lookup."""
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    if cf.empty or "symbol" not in cf.columns or "asOfDate" not in cf.columns:
+        return out
+    cf = cf.dropna(subset=["symbol"]).sort_values(["symbol", "asOfDate"], ascending=[True, False])
+    for sym, g in cf.groupby("symbol"):
+        sym = str(sym).strip().upper() if sym else ""
+        if not sym:
+            continue
+        rows = g.to_dict("records")
+        out[sym] = [r for r in rows if r.get("asOfDate")]
+    return out
+
+
+def get_company_facts_at(
+    sym: str,
+    price_date: str,
+    cf_lookup: Dict[str, List[Dict[str, Any]]],
+    step_back_for_employees: int = 2,
+) -> Dict[str, Any]:
+    """Row with asOfDate <= price_date (latest). employees: step back up to step_back_for_employees if null."""
+    out: Dict[str, Any] = {"employees": np.nan, "ipoDate": np.nan, "shares_out": np.nan}
+    if not sym:
+        return out
+    sym = str(sym).strip().upper()
+    rows = cf_lookup.get(sym)
+    if not rows:
+        return out
+    try:
+        pd_end = pd.Timestamp(price_date)
+    except Exception:
+        return out
+    eligible = []
+    for r in rows:
+        asof = r.get("asOfDate")
+        if not asof:
+            continue
+        try:
+            dt = pd.Timestamp(asof)
+        except Exception:
+            continue
+        if dt <= pd_end:
+            eligible.append(r)
+    if not eligible:
+        return out
+    chosen = eligible[0]
+    # shares_out: sharesOutstanding_shares else sharesOutstanding_profile
+    so_sh = _float_or_nan(chosen.get("sharesOutstanding_shares"))
+    so_pr = _float_or_nan(chosen.get("sharesOutstanding_profile"))
+    out["shares_out"] = so_sh if (so_sh is not None and not np.isnan(so_sh) and so_sh > 0) else so_pr
+    # ipoDate: YYYY-MM-DD
+    ipo = chosen.get("ipoDate")
+    if ipo is not None and not pd.isna(ipo):
+        try:
+            out["ipoDate"] = pd.Timestamp(ipo).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    # employees: use chosen; if null, step back 1..step_back_for_employees
+    for i in range(min(step_back_for_employees + 1, len(eligible))):
+        r2 = eligible[i]
+        emp = _float_or_nan(r2.get("employees"))
+        if emp is not None and not np.isnan(emp) and emp >= 0:
+            out["employees"] = emp
+            break
+    return out
+
+
+def get_employees_at(sym: str, price_date: str, cf_lookup: Dict[str, List[Dict[str, Any]]]) -> Any:
+    """Finviz-style: latest company_facts row with asOfDate <= price_date; step back if employees null."""
+    d = get_company_facts_at(sym, price_date, cf_lookup)
+    return d.get("employees", np.nan)
+
+
+def get_ipo_date_at(sym: str, price_date: str, cf_lookup: Dict[str, List[Dict[str, Any]]]) -> Any:
+    """Finviz-style: latest company_facts ipoDate with asOfDate <= price_date. YYYY-MM-DD."""
+    d = get_company_facts_at(sym, price_date, cf_lookup)
+    return d.get("ipoDate", np.nan)
+
+
+def build_holdings_dedupe_and_totals(holdings: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """symbol -> DataFrame with (asOfDate, total_holdings). Per (symbol, asOfDate): dedupe by reportingName (max securitiesOwned), then sum."""
+    out: Dict[str, pd.DataFrame] = {}
+    if holdings.empty or "symbol" not in holdings.columns or "securitiesOwned" not in holdings.columns:
+        return out
+    need = ["symbol", "asOfDate", "securitiesOwned"]
+    has_reporting = "reportingName" in holdings.columns
+    if has_reporting:
+        need.append("reportingName")
+    h = holdings.dropna(subset=["symbol"]).copy()
+    h["securitiesOwned"] = pd.to_numeric(h["securitiesOwned"], errors="coerce")
+    h = h.dropna(subset=["securitiesOwned"])
+    if h.empty:
+        return out
+    if has_reporting:
+        # (symbol, asOfDate, reportingName) -> max(securitiesOwned)
+        dedupe = h.groupby(["symbol", "asOfDate", "reportingName"], as_index=False)["securitiesOwned"].max()
+        tot = dedupe.groupby(["symbol", "asOfDate"], as_index=False)["securitiesOwned"].sum()
+    else:
+        tot = h.groupby(["symbol", "asOfDate"], as_index=False)["securitiesOwned"].sum()
+    tot["symbol"] = tot["symbol"].astype(str).str.strip().str.upper()
+    for sym, g in tot.groupby("symbol"):
+        sym = str(sym).strip().upper() if sym else ""
+        if not sym:
+            continue
+        out[sym] = g.sort_values("asOfDate", ascending=False).reset_index(drop=True)
+    return out
+
+
+def holdings_total_at(
+    sym: str,
+    as_of_date: str,
+    holdings_by_sym: Dict[str, pd.DataFrame],
+) -> Optional[float]:
+    """Total insider holdings for symbol at latest snapshot with asOfDate <= as_of_date."""
+    if not sym:
+        return None
+    sym = str(sym).strip().upper()
+    df = holdings_by_sym.get(sym)
+    if df is None or df.empty:
+        return None
+    try:
+        pd_end = pd.Timestamp(as_of_date)
+    except Exception:
+        return None
+    for _, row in df.iterrows():
+        asof = row.get("asOfDate")
+        if not asof:
+            continue
+        try:
+            if pd.Timestamp(asof) <= pd_end:
+                return float(row["securitiesOwned"])
+        except Exception:
+            continue
+    return None
+
+
+def holdings_prev_90d(
+    sym: str,
+    price_date: str,
+    holdings_by_sym: Dict[str, pd.DataFrame],
+) -> Optional[float]:
+    """Holdings total at snapshot closest to (price_date - 90d), asOfDate <= price_date - 90d (Finviz Trans A)."""
+    if not sym:
+        return None
+    sym = str(sym).strip().upper()
+    df = holdings_by_sym.get(sym)
+    if df is None or df.empty:
+        return None
+    try:
+        target = pd.Timestamp(price_date) - pd.Timedelta(days=90)
+    except Exception:
+        return None
+    best_row = None
+    best_diff = None
+    for _, row in df.iterrows():
+        asof = row.get("asOfDate")
+        if not asof:
+            continue
+        try:
+            dt = pd.Timestamp(asof)
+            if dt > target:
+                continue
+            diff = abs((dt - target).total_seconds())
+            if best_diff is None or diff < best_diff:
+                best_diff = diff
+                best_row = row
+        except Exception:
+            continue
+    if best_row is None:
+        return None
+    return float(best_row["securitiesOwned"])
+
+
+def build_transactions_group(transactions: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Symbol -> DataFrame (transactionDate parsed, 90d window for Trans fallback B)."""
+    out: Dict[str, pd.DataFrame] = {}
+    if transactions.empty or "symbol" not in transactions.columns:
+        return out
+    need = ["transactionDate", "acquisitionOrDisposition", "transactionType", "securitiesTransacted"]
+    if not all(c in transactions.columns for c in need):
+        return out
+    t = transactions.dropna(subset=["symbol"]).copy()
+    t["_tx_date"] = pd.to_datetime(t["transactionDate"], errors="coerce")
+    t["securitiesTransacted"] = pd.to_numeric(t["securitiesTransacted"], errors="coerce")
+    for sym, g in t.groupby("symbol"):
+        sym = str(sym).strip().upper() if sym else ""
+        if not sym:
+            continue
+        out[sym] = g.copy()
+    return out
+
+
+def _transaction_sign(row: pd.Series) -> Optional[int]:
+    """+1 acquisition, -1 disposition, None exclude."""
+    aod = row.get("acquisitionOrDisposition")
+    if aod is not None and not pd.isna(aod):
+        aod = str(aod).strip().upper()
+        if aod == "A":
+            return 1
+        if aod == "D":
+            return -1
+    tt = row.get("transactionType")
+    if tt is None or pd.isna(tt):
+        return None
+    tt_lower = str(tt).lower()
+    if "sale" in tt_lower or "sell" in tt_lower or "disposed" in tt_lower:
+        return -1
+    if "buy" in tt_lower or "purchase" in tt_lower or "acquired" in tt_lower:
+        return 1
+    return None
+
+
+def net_trans_shares_90d(sym: str, price_date: str, tx_group: Dict[str, pd.DataFrame]) -> Optional[float]:
+    """Net insider transaction shares in (price_date - 90d, price_date] (Finviz Trans B fallback)."""
+    df = tx_group.get(str(sym).strip().upper() if sym else "")
+    if df is None or df.empty:
+        return None
+    try:
+        end_ts = pd.Timestamp(price_date)
+        start_ts = end_ts - pd.Timedelta(days=90)
+    except Exception:
+        return None
+    df = df.dropna(subset=["_tx_date"])
+    mask = (df["_tx_date"] > start_ts) & (df["_tx_date"] <= end_ts)
+    win = df.loc[mask]
+    if win.empty:
+        return None
+    net = 0.0
+    for _, row in win.iterrows():
+        sign = _transaction_sign(row)
+        if sign is None:
+            continue
+        qty = row.get("securitiesTransacted")
+        if pd.isna(qty):
+            continue
+        try:
+            net += float(qty) * sign
+        except (TypeError, ValueError):
+            continue
+    return net
+
+
+def insider_own_pct_finviz(
+    holdings_now: Optional[float],
+    shares_out: Optional[float],
+) -> Optional[float]:
+    """Insider Own % = 100 * holdings_now / shares_out. Clamp 0..100. 2 decimals."""
+    if holdings_now is None or shares_out is None or (isinstance(shares_out, (int, float)) and (np.isnan(shares_out) or shares_out <= 0)):
+        return None
+    try:
+        pct = 100.0 * float(holdings_now) / float(shares_out)
+        pct = max(0.0, min(100.0, pct))
+        return round(pct, 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def insider_trans_pct_finviz(
+    holdings_now: Optional[float],
+    holdings_prev: Optional[float],
+    net_trans_90d: Optional[float],
+    shares_out: Optional[float],
+    prefer_holdings_diff: bool = True,
+) -> Optional[float]:
+    """(A) 100*(holdings_now - holdings_prev)/shares_out if prefer and holdings_prev available; else (B) 100*net_trans_90d/shares_out. Clamp ~[-99, 99]."""
+    if shares_out is None or (isinstance(shares_out, (int, float)) and (np.isnan(shares_out) or shares_out <= 0)):
+        return None
+    try:
+        if prefer_holdings_diff and holdings_now is not None and holdings_prev is not None:
+            chg = float(holdings_now) - float(holdings_prev)
+            pct = 100.0 * chg / float(shares_out)
+        elif net_trans_90d is not None:
+            pct = 100.0 * float(net_trans_90d) / float(shares_out)
+        else:
+            return None
+        pct = max(-99.0, min(99.0, pct))
+        return round(pct, 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def format_insider_own_trans(own_pct: Optional[float], trans_pct: Optional[float]) -> str:
+    """'xx.xx% / +x.xx%' or 'N/A / N/A' etc. Always 2 decimals for numbers."""
+    own_s = f"{own_pct:.2f}%" if (own_pct is not None and not np.isnan(own_pct)) else "N/A"
+    if trans_pct is None or np.isnan(trans_pct):
+        trans_s = "N/A"
+    else:
+        trans_s = f"+{trans_pct:.2f}%" if trans_pct >= 0 else f"{trans_pct:.2f}%"
+    return f"{own_s} / {trans_s}"
+
+
+# -----------------------------------------------------------------------------
 # Price-based indicators (one symbol)
 # -----------------------------------------------------------------------------
+
+
+def _compute_beta_from_returns(stock_ret: pd.Series, mkt_ret: pd.Series) -> float:
+    """beta = cov(stock, mkt) / var(mkt). 둘 다 같은 인덱스로 정렬돼 있어야 함."""
+    df = pd.concat([stock_ret, mkt_ret], axis=1).dropna()
+    if df.shape[0] < 24:
+        return np.nan
+    s = df.iloc[:, 0].astype(float).values
+    m = df.iloc[:, 1].astype(float).values
+    var_m = np.var(m, ddof=1)
+    if var_m == 0 or np.isnan(var_m):
+        return np.nan
+    cov_sm = np.cov(s, m, ddof=1)[0, 1]
+    beta = cov_sm / var_m
+    if np.isnan(beta):
+        return np.nan
+    beta = max(-10.0, min(10.0, float(beta)))
+    return float(beta)
+
+
+def beta_finviz_style(
+    stock_prices: pd.DataFrame,
+    mkt_prices: pd.DataFrame,
+    price_date: str,
+    *,
+    months: int = 60,
+    min_months: int = 24,
+    daily_days: int = 252,
+    min_daily: int = 60,
+) -> float:
+    """
+    Finviz 근사:
+      1) 월말 종가 기준 월간 수익률로 5년(60개월) beta
+      2) 월간 데이터 부족하면 최근 252거래일 일간 beta
+    """
+    if stock_prices is None or stock_prices.empty or mkt_prices is None or mkt_prices.empty:
+        return np.nan
+
+    sp = stock_prices.copy()
+    mp = mkt_prices.copy()
+
+    sp["date"] = pd.to_datetime(sp["date"], errors="coerce")
+    mp["date"] = pd.to_datetime(mp["date"], errors="coerce")
+    sp = sp.dropna(subset=["date"])
+    mp = mp.dropna(subset=["date"])
+    if sp.empty or mp.empty:
+        return np.nan
+
+    end = pd.to_datetime(price_date, errors="coerce")
+    if pd.isna(end):
+        return np.nan
+
+    sp = sp.loc[sp["date"] <= end].sort_values("date")
+    mp = mp.loc[mp["date"] <= end].sort_values("date")
+    if sp.empty or mp.empty:
+        return np.nan
+
+    sp["close"] = pd.to_numeric(sp["close"], errors="coerce")
+    mp["close"] = pd.to_numeric(mp["close"], errors="coerce")
+    sp = sp.dropna(subset=["close"])
+    mp = mp.dropna(subset=["close"])
+    if sp.empty or mp.empty:
+        return np.nan
+
+    # (A) 5Y Monthly (월말 종가)
+    sp_m = sp.set_index("date")["close"].groupby(pd.Grouper(freq="M")).last()
+    mp_m = mp.set_index("date")["close"].groupby(pd.Grouper(freq="M")).last()
+
+    sp_ret_m = sp_m.pct_change()
+    mp_ret_m = mp_m.pct_change()
+
+    joined_m = pd.concat([sp_ret_m, mp_ret_m], axis=1).dropna()
+    if joined_m.shape[0] >= min_months:
+        joined_m = joined_m.tail(months)
+        beta_m = _compute_beta_from_returns(joined_m.iloc[:, 0], joined_m.iloc[:, 1])
+        if not np.isnan(beta_m):
+            return round(beta_m, 2)
+
+    # (B) Daily fallback (최근 252 trading days)
+    sp_d = sp.set_index("date")["close"].sort_index()
+    mp_d = mp.set_index("date")["close"].sort_index()
+
+    common_idx = sp_d.index.intersection(mp_d.index)
+    if len(common_idx) < min_daily:
+        return np.nan
+
+    sp_ret_d = sp_d.loc[common_idx].pct_change()
+    mp_ret_d = mp_d.loc[common_idx].pct_change()
+    joined_d = pd.concat([sp_ret_d, mp_ret_d], axis=1).dropna()
+    if joined_d.shape[0] < min_daily:
+        return np.nan
+
+    joined_d = joined_d.tail(daily_days)
+    beta_d = _compute_beta_from_returns(joined_d.iloc[:, 0], joined_d.iloc[:, 1])
+    if np.isnan(beta_d):
+        return np.nan
+    return round(beta_d, 2)
 
 
 def _float_or_nan(x: Any) -> float:
@@ -625,6 +1077,58 @@ OUTPUT_COLUMNS = [
     "Target Price", "Index",
 ]
 
+# Unique key for snapshot accumulation: (asOfDate, symbol).
+# Same key in a later run replaces the old row (update); new keys are appended (insert).
+FACTORS_KEY_COLS = ["asOfDate", "symbol"]
+
+
+def load_existing_factors(data_dir: Path, out_base: str, columns: List[str]) -> pd.DataFrame:
+    """Load accumulated factors from disk for upsert. Prefer parquet, fallback to csv.
+    Returns DF with at least `columns` (missing cols added as NaN); extra cols dropped.
+    Normalizes symbol (str.upper().strip()) and asOfDate (YYYY-MM-DD)."""
+    path_pq = data_dir / f"{out_base}.parquet"
+    path_csv = data_dir / f"{out_base}.csv"
+    if path_pq.exists():
+        df = pd.read_parquet(path_pq)
+    elif path_csv.exists():
+        df = pd.read_csv(path_csv)
+    else:
+        return pd.DataFrame(columns=columns)
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    for c in columns:
+        if c not in df.columns:
+            df[c] = np.nan
+    df = df.reindex(columns=columns)
+    if "symbol" in df.columns:
+        df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+    for c in ["asOfDate", "price_date", "financials_date"]:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce").dt.strftime("%Y-%m-%d")
+            df[c] = df[c].astype(str).replace("nan", "").replace("<NA>", "").str[:10]
+    return df
+
+
+def upsert_factors(
+    existing: pd.DataFrame,
+    new_df: pd.DataFrame,
+    key_cols: List[str],
+    columns: List[str],
+) -> pd.DataFrame:
+    """Merge existing and new snapshot: (asOfDate, symbol) is unique; new overwrites existing.
+    Concat existing then new_df, drop_duplicates(keep='last') so new wins. Reindex to columns, sort asOfDate asc, symbol asc."""
+    for df in (existing, new_df):
+        for c in columns:
+            if c not in df.columns:
+                df[c] = np.nan
+    existing = existing.reindex(columns=[c for c in columns if c in existing.columns])
+    new_df = new_df.reindex(columns=[c for c in columns if c in new_df.columns])
+    combined = pd.concat([existing, new_df], ignore_index=True)
+    combined = combined.drop_duplicates(subset=key_cols, keep="last")
+    combined = combined.reindex(columns=[c for c in columns if c in combined.columns])
+    combined = combined.sort_values(key_cols, ascending=[True, True]).reset_index(drop=True)
+    return combined
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Build factors_latest from Parquet inputs")
@@ -646,13 +1150,26 @@ def main() -> None:
         symbols = prices["symbol"].dropna().astype(str).str.strip().str.upper().unique().tolist()
         log.info("Symbols: %s", len(symbols))
 
+        sp500_df = load_sp500_prices(data_dir)
+        if not sp500_df.empty and "symbol" in sp500_df.columns:
+            sp500_df = sp500_df.loc[sp500_df["symbol"] == "^GSPC"].copy()
+        if sp500_df.empty or "close" not in sp500_df.columns:
+            log.warning("sp500_prices missing/empty; Beta will remain NaN")
+
         financials = load_financials(data_dir)
         dividends = load_dividends(data_dir)
         shares_df = load_shares(data_dir)
         index_df = load_index_membership(data_dir, index_symbol)
         targets_df = load_targets(data_dir)
+        company_facts = load_company_facts(data_dir)
+        insider_holdings_df = load_insider_holdings(data_dir)
+        insider_transactions_df = load_insider_transactions(data_dir)
         est_a = load_estimates_snapshot(data_dir)
         est_q = load_estimates_quarterly_snapshot(data_dir)
+
+        cf_lookup = build_company_facts_lookup(company_facts)
+        holdings_by_sym = build_holdings_dedupe_and_totals(insider_holdings_df)
+        tx_group = build_transactions_group(insider_transactions_df)
 
         eps_ttm_series_map = build_eps_ttm_series(financials)
         latest_fin, ttm_fin = latest_financials_and_ttm(financials)
@@ -684,6 +1201,17 @@ def main() -> None:
                 continue
             as_of = price_date
             price_inds = compute_price_indicators(series, price_date)
+            # Beta: sp500_prices(^GSPC) 시장 수익률로 Finviz 근사 (5Y 월간 → 252일 일간 fallback)
+            beta_val = np.nan
+            try:
+                if sp500_df is not None and not sp500_df.empty:
+                    stock_for_beta = series[["date", "close"]].copy()
+                    mkt_for_beta = sp500_df[["date", "close"]].copy()
+                    beta_val = beta_finviz_style(stock_for_beta, mkt_for_beta, price_date)
+            except Exception:
+                beta_val = np.nan
+            price_inds["Beta"] = beta_val
+
             price = price_inds.get("Price", np.nan)
             if np.isnan(price):
                 continue
@@ -741,6 +1269,24 @@ def main() -> None:
                     gr5_pct = np.nan
 
             fin_inds = build_financial_indicators(row_latest, row_ttm, shares_out, price)
+            # Finviz-style: Employees, IPO (Date) from company_facts (asOfDate <= price_date, step back for employees)
+            employees_val = get_employees_at(sym, price_date, cf_lookup)
+            ipo_date_val = get_ipo_date_at(sym, price_date, cf_lookup)
+            fin_inds["Employees"] = employees_val
+            fin_inds["IPO (Date)"] = ipo_date_val
+
+            # Finviz-style: Insider Own % (holdings_now/shares_out), Insider Trans % (holdings diff or net trans 90d)
+            cf_at = get_company_facts_at(sym, price_date, cf_lookup)
+            shares_out_insider = cf_at.get("shares_out")
+            if shares_out_insider is None or (isinstance(shares_out_insider, (int, float)) and (np.isnan(shares_out_insider) or shares_out_insider <= 0)):
+                shares_out_insider = float(shares_out) if (shares_out is not None and not np.isnan(shares_out) and shares_out > 0) else None
+            holdings_now = holdings_total_at(sym, price_date, holdings_by_sym)
+            holdings_prev = holdings_prev_90d(sym, price_date, holdings_by_sym)
+            net_trans = net_trans_shares_90d(sym, price_date, tx_group)
+            own_pct = insider_own_pct_finviz(holdings_now, shares_out_insider)
+            trans_pct = insider_trans_pct_finviz(holdings_now, holdings_prev, net_trans, shares_out_insider, prefer_holdings_diff=True)
+            insider_own_trans_str = format_insider_own_trans(own_pct, trans_pct)
+
             target_p = target_series.get(sym, np.nan)
             if not isinstance(target_p, (int, float)):
                 target_p = np.nan
@@ -877,7 +1423,7 @@ def main() -> None:
                 "EPS Next Y": eps_next_y if (eps_next_y is not None and not np.isnan(eps_next_y)) else np.nan,
                 "EPS Next Q": eps_next_q if (eps_next_q is not None and not np.isnan(eps_next_q)) else np.nan,
                 "EPS Next 5Y": eps_next_5y_pct,
-                "Insider Own/Trans": np.nan,
+                "Insider Own/Trans": insider_own_trans_str,
                 "Inst Own/Trans": np.nan,
                 "Short Float": np.nan,
                 "Short Interest": np.nan,
@@ -898,7 +1444,7 @@ def main() -> None:
             if c in out_df.columns:
                 out_df[c] = out_df[c].astype(str).replace("nan", "").str[:10]
 
-    log.info("Output rows: %s", len(out_df))
+    log.info("New snapshot rows: %s", len(out_df))
     log.info("ROIC non-null: %s / %s", out_df["ROIC"].notna().sum(), len(out_df))
     eps_cols = ["EPS This Y", "EPS Next Y", "EPS Next Q", "EPS Next 5Y"]
     log.info(
@@ -948,11 +1494,31 @@ def main() -> None:
                 sample.get("ex_date"),
             )
 
+    # Snapshot accumulation (upsert): do not overwrite entire file; merge today's out_df with existing.
+    # key_cols=['asOfDate','symbol']: each row is one snapshot per symbol per date; same (date, symbol) in a
+    # later run must replace the old row (update), and new (date, symbol) pairs are appended (insert).
+    existing_df = load_existing_factors(data_dir, out_base, OUTPUT_COLUMNS)
+    merged_df = upsert_factors(existing_df, out_df, FACTORS_KEY_COLS, OUTPUT_COLUMNS)
+    log.info("Merged total rows: %s", len(merged_df))
+    log.info("Unique keys: %s", merged_df[FACTORS_KEY_COLS].drop_duplicates().shape[0])
+
+    for c in OUTPUT_COLUMNS:
+        if c not in merged_df.columns:
+            merged_df[c] = np.nan
+    merged_df = merged_df.reindex(columns=[c for c in OUTPUT_COLUMNS if c in merged_df.columns])
+    for c in merged_df.select_dtypes(include=[np.number]).columns:
+        merged_df[c] = merged_df[c].astype(float, errors="ignore")
+    for c in ["asOfDate", "price_date", "financials_date"]:
+        if c in merged_df.columns:
+            merged_df[c] = merged_df[c].astype(str).replace("nan", "").str[:10]
+
+    merged_df = merged_df.sort_values(FACTORS_KEY_COLS, ascending=[True, True]).reset_index(drop=True)
+
     out_path_pq = data_dir / f"{out_base}.parquet"
     out_path_csv = data_dir / f"{out_base}.csv"
-    out_df.to_parquet(out_path_pq, index=False)
-    out_df.to_csv(out_path_csv, index=False, date_format="%Y-%m-%d")
-    log.info("Wrote %s and %s", out_path_pq, out_path_csv)
+    merged_df.to_parquet(out_path_pq, index=False)
+    merged_df.to_csv(out_path_csv, index=False, date_format="%Y-%m-%d")
+    log.info("Wrote %s and %s (upserted)", out_path_pq, out_path_csv)
 
 
 if __name__ == "__main__":

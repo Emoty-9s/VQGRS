@@ -25,6 +25,7 @@ backfill/monthly: index_membership, company_facts_snapshot, insider_transactions
   python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode trigger
   python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode trigger --earnings-use-lastupdated
   python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode trigger --verify-dividends-calendar-exdate AAPL
+  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode sp500_backfill --from 2020-01-01
 """
 from __future__ import annotations
 
@@ -79,6 +80,9 @@ PATH_DOWJONES = "/stable/dowjones-constituent"
 
 # Table schemas (column order = final output)
 PRICES_EOD_COLUMNS = ["symbol", "date", "open", "high", "low", "close", "adjClose", "volume"]
+# S&P 500 index (^GSPC) EOD: same schema as prices_eod, stored in sp500_prices.parquet/.csv; symbol always "^GSPC".
+SP500_SYMBOL = "^GSPC"
+SP500_PRICES_COLUMNS = ["symbol", "date", "open", "high", "low", "close", "adjClose", "volume"]
 ADJCLOSE_COLUMNS = ["symbol", "date", "adjClose"]
 
 # adjClose fill: trigger dividend-adjusted fetch when missing >= 5%; fallback when still > 80%
@@ -146,6 +150,23 @@ def load_latest_prices_date_map(outdir: Path) -> Dict[str, str]:
         return df.groupby("symbol", as_index=False)["date"].max().set_index("symbol")["date"].astype(str).to_dict()
     except Exception:
         return {}
+
+
+def load_latest_sp500_date(outdir: Path) -> Optional[str]:
+    """sp500_prices.parquet이 있으면 date max 반환(YYYY-MM-DD). 없으면 None."""
+    path = outdir / "sp500_prices.parquet"
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_parquet(path)
+        if df.empty or "date" not in df.columns:
+            return None
+        max_date = df["date"].max()
+        if pd.isna(max_date):
+            return None
+        return str(max_date)[:10]
+    except Exception:
+        return None
 
 
 def compute_target_trade_date(today: date) -> str:
@@ -1664,6 +1685,74 @@ def _eod_backfill_symbol(
     return out
 
 
+def run_sp500_backfill(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    outdir: Path,
+    from_date: str,
+    to_date: str,
+    call_counter: Dict[str, Any],
+) -> None:
+    """Backfill sp500_prices (^GSPC) with same policy as prices_eod: full-range then chunk via _eod_backfill_symbol. adjClose missing → close."""
+    df = _eod_backfill_symbol(session, rl, api_key, SP500_SYMBOL, from_date, to_date, call_counter)
+    if df.empty:
+        log.info("backfill sp500_prices: from=%s to=%s rows=0 (empty, existing kept)", from_date, to_date)
+        return
+    df = df.reindex(columns=SP500_PRICES_COLUMNS)
+    df["symbol"] = SP500_SYMBOL
+    if df["adjClose"].isna().any():
+        df = df.copy()
+        df.loc[df["adjClose"].isna(), "adjClose"] = df.loc[df["adjClose"].isna(), "close"]
+    upsert_table(outdir, "sp500_prices", df, ["symbol", "date"], SP500_PRICES_COLUMNS, allow_empty_overwrite=False)
+    log.info("backfill sp500_prices: from=%s to=%s rows=%s", from_date, to_date, len(df))
+    n_unique = df["symbol"].nunique() if "symbol" in df.columns else 0
+    log.info("sp500_prices sanity: unique symbols=%s (expected 1 for ^GSPC)", n_unique)
+
+
+def run_sp500_daily(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    outdir: Path,
+    target_trade_date: str,
+    call_counter: Dict[str, Any],
+) -> None:
+    """Daily incremental sp500_prices: fetch from (latest date + 1) to target_trade_date; same policy as prices_eod daily."""
+    latest = load_latest_sp500_date(outdir)
+    if latest:
+        try:
+            from_dt = date.fromisoformat(latest[:10]) + timedelta(days=1)
+        except ValueError:
+            from_dt = date.fromisoformat(CUTOFF_DATE[:10])
+    else:
+        from_dt = date.fromisoformat(CUTOFF_DATE[:10])
+    to_dt = date.fromisoformat(target_trade_date[:10])
+    if from_dt > to_dt:
+        log.info("daily sp500_prices: target_trade_date=%s no new rows (from > to)", target_trade_date)
+        return
+    from_d = from_dt.isoformat()
+    try:
+        rows = fetch_eod_full(session, rl, api_key, SP500_SYMBOL, from_d, target_trade_date, call_counter)
+        df = build_prices_eod_from_full(rows if isinstance(rows, list) else [], SP500_SYMBOL)
+    except Exception as e:
+        log.debug("daily sp500_prices: %s", _safe_log_message(e))
+        log.info("daily sp500_prices: target_trade_date=%s no new rows", target_trade_date)
+        return
+    if df.empty:
+        log.info("daily sp500_prices: target_trade_date=%s no new rows", target_trade_date)
+        return
+    df = df.reindex(columns=SP500_PRICES_COLUMNS)
+    df["symbol"] = SP500_SYMBOL
+    if df["adjClose"].isna().any():
+        df = df.copy()
+        df.loc[df["adjClose"].isna(), "adjClose"] = df.loc[df["adjClose"].isna(), "close"]
+    upsert_table(outdir, "sp500_prices", df, ["symbol", "date"], SP500_PRICES_COLUMNS, allow_empty_overwrite=False)
+    log.info("daily sp500_prices: target_trade_date=%s rows=%s", target_trade_date, len(df))
+    n_unique = df["symbol"].nunique() if "symbol" in df.columns else 0
+    log.info("sp500_prices sanity: unique symbols=%s (expected 1 for ^GSPC)", n_unique)
+
+
 def fill_adjclose_backfill(
     new_eod: pd.DataFrame,
     from_date: str,
@@ -2117,6 +2206,9 @@ def run_backfill(
         except Exception as e:
             log.warning("index_membership %s: %s (skipping index, run continues)", idx_sym, _safe_log_message(e))
 
+    # sp500_prices: same backfill policy as prices_eod (^GSPC only), separate table.
+    run_sp500_backfill(session, rl, api_key, outdir, from_date, to_date, call_counter)
+
 
 def run_debug_financials_fields(
     symbol: str,
@@ -2213,6 +2305,9 @@ def run_daily(
         )
     else:
         log.info("daily prices_eod: target_trade_date=%s no new rows (per-symbol incremental)", target_trade_date)
+
+    # sp500_prices: same daily incremental policy (^GSPC only).
+    run_sp500_daily(session, rl, api_key, outdir, target_trade_date, call_counter)
 
 
 def run_weekly(
@@ -2644,7 +2739,7 @@ def main() -> None:
     ap.add_argument("--from", dest="from_date", default="2020-01-01", help="Start date YYYY-MM-DD")
     ap.add_argument("--to", dest="to_date", default="", help="End date YYYY-MM-DD (backfill: today; daily: yesterday)")
     ap.add_argument("--max-workers", type=int, default=4, help="ThreadPool workers")
-    ap.add_argument("--mode", choices=["backfill", "daily", "weekly", "monthly", "trigger"], default="backfill", help="backfill=full; daily=prices_eod only; weekly=estimates/targets only; monthly=index_membership, company_facts, insider; trigger=calendar-based dividends_events+earnings_events")
+    ap.add_argument("--mode", choices=["backfill", "daily", "weekly", "monthly", "trigger", "sp500_backfill"], default="backfill", help="backfill=full; daily=prices_eod only; weekly=estimates/targets only; monthly=index_membership, company_facts, insider; trigger=calendar-based dividends_events+earnings_events; sp500_backfill=sp500_prices (^GSPC) only")
     ap.add_argument("--only-symbol", default="", help="Optional: AAPL,MSFT")
     ap.add_argument("--verify-dividends-calendar-exdate", default="", metavar="SYMBOL", help="Trigger only: verify dividends-calendar date vs exDate for SYMBOL (log MATCH/MISMATCH, no data change)")
     ap.add_argument("--earnings-use-lastupdated", action="store_true", help="Trigger only: add lastUpdated to earnings_events and skip rows not newer than existing")
@@ -2670,7 +2765,7 @@ def main() -> None:
     from_date = (getattr(args, "from_date") or "2020-01-01").strip()[:10]
     to_date = (getattr(args, "to_date") or "").strip()[:10]
     if not to_date:
-        to_date = date.today().isoformat() if args.mode == "backfill" else (date.today() - timedelta(days=1)).isoformat()
+        to_date = date.today().isoformat() if args.mode in ("backfill", "sp500_backfill") else (date.today() - timedelta(days=1)).isoformat()
     if args.mode == "trigger":
         from_date = (date.today() - timedelta(days=7)).isoformat()
         to_date = date.today().isoformat()
@@ -2715,6 +2810,8 @@ def main() -> None:
             include_company_profile=True,
             include_shares_snapshot=True,
         )
+    elif args.mode == "sp500_backfill":
+        run_sp500_backfill(session, rl, api_key, outdir, from_date, to_date, call_counter)
     elif args.mode == "weekly":
         run_weekly(
             session, rl, api_key, outdir, universe, call_counter,
