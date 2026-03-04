@@ -1,29 +1,30 @@
 # -*- coding: utf-8 -*-
 r"""
 FMP Premium: 11개 테이블 수집 (prices_eod, financials_quarterly, dividends_events, earnings_events,
-estimates_snapshot, targets_snapshot, shares_snapshot, company_profile_snapshot, insider_*, index_membership).
+estimates_snapshot, targets_snapshot, company_facts_snapshot, insider_*, index_membership).
 API Key: 환경변수 FMP_API_KEY (로그/예외/출력 노출 금지). 결측 NaN 유지. 저장은 PK 기준 Upsert.
 prices_eod의 adjClose는 dividend-adjusted API 또는 배당/스플릿 이벤트 기반 계산으로 채운다.
 
-모드별 실행 테이블:
-  | 모드      | prices_eod              | estimates/targets | profile/shares      | earnings/dividends/financials/insider (워터마크) |
-  |-----------|-------------------------|-------------------|---------------------|---------------------------------------------------|
-  | backfill  | O (per-symbol full)     | O                 | opt-in (--include-*) | O (전체 full fetch)                               |
-  | daily     | O (per-symbol 증분)     | O                 | opt-in (--include-*) | O (감지→변경시만; dividends daily 생략)             |
-  | weekly    | X                       | X                 | X                   | O (감지→변경시만; dividends 감지 O; insider는 --weekly-include-insider 시에만) |
+모드별 실행 테이블 (스케줄 정책):
+  | 모드      | prices_eod              | estimates/targets | company_facts / index / insider     | 트리거(earnings/dividends)   |
+  |-----------|-------------------------|-------------------|-------------------------------------|------------------------------|
+  | backfill  | O (per-symbol full)     | O                 | O (항상: index_membership, company_facts_snapshot, insider_*) | O (전체 full fetch)          |
+  | daily     | O (per-symbol 증분만)   | X                 | X                                   | X                            |
+  | weekly    | X                       | O (스냅샷만)      | X                                   | X                            |
+  | monthly   | X                       | X                 | O (항상: index_membership, company_facts_snapshot, insider_*) | X                    |
+  | trigger   | X                       | X                 | X                                   | O (dividends+earnings+financials; 1~5일 보험) |
 
-profile/shares: Premium 제한으로 bulk 엔드포인트 비사용. company_profile_snapshot은 --include-company-profile 시 per-symbol profile 시도; shares_snapshot은 --include-shares-snapshot 시에만. 제한 시 1회 로그 후 비활성화.
-weekly dividends: API limit 지원 시 limit=2 light 감지; 미지원 시 기본 skip, --weekly-dividends-full-refresh 시 full refresh.
-financials 월 1일: 현재 shard만 갱신; --monthly-financials-cap N 으로 심볼 수 제한 가능.
+트리거(trigger 모드): (A) earnings-calendar → earnings_events upsert + earnings_hit_symbols 수집 (B) dividends-calendar → dividends_events upsert (C) financials_quarterly: earnings_hit_symbols만 갱신. 단 매월 1~5일(현지)에는 보험으로 shard universe 전체 갱신(자동, 옵션 없음).
+backfill/monthly: index_membership, company_facts_snapshot, insider_transactions, insider_holdings_snapshot는 옵션 없이 항상 실행. 제한(402/403) 시 해당 소스만 스킵·가능 범위만 저장; 빈 결과로 기존 파일 덮어쓰지 않음.
 
 실행 예:
-  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode backfill --from 2020-01-01
   python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode daily
-  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode daily --only-symbol AAPL,MSFT
-  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode backfill --index-symbols SP500,NASDAQ,DOWJONES
-  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode daily --daily-include-insider
-  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode daily --daily-include-index --index-symbols SP500
-  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode daily --include-company-profile --include-shares-snapshot
+  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode weekly
+  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode monthly --index-symbols SP500,NASDAQ
+  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode backfill --from 2020-01-01
+  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode trigger
+  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode trigger --earnings-use-lastupdated
+  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode trigger --verify-dividends-calendar-exdate AAPL
 """
 from __future__ import annotations
 
@@ -34,7 +35,7 @@ import os
 import threading
 import time
 import zlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -65,7 +66,9 @@ PATH_CASHFLOW = "/stable/cash-flow-statement"
 PATH_CASHFLOW_AS_REPORTED = "/stable/cash-flow-statement-as-reported"
 PATH_BALANCE_AS_REPORTED = "/stable/balance-sheet-statement-as-reported"
 PATH_DIVIDENDS = "/stable/dividends"
+PATH_DIVIDENDS_CALENDAR = "/stable/dividends-calendar"
 PATH_EARNINGS = "/stable/earnings-company"
+PATH_EARNINGS_CALENDAR = "/stable/earnings-calendar"
 PATH_ANALYST_ESTIMATES = "/stable/analyst-estimates"
 PATH_PRICE_TARGET_CONSENSUS = "/stable/price-target-consensus"
 PATH_SHARES_FLOAT_ALL = "/stable/shares-float-all"
@@ -110,11 +113,16 @@ DIVIDENDS_EVENTS_COLUMNS = [
 EARNINGS_EVENTS_COLUMNS = [
     "symbol", "earningsDate", "epsActual", "epsEstimated", "revenueActual", "revenueEstimated", "fiscalDate",
 ]
-ESTIMATES_SNAPSHOT_COLUMNS = ["symbol", "asOfDate", "epsNextY", "epsNextQ", "epsThisY"]
+EARNINGS_EVENTS_COLUMNS_WITH_LASTUPDATED = EARNINGS_EVENTS_COLUMNS + ["lastUpdated"]
+ESTIMATES_SNAPSHOT_COLUMNS = ["symbol", "asOfDate", "epsNextY", "epsNextQ", "epsThisY", "epsNext5Y"]
+ESTIMATES_QUARTERLY_SNAPSHOT_COLUMNS = ["symbol", "asOfDate", "epsNextQ"]
 TARGETS_SNAPSHOT_COLUMNS = ["symbol", "asOfDate", "targetPrice"]
 SHARES_SNAPSHOT_COLUMNS = ["symbol", "asOfDate", "sharesOutstanding", "sharesFloat"]
 INDEX_MEMBERSHIP_COLUMNS = ["indexSymbol", "asOfDate", "memberSymbol", "isMember"]
-COMPANY_PROFILE_SNAPSHOT_COLUMNS = ["symbol", "asOfDate", "employees", "ipoDate", "sharesOutstanding"]
+COMPANY_FACTS_SNAPSHOT_COLUMNS = [
+    "symbol", "asOfDate", "sector", "industry", "employees", "ipoDate",
+    "sharesOutstanding_profile", "sharesOutstanding_shares", "sharesFloat",
+]
 INSIDER_TRANSACTIONS_COLUMNS = [
     "symbol", "transactionDate", "reportingCik", "reportingName", "transactionType",
     "securitiesTransacted", "price", "value", "securitiesOwned",
@@ -125,14 +133,6 @@ INSIDER_HOLDINGS_SNAPSHOT_COLUMNS = [
 ]
 
 CUTOFF_DATE = "2020-01-01"
-MAX_PROFILE_BULK_PARTS = 5000
-PROFILE_BULK_STAGNATION_PARTS = 50
-
-WATERMARKS_COLUMNS = ["table_name", "symbol", "last_date", "last_checked_at", "last_status"]
-WATERMARKS_PK = ["table_name", "symbol"]
-DIVIDENDS_LIGHT_LIMIT = 2
-DIVIDENDS_LIGHT_MAX_RESPONSE_ROWS = 10  # if response has more rows, consider limit not supported
-
 
 def load_latest_prices_date_map(outdir: Path) -> Dict[str, str]:
     """prices_eod.parquet이 있으면 symbol별 max(date)를 반환. 없으면 빈 dict."""
@@ -161,120 +161,9 @@ def compute_target_trade_date(today: date) -> str:
     return target.isoformat()
 
 
-def load_watermarks(outdir: Path) -> pd.DataFrame:
-    path = outdir / "watermarks.parquet"
-    if not path.exists():
-        return pd.DataFrame(columns=WATERMARKS_COLUMNS)
-    try:
-        df = pd.read_parquet(path)
-        for c in WATERMARKS_COLUMNS:
-            if c not in df.columns:
-                df[c] = pd.NA
-        return df.reindex(columns=WATERMARKS_COLUMNS)
-    except Exception:
-        return pd.DataFrame(columns=WATERMARKS_COLUMNS)
-
-
 def _safe_log_message(ex: Exception) -> str:
     """Return a short message for logging without risking API key exposure."""
     return type(ex).__name__ + (f": {str(ex)[:80]}" if str(ex) and "apikey" not in str(ex).lower() and "api_key" not in str(ex).lower() else "")
-
-
-def get_watermark(df: pd.DataFrame, table_name: str, symbol: str) -> Optional[str]:
-    if df.empty or "table_name" not in df.columns or "symbol" not in df.columns:
-        return None
-    m = (df["table_name"] == table_name) & (df["symbol"] == symbol)
-    rows = df.loc[m]
-    if rows.empty or "last_date" not in rows.columns:
-        return None
-    val = rows["last_date"].iloc[0]
-    if pd.isna(val) or not str(val).strip():
-        return None
-    return str(val).strip()[:10]
-
-
-def touch_watermark(
-    df: pd.DataFrame,
-    table_name: str,
-    symbol: str,
-    today: str,
-    status: str = "ok",
-) -> pd.DataFrame:
-    """Update last_checked_at and last_status (for every detection attempt). status: 'ok' | 'fail'. Returns DataFrame (caller assign back)."""
-    today = str(today).strip()[:10]
-    status = "ok" if str(status).strip().lower() == "ok" else "fail"
-    for c in WATERMARKS_COLUMNS:
-        if c not in df.columns:
-            df[c] = pd.NA
-    out = df.copy()
-    m = (out["table_name"].astype(str) == table_name) & (out["symbol"].astype(str) == symbol)
-    if m.any():
-        out.loc[m, "last_checked_at"] = today
-        out.loc[m, "last_status"] = status
-    else:
-        new_row = pd.DataFrame([{
-            "table_name": table_name,
-            "symbol": symbol,
-            "last_date": pd.NA,
-            "last_checked_at": today,
-            "last_status": status,
-        }])
-        out = pd.concat([out, new_row], ignore_index=True)
-    return out
-
-
-def set_watermark_date(
-    df: pd.DataFrame,
-    table_name: str,
-    symbol: str,
-    new_date: str,
-    today: str,
-) -> pd.DataFrame:
-    """Update last_date, last_checked_at and last_status=ok (on successful data update). Returns DataFrame (caller assign back)."""
-    new_date = str(new_date).strip()[:10]
-    today = str(today).strip()[:10]
-    for c in WATERMARKS_COLUMNS:
-        if c not in df.columns:
-            df[c] = pd.NA
-    out = df.copy()
-    m = (out["table_name"].astype(str) == table_name) & (out["symbol"].astype(str) == symbol)
-    if m.any():
-        out.loc[m, "last_date"] = new_date
-        out.loc[m, "last_checked_at"] = today
-        out.loc[m, "last_status"] = "ok"
-    else:
-        new_row = pd.DataFrame([{
-            "table_name": table_name,
-            "symbol": symbol,
-            "last_date": new_date,
-            "last_checked_at": today,
-            "last_status": "ok",
-        }])
-        out = pd.concat([out, new_row], ignore_index=True)
-    return out
-
-
-def save_watermarks(outdir: Path, df: pd.DataFrame) -> None:
-    """Save watermarks.parquet; dedupe by (table_name, symbol) keep last."""
-    if df.empty:
-        return
-    outdir.mkdir(parents=True, exist_ok=True)
-    path = outdir / "watermarks.parquet"
-    for c in WATERMARKS_COLUMNS:
-        if c not in df.columns:
-            df[c] = pd.NA
-    out = df.reindex(columns=WATERMARKS_COLUMNS).copy()
-    pk_avail = [c for c in WATERMARKS_PK if c in out.columns]
-    if pk_avail:
-        tmp = out[pk_avail].copy()
-        for c in pk_avail:
-            tmp[c] = tmp[c].astype("string").fillna("<NA>")
-        out["_pk"] = tmp[pk_avail[0]]
-        for c in pk_avail[1:]:
-            out["_pk"] = out["_pk"].astype(str) + "|" + tmp[c].astype(str)
-        out = out.drop_duplicates(subset=["_pk"], keep="last").drop(columns=["_pk"])
-    out = out.reindex(columns=WATERMARKS_COLUMNS)
-    out.to_parquet(path, index=False, engine="pyarrow")
 
 
 def make_insider_id(
@@ -310,10 +199,6 @@ def make_insider_id(
         return "R_" + h
     h = hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
     return "H_" + h
-
-
-def _safe_params(params: Dict[str, Any]) -> Dict[str, Any]:
-    return {k: ("***" if k.lower() == "apikey" else v) for k, v in params.items()}
 
 
 def _sanitize_snippet(text: str, max_len: int = 120) -> str:
@@ -681,32 +566,6 @@ def fetch_dividends(
     return data if isinstance(data, list) else []
 
 
-def fetch_dividends_light(
-    session: requests.Session,
-    rl: RateLimiter,
-    api_key: str,
-    symbol: str,
-    limit: int = DIVIDENDS_LIGHT_LIMIT,
-    call_counter: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[Dict[str, Any]], bool]:
-    """Try dividends with limit for detection. Returns (rows, light_ok). light_ok=False if API errors or returns too many rows (limit ignored)."""
-    try:
-        data = fmp_get(
-            session, rl, PATH_DIVIDENDS,
-            {"symbol": symbol, "limit": limit},
-            api_key,
-            call_counter=call_counter,
-            allow_404_empty=True,
-        )
-    except Exception:
-        return ([], False)
-    if not isinstance(data, list):
-        return ([], False)
-    if len(data) > DIVIDENDS_LIGHT_MAX_RESPONSE_ROWS:
-        return ([], False)
-    return (data, True)
-
-
 def fetch_earnings(
     session: requests.Session,
     rl: RateLimiter,
@@ -725,16 +584,59 @@ def fetch_earnings(
     return data if isinstance(data, list) else []
 
 
+def fetch_dividends_calendar(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    from_date: str,
+    to_date: str,
+    call_counter: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """GET /stable/dividends-calendar?from=&to=. Returns list of rows (no symbol filter)."""
+    data = fmp_get(
+        session, rl, PATH_DIVIDENDS_CALENDAR,
+        {"from": from_date[:10], "to": to_date[:10]},
+        api_key,
+        call_counter=call_counter,
+        allow_404_empty=True,
+    )
+    return data if isinstance(data, list) else []
+
+
+def fetch_earnings_calendar(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    from_date: str,
+    to_date: str,
+    call_counter: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """GET /stable/earnings-calendar?from=&to=. Returns list of rows (no symbol filter)."""
+    data = fmp_get(
+        session, rl, PATH_EARNINGS_CALENDAR,
+        {"from": from_date[:10], "to": to_date[:10]},
+        api_key,
+        call_counter=call_counter,
+        allow_404_empty=True,
+    )
+    return data if isinstance(data, list) else []
+
+
 def fetch_analyst_estimates(
     session: requests.Session,
     rl: RateLimiter,
     api_key: str,
     symbol: str,
     call_counter: Optional[Dict[str, Any]] = None,
+    *,
+    period: str = "annual",
+    page: int = 0,
+    limit: int = 10,
 ) -> List[Dict[str, Any]]:
+    """GET /stable/analyst-estimates. period=annual|quarter, page, limit required to avoid 400."""
     data = fmp_get(
         session, rl, PATH_ANALYST_ESTIMATES,
-        {"symbol": symbol},
+        {"symbol": symbol, "period": period, "page": page, "limit": limit},
         api_key,
         call_counter=call_counter,
         allow_404_empty=True,
@@ -1297,7 +1199,79 @@ def build_earnings_events(
     return pd.DataFrame(out).reindex(columns=EARNINGS_EVENTS_COLUMNS)
 
 
+def build_dividends_events_from_calendar(
+    rows: List[Dict[str, Any]],
+    universe_set: Set[str],
+) -> pd.DataFrame:
+    """Calendar response: filter by universe_set, map date -> exDate and other fields to DIVIDENDS_EVENTS_COLUMNS."""
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        sym = (r.get("symbol") or r.get("ticker") or "").strip().upper()
+        if not sym or sym not in universe_set:
+            continue
+        ex_d = pick_date10(r, ["date", "exDate", "exDividendDate"])
+        if not ex_d:
+            continue
+        freq = pick_text(r, ["frequency"])
+        if freq is None and r.get("frequency") is not None:
+            freq = str(r["frequency"])
+        out.append({
+            "symbol": sym,
+            "exDate": ex_d,
+            "dividend": pick(r, ["dividend"]),
+            "adjDividend": pick(r, ["adjDividend", "adjustedDividend"]),
+            "recordDate": pick_date10(r, ["recordDate"]),
+            "paymentDate": pick_date10(r, ["paymentDate"]),
+            "declarationDate": pick_date10(r, ["declarationDate"]),
+            "frequency": freq,
+            "yield": pick(r, ["yield", "dividendYield"]) if any(k in r for k in ("yield", "dividendYield")) else None,
+        })
+    if not out:
+        return pd.DataFrame(columns=DIVIDENDS_EVENTS_COLUMNS)
+    df = pd.DataFrame(out)
+    return df.reindex(columns=DIVIDENDS_EVENTS_COLUMNS)
+
+
+def build_earnings_events_from_calendar(
+    rows: List[Dict[str, Any]],
+    universe_set: Set[str],
+    include_last_updated: bool = False,
+) -> pd.DataFrame:
+    """Calendar response: filter by universe_set, map to EARNINGS_EVENTS_COLUMNS; optionally add lastUpdated."""
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        sym = (r.get("symbol") or r.get("ticker") or "").strip().upper()
+        if not sym or sym not in universe_set:
+            continue
+        d = pick_date10(r, ["date", "earningsDate", "fiscalDateEnding"])
+        if not d:
+            continue
+        row: Dict[str, Any] = {
+            "symbol": sym,
+            "earningsDate": d,
+            "epsActual": pick(r, ["epsActual", "eps", "reportedEps"]),
+            "epsEstimated": pick(r, ["epsEstimated", "estimatedEps"]),
+            "revenueActual": pick(r, ["revenue", "revenueActual"]),
+            "revenueEstimated": pick(r, ["revenueEstimated", "estimatedRevenue"]),
+            "fiscalDate": pick_date10(r, ["fiscalDateEnding", "fiscalDate"]),
+        }
+        if include_last_updated:
+            lu = r.get("updated") or r.get("lastUpdated")
+            if lu is not None:
+                row["lastUpdated"] = str(lu).strip()[:28]
+            else:
+                row["lastUpdated"] = pd.NA
+        out.append(row)
+    if not out:
+        cols = EARNINGS_EVENTS_COLUMNS_WITH_LASTUPDATED if include_last_updated else EARNINGS_EVENTS_COLUMNS
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(out)
+    cols = EARNINGS_EVENTS_COLUMNS_WITH_LASTUPDATED if include_last_updated else EARNINGS_EVENTS_COLUMNS
+    return df.reindex(columns=cols)
+
+
 def build_estimates_snapshot(rows: List[Dict[str, Any]], symbol: str, as_of: str) -> pd.DataFrame:
+    """Legacy: single-call snapshot (kept for any callers). Prefer build_estimates_snapshot_annual/quarter."""
     sym = symbol.strip().upper()
     r = (rows[0] if rows else {}) or {}
     df = pd.DataFrame([{
@@ -1306,8 +1280,98 @@ def build_estimates_snapshot(rows: List[Dict[str, Any]], symbol: str, as_of: str
         "epsNextY": pick(r, ["epsNextY", "epsNextYear", "estimatedEpsNextYear"]),
         "epsNextQ": pick(r, ["epsNextQ", "epsNextQuarter", "estimatedEpsNextQuarter"]),
         "epsThisY": pick(r, ["epsThisY", "epsThisYear", "estimatedEpsThisYear"]),
+        "epsNext5Y": pd.NA,
     }])
     return df.reindex(columns=ESTIMATES_SNAPSHOT_COLUMNS)
+
+
+def _estimates_eps_from_row(r: Dict[str, Any]) -> Optional[float]:
+    """Extract EPS value from analyst-estimates row; API returns epsAvg/epsLow/epsHigh."""
+    v = pick(r, ["epsAvg", "estimatedEpsAvg", "eps", "epsMean"])
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _estimates_rows_on_or_after(rows: List[Dict[str, Any]], as_of: str) -> List[Dict[str, Any]]:
+    """Filter rows with date >= as_of (YYYY-MM-DD), sort by date ascending. Drops None/empty dates."""
+    as_of_10 = str(as_of).strip()[:10] if as_of else ""
+    if not as_of_10:
+        return list(rows) if rows else []
+    dated: List[Tuple[str, Dict[str, Any]]] = []
+    for r in rows:
+        d = pick_date10(r, ["date", "fiscalDateEnding", "fillingDate"])
+        if not d:
+            continue
+        if d >= as_of_10:
+            dated.append((d, r))
+    dated.sort(key=lambda x: x[0])
+    return [r for _, r in dated]
+
+
+def _estimates_rows_after(rows: List[Dict[str, Any]], as_of: str) -> List[Dict[str, Any]]:
+    """Filter rows with date > as_of (strictly after today), sort by date ascending. Finviz-style this/next."""
+    as_of_10 = str(as_of).strip()[:10] if as_of else ""
+    if not as_of_10:
+        return list(rows) if rows else []
+    dated: List[Tuple[str, Dict[str, Any]]] = []
+    for r in rows:
+        d = pick_date10(r, ["date", "fiscalDateEnding", "fillingDate"])
+        if not d:
+            continue
+        if d > as_of_10:
+            dated.append((d, r))
+    dated.sort(key=lambda x: x[0])
+    return [r for _, r in dated]
+
+
+def build_estimates_snapshot_annual(rows: List[Dict[str, Any]], symbol: str, as_of: str) -> pd.DataFrame:
+    """Finviz-style annual: date>as_of 중 가장 가까운 1개 epsAvg->epsThisY, 2번째->epsNextY; 5번째로 epsNext5Y(CAGR)."""
+    sym = symbol.strip().upper()
+    filtered = _estimates_rows_after(rows, as_of)
+    eps_this = None
+    eps_next = None
+    eps_next_5y: Optional[float] = None
+    if len(filtered) >= 1:
+        eps_this = _estimates_eps_from_row(filtered[0])
+    if len(filtered) >= 2:
+        eps_next = _estimates_eps_from_row(filtered[1])
+    if len(filtered) >= 5:
+        eps_t0 = _estimates_eps_from_row(filtered[0])
+        eps_t5 = _estimates_eps_from_row(filtered[4])
+        if eps_t0 is not None and eps_t5 is not None and eps_t0 > 0:
+            try:
+                growth = (float(eps_t5) / float(eps_t0)) ** (1.0 / 5.0) - 1.0
+                eps_next_5y = growth
+            except (ZeroDivisionError, ValueError):
+                pass
+    df = pd.DataFrame([{
+        "symbol": sym,
+        "asOfDate": as_of,
+        "epsNextY": eps_next,
+        "epsNextQ": pd.NA,
+        "epsThisY": eps_this,
+        "epsNext5Y": eps_next_5y,
+    }])
+    return df.reindex(columns=ESTIMATES_SNAPSHOT_COLUMNS)
+
+
+def build_estimates_snapshot_quarter(rows: List[Dict[str, Any]], symbol: str, as_of: str) -> pd.DataFrame:
+    """Quarter estimates: date>as_of 중 가장 가까운 1개 epsAvg->epsNextQ."""
+    sym = symbol.strip().upper()
+    filtered = _estimates_rows_after(rows, as_of)
+    eps_next_q = _estimates_eps_from_row(filtered[0]) if filtered else None
+    df = pd.DataFrame([{
+        "symbol": sym,
+        "asOfDate": as_of,
+        "epsNextQ": eps_next_q,
+    }])
+    return df.reindex(columns=ESTIMATES_QUARTERLY_SNAPSHOT_COLUMNS)
 
 
 def build_targets_snapshot(data: Any, symbol: str, as_of: str) -> pd.DataFrame:
@@ -1326,39 +1390,52 @@ def build_targets_snapshot(data: Any, symbol: str, as_of: str) -> pd.DataFrame:
     return df.reindex(columns=TARGETS_SNAPSHOT_COLUMNS)
 
 
-def build_shares_snapshot_row(r: Dict[str, Any], as_of: str) -> Dict[str, Any]:
+def build_company_facts_from_shares_row(r: Dict[str, Any], as_of: str) -> Dict[str, Any]:
+    """One row for company_facts_snapshot from shares-float-all; profile fields NA."""
     sym = (r.get("symbol") or r.get("ticker") or "").strip().upper()
     return {
         "symbol": sym,
         "asOfDate": as_of,
-        "sharesOutstanding": pick(r, ["outstandingShares", "sharesOutstanding", "commonStockSharesOutstanding"]),
+        "sector": pd.NA,
+        "industry": pd.NA,
+        "employees": pd.NA,
+        "ipoDate": pd.NA,
+        "sharesOutstanding_profile": pd.NA,
+        "sharesOutstanding_shares": pick(r, ["outstandingShares", "sharesOutstanding", "commonStockSharesOutstanding"]),
         "sharesFloat": pick(r, ["floatShares", "sharesFloat", "float"]),
     }
 
 
-def build_company_profile_snapshot_from_bulk(
+def build_company_facts_from_profile(
     rows: List[Dict[str, Any]],
     sym_set: Set[str],
     as_of: str,
 ) -> pd.DataFrame:
+    """Company_facts_snapshot DF from profile (per-symbol); shares cols NA."""
     out = []
     for r in rows:
         sym = (r.get("symbol") or r.get("ticker") or "").strip().upper()
         if not sym or (sym_set and sym not in sym_set):
             continue
+        sector = pick_text(r, ["sector"])
+        industry = pick_text(r, ["industry"])
         emp = pick(r, ["fullTimeEmployees", "employees", "employeeCount"])
         if emp is not None and isinstance(emp, (int, float)):
             emp = float(emp)
         out.append({
             "symbol": sym,
             "asOfDate": as_of,
+            "sector": sector if sector is not None else pd.NA,
+            "industry": industry if industry is not None else pd.NA,
             "employees": emp,
             "ipoDate": pick_date10(r, ["ipoDate", "ipoDate", "date"]),
-            "sharesOutstanding": pick(r, ["sharesOutstanding", "outstandingShares", "commonStockSharesOutstanding"]),
+            "sharesOutstanding_profile": pick(r, ["sharesOutstanding", "outstandingShares", "commonStockSharesOutstanding"]),
+            "sharesOutstanding_shares": pd.NA,
+            "sharesFloat": pd.NA,
         })
     if not out:
-        return pd.DataFrame(columns=COMPANY_PROFILE_SNAPSHOT_COLUMNS)
-    return pd.DataFrame(out).reindex(columns=COMPANY_PROFILE_SNAPSHOT_COLUMNS)
+        return pd.DataFrame(columns=COMPANY_FACTS_SNAPSHOT_COLUMNS)
+    return pd.DataFrame(out).reindex(columns=COMPANY_FACTS_SNAPSHOT_COLUMNS)
 
 
 def build_insider_transactions(rows: List[Dict[str, Any]], symbol: str) -> pd.DataFrame:
@@ -1482,7 +1559,10 @@ def upsert_table(
     new_df: pd.DataFrame,
     pk: List[str],
     columns: List[str],
+    *,
+    allow_empty_overwrite: bool = True,
 ) -> None:
+    """Concat existing + new_df, dedupe by pk, save. When allow_empty_overwrite=False and new_df is empty, skip write (keep existing); log only."""
     path_pq = outdir / f"{name}.parquet"
     path_csv = outdir / f"{name}.csv"
     existing = pd.DataFrame()
@@ -1492,6 +1572,12 @@ def upsert_table(
         except Exception:
             pass
     if new_df.empty and existing.empty:
+        return
+    if not allow_empty_overwrite and new_df.empty and not existing.empty:
+        log.info("%s: skip save (new_df empty, allow_empty_overwrite=False; existing kept)", name)
+        return
+    if not allow_empty_overwrite and new_df.empty:
+        log.info("%s: skip save (new_df empty, no existing file; not creating empty)", name)
         return
     combined = pd.concat([existing, new_df], ignore_index=True)
     for c in columns:
@@ -1690,18 +1776,8 @@ def log_prices_eod_adjclose_observability(outdir: Path, df: Optional[pd.DataFram
         )
 
 
-def _max_date_from_rows(rows: List[Dict[str, Any]], keys: List[str]) -> Optional[str]:
-    """Extract max YYYY-MM-DD from list of dicts using pick_date10 on keys."""
-    dates: List[str] = []
-    for r in rows:
-        d = pick_date10(r, keys)
-        if d:
-            dates.append(d)
-    return max(dates) if dates else None
-
-
 # -----------------------------------------------------------------------------
-# 증분 감지 공통: 저장된 최신 날짜 맵, 날짜 범위 필터, PK/컬럼 비교 (earnings/dividends 확장 가능)
+# 증분 감지 공통: 저장된 최신 날짜 맵, 날짜 범위 필터 (trigger 등에서 사용)
 # -----------------------------------------------------------------------------
 
 
@@ -1748,376 +1824,6 @@ def filter_rows_by_date_range(
         if from_date <= d <= to_date:
             out.append(r)
     return out
-
-
-def _value_equals(a: Any, b: Any) -> bool:
-    """NaN==NaN 동일, float는 동일 또는 abs(diff)<1e-9."""
-    if pd.isna(a) and pd.isna(b):
-        return True
-    if pd.isna(a) or pd.isna(b):
-        return False
-    try:
-        fa, fb = float(a), float(b)
-        if fa == fb:
-            return True
-        return abs(fa - fb) < 1e-9
-    except (TypeError, ValueError):
-        return a == b
-
-
-def detect_changes(
-    new_df: pd.DataFrame,
-    existing_df: pd.DataFrame,
-    pk_columns: List[str],
-    compare_columns: List[str],
-) -> bool:
-    """PK가 새로 있거나, 기존 PK인데 compare_columns 중 하나라도 값이 다르면 True. earnings/dividends 등 재사용 가능."""
-    if new_df.empty:
-        return False
-    if existing_df.empty:
-        return True
-    if not all(p in existing_df.columns for p in pk_columns):
-        return True
-    existing_sub = existing_df[[c for c in pk_columns + compare_columns if c in existing_df.columns]].copy()
-    new_sub = new_df[[c for c in pk_columns + compare_columns if c in new_df.columns]].copy()
-    existing_by_pk = existing_sub.set_index(pk_columns)
-    for _, new_row in new_sub.iterrows():
-        pk_tuple = tuple(new_row.get(p) for p in pk_columns)
-        if pk_tuple not in existing_by_pk.index:
-            return True
-        old_row = existing_by_pk.loc[pk_tuple]
-        if isinstance(old_row, pd.DataFrame):
-            old_row = old_row.iloc[0]
-        for col in compare_columns:
-            if col not in new_sub.columns or col not in existing_sub.columns:
-                continue
-            if not _value_equals(new_row.get(col), old_row.get(col)):
-                return True
-    return False
-
-
-def run_watermark_tables(
-    session: requests.Session,
-    rl: RateLimiter,
-    api_key: str,
-    outdir: Path,
-    universe: List[str],
-    call_counter: Dict[str, Any],
-    today: str,
-    max_workers: int,
-    insider_limit: int = 200,
-    insider_common_stock_only: bool = True,
-    include_insider: bool = False,
-    run_dividends_detection: bool = False,
-    weekly_dividends_full_refresh: bool = False,
-    num_shards: int = 1,
-    shard_id: int = 0,
-    monthly_financials_cap: Optional[int] = None,
-    log_start: bool = False,
-) -> None:
-    """Watermark-based change detection. earnings → trigger financials. last_checked_at/last_status on every attempt; last_date only on update.
-    run_dividends_detection: daily=False; weekly=True. weekly_dividends_full_refresh: when limit unsupported, allow full refresh in weekly (opt-in)."""
-    watermarks_df = load_watermarks(outdir)
-    today_dt = date.today()
-    force_financials_monthly = today_dt.day == 1
-    if log_start:
-        log.info(
-            "run_watermark_tables: today=%s monthly_safeguard=%s run_dividends_detection=%s weekly_dividends_full_refresh=%s universe_size=%s include_insider=%s",
-            today, force_financials_monthly, run_dividends_detection, weekly_dividends_full_refresh, len(universe), include_insider,
-        )
-
-    # --- earnings_events (limit=2 lightweight detection) ---
-    symbols_earnings: List[str] = []
-    for sym in universe:
-        try:
-            rows = fetch_earnings(session, rl, api_key, sym, 2, call_counter)
-            watermarks_df = touch_watermark(watermarks_df, "earnings_events", sym, today, status="ok")
-            max_d = _max_date_from_rows(rows, ["date", "fiscalDateEnding", "earningsDate"])
-            w = get_watermark(watermarks_df, "earnings_events", sym)
-            if max_d and (w is None or max_d > w):
-                symbols_earnings.append(sym)
-                log.info("[earnings] %s → update detected", sym)
-            else:
-                log.info("[earnings] %s → no update", sym)
-        except Exception as e:
-            log.info("[earnings] %s detection failed: %s", sym, _safe_log_message(e))
-            watermarks_df = touch_watermark(watermarks_df, "earnings_events", sym, today, status="fail")
-    if symbols_earnings:
-        def _earn_full(s: str) -> pd.DataFrame:
-            sess = make_session()
-            try:
-                r = fetch_earnings(sess, rl, api_key, s, 400, call_counter)
-                df = build_earnings_events(r, s, CUTOFF_DATE)
-                return df
-            except Exception as e:
-                log.debug("%s earnings full: %s", s, e)
-                return pd.DataFrame(columns=EARNINGS_EVENTS_COLUMNS)
-        if max_workers <= 1:
-            earn_dfs = [_earn_full(s) for s in symbols_earnings]
-        else:
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                earn_dfs = list(ex.map(_earn_full, symbols_earnings))
-        non_empty = [d for d in earn_dfs if not d.empty]
-        if non_empty:
-            combined = pd.concat(non_empty, ignore_index=True)
-            upsert_table(outdir, "earnings_events", combined, ["symbol", "earningsDate"], EARNINGS_EVENTS_COLUMNS)
-            for s in symbols_earnings:
-                log.info("[earnings] %s → updated", s)
-            if "earningsDate" in combined.columns:
-                for s in symbols_earnings:
-                    sub = combined.loc[combined["symbol"] == s, "earningsDate"].dropna().astype(str)
-                    if not sub.empty:
-                        max_d = sub.str[:10].max()
-                        watermarks_df = set_watermark_date(watermarks_df, "earnings_events", s, max_d, today)
-    # --- dividends_events: light detection (limit=2) when API supports it; else weekly full refresh only if --weekly-dividends-full-refresh ---
-    symbols_div: List[str] = []
-    dividends_light_available: Optional[bool] = None
-    if run_dividends_detection:
-        if universe:
-            probe_rows, dividends_light_available = fetch_dividends_light(
-                session, rl, api_key, universe[0], DIVIDENDS_LIGHT_LIMIT, call_counter
-            )
-            if dividends_light_available is False and not weekly_dividends_full_refresh:
-                log.info(
-                    "dividends: LIMIT unsupported; weekly dividends skipped (use --weekly-dividends-full-refresh to enable full refresh)"
-                )
-            elif dividends_light_available is False and weekly_dividends_full_refresh:
-                log.info("dividends: LIMIT unsupported; performing weekly dividends full refresh (heavy)")
-        if dividends_light_available:
-            for sym in universe:
-                try:
-                    rows, light_ok = fetch_dividends_light(session, rl, api_key, sym, DIVIDENDS_LIGHT_LIMIT, call_counter)
-                    watermarks_df = touch_watermark(watermarks_df, "dividends_events", sym, today, status="ok")
-                    if not light_ok:
-                        log.info("[dividends] %s → light failed, skip", sym)
-                        continue
-                    max_d = _max_date_from_rows(rows, ["date", "exDividendDate", "exDate"])
-                    w = get_watermark(watermarks_df, "dividends_events", sym)
-                    if max_d and (w is None or max_d > w):
-                        symbols_div.append(sym)
-                        log.info("[dividends] %s → update detected (light)", sym)
-                    else:
-                        log.info("[dividends] %s → no update", sym)
-                except Exception as e:
-                    log.info("[dividends] %s detection failed: %s", sym, _safe_log_message(e))
-                    watermarks_df = touch_watermark(watermarks_df, "dividends_events", sym, today, status="fail")
-        elif dividends_light_available is False and weekly_dividends_full_refresh:
-            for sym in universe:
-                try:
-                    rows = fetch_dividends(session, rl, api_key, sym, call_counter)
-                    watermarks_df = touch_watermark(watermarks_df, "dividends_events", sym, today, status="ok")
-                    max_d = _max_date_from_rows(rows, ["date", "exDividendDate", "exDate"])
-                    w = get_watermark(watermarks_df, "dividends_events", sym)
-                    if max_d and (w is None or max_d > w):
-                        symbols_div.append(sym)
-                        log.info("[dividends] %s → update detected (full)", sym)
-                    else:
-                        log.info("[dividends] %s → skipped", sym)
-                except Exception as e:
-                    log.info("[dividends] %s detection failed: %s", sym, _safe_log_message(e))
-                    watermarks_df = touch_watermark(watermarks_df, "dividends_events", sym, today, status="fail")
-    if symbols_div:
-        def _div_full(s: str) -> pd.DataFrame:
-            sess = make_session()
-            try:
-                r = fetch_dividends(sess, rl, api_key, s, call_counter)
-                return build_dividends_events(r, s, CUTOFF_DATE)
-            except Exception as e:
-                log.debug("%s dividends full: %s", s, e)
-                return pd.DataFrame(columns=DIVIDENDS_EVENTS_COLUMNS)
-        if max_workers <= 1:
-            div_dfs = [_div_full(s) for s in symbols_div]
-        else:
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                div_dfs = list(ex.map(_div_full, symbols_div))
-        non_empty = [d for d in div_dfs if not d.empty]
-        if non_empty:
-            combined = pd.concat(non_empty, ignore_index=True)
-            combined["_d"] = combined["paymentDate"].astype(str)
-            combined = combined.drop_duplicates(subset=["symbol", "exDate", "_d", "dividend"], keep="last")
-            combined = combined.drop(columns=["_d"], errors="ignore")
-            upsert_table(outdir, "dividends_events", combined, ["symbol", "exDate", "paymentDate", "dividend"], DIVIDENDS_EVENTS_COLUMNS)
-            for s in symbols_div:
-                log.info("[dividends] %s → updated", s)
-            if "exDate" in combined.columns:
-                for s in symbols_div:
-                    sub = combined.loc[combined["symbol"] == s, "exDate"].dropna().astype(str)
-                    if not sub.empty:
-                        max_d = sub.str[:10].max()
-                        watermarks_df = set_watermark_date(watermarks_df, "dividends_events", s, max_d, today)
-    # --- financials_quarterly: 저장된 최신 날짜 기반 증분 감지 → 변경된 심볼만 upsert (earnings 트리거 제거) ---
-    existing_fin = load_existing_table(outdir, "financials_quarterly")
-    if not existing_fin.empty and "fiscalDate" in existing_fin.columns:
-        existing_fin = existing_fin.copy()
-        existing_fin["fiscalDate"] = pd.to_datetime(existing_fin["fiscalDate"], errors="coerce").dt.strftime("%Y-%m-%d")
-    last_saved_fin = last_saved_date_map(existing_fin, "symbol", "fiscalDate", CUTOFF_DATE)
-    symbols_fin = list(universe)
-    if force_financials_monthly and monthly_financials_cap is not None and monthly_financials_cap >= 1:
-        symbols_fin = symbols_fin[:monthly_financials_cap]
-        log.info("monthly safeguard: financials capped to %s symbols", len(symbols_fin))
-    to_date_fin = today
-    cutoff_dt = date.fromisoformat(CUTOFF_DATE[:10])
-    fin_date_keys = ["date", "fiscalDateEnding", "fillingDate"]
-    as_reported_state_fin: Dict[str, Any] = {
-        "disabled_cashflow": False,
-        "disabled_balance": False,
-        "warned_cashflow": False,
-        "warned_balance": False,
-        "lock": threading.Lock(),
-    }
-
-    collected_fin: List[pd.DataFrame] = []
-    succeeded_fin: List[str] = []
-    for sym in symbols_fin:
-        last_saved = last_saved_fin.get(sym, CUTOFF_DATE)
-        try:
-            last_dt = date.fromisoformat(str(last_saved)[:10])
-        except ValueError:
-            last_dt = cutoff_dt
-        from_dt = max(last_dt - timedelta(days=7), cutoff_dt)
-        from_date_fin = from_dt.isoformat()
-        try:
-            inc = fetch_income(session, rl, api_key, sym, 200, call_counter)
-            bal = fetch_balance(session, rl, api_key, sym, 200, call_counter)
-            cf = fetch_cashflow(session, rl, api_key, sym, 200, call_counter)
-        except Exception as e:
-            log.debug("financials fetch %s: %s", sym, _safe_log_message(e))
-            watermarks_df = touch_watermark(watermarks_df, "financials_quarterly", sym, today, status="fail")
-            continue
-        inc_f = filter_rows_by_date_range(inc or [], fin_date_keys, from_date_fin, to_date_fin)
-        bal_f = filter_rows_by_date_range(bal or [], fin_date_keys, from_date_fin, to_date_fin)
-        cf_f = filter_rows_by_date_range(cf or [], fin_date_keys, from_date_fin, to_date_fin)
-        new_df = build_financials_quarterly(inc_f, bal_f, cf_f, sym, from_date_fin)
-        new_df = enrich_financials_quarterly_from_as_reported(new_df, sym, session, rl, api_key, call_counter, as_reported_state_fin, 200)
-        existing_slice = existing_fin.loc[existing_fin["symbol"] == sym] if not existing_fin.empty else pd.DataFrame()
-        changed = detect_changes(new_df, existing_slice, FINANCIALS_PK, FINANCIALS_COMPARE_COLUMNS)
-        new_max_date = None
-        if not new_df.empty and "fiscalDate" in new_df.columns:
-            new_max_date = new_df["fiscalDate"].max()
-            if hasattr(new_max_date, "strftime"):
-                new_max_date = new_max_date.strftime("%Y-%m-%d")[:10]
-            else:
-                new_max_date = str(new_max_date)[:10] if new_max_date is not None else None
-        log.info(
-            "[financials] symbol=%s last_saved_date=%s new_max_date=%s n_new_rows=%s changed=%s",
-            sym, last_saved, new_max_date, len(new_df), changed,
-        )
-        if new_df.empty:
-            watermarks_df = touch_watermark(watermarks_df, "financials_quarterly", sym, today, status="fail")
-            continue
-        if changed:
-            collected_fin.append(new_df)
-            succeeded_fin.append(sym)
-    if collected_fin:
-        combined_fin = pd.concat(collected_fin, ignore_index=True)
-        upsert_table(outdir, "financials_quarterly", combined_fin, FINANCIALS_PK, FINANCIALS_QUARTERLY_COLUMNS)
-        for s in succeeded_fin:
-            watermarks_df = touch_watermark(watermarks_df, "financials_quarterly", s, today, status="ok")
-            sub = combined_fin.loc[combined_fin["symbol"] == s, "fiscalDate"].dropna().astype(str)
-            if not sub.empty:
-                max_d = sub.str[:10].max()
-                watermarks_df = set_watermark_date(watermarks_df, "financials_quarterly", s, max_d, today)
-        log.info("financials upserted rows=%s symbols=%s", len(combined_fin), len(succeeded_fin))
-    # --- insider_transactions (stable /stable/insider-trading/search); 403/restricted → one-time disable ---
-    insider_disabled = False
-    insider_warning_logged = False
-
-    def _insider_restricted(code: int, body: str) -> bool:
-        if code in (402, 403):
-            return True
-        if code >= 400 and body and ("restricted" in body.lower() or "subscription" in body.lower() or "not available" in body.lower()):
-            return True
-        return False
-
-    if include_insider:
-        symbols_insider: List[str] = []
-        first_insider_probe = True
-        for sym in universe:
-            if insider_disabled:
-                break
-            if first_insider_probe:
-                first_insider_probe = False
-                result = fetch_insider_trading_stable(session, rl, api_key, sym, page=0, limit=2, call_counter=call_counter, return_status=True)
-                if isinstance(result, tuple) and len(result) == 2 and result[1] is not None:
-                    code, body, headers = result[1]
-                    snippet = _sanitize_snippet(body if isinstance(body, str) else str(body))
-                    rl_h = _rate_limit_headers(headers)
-                    retry_after = rl_h.get("Retry-After", "<none>") or "<none>"
-                    rl_remaining = rl_h.get("X-RateLimit-Remaining", "")
-                    log.info(
-                        "insider probe: symbol=%s status=%s snippet=\"%s\" retry_after=\"%s\" rl_remaining=\"%s\"",
-                        sym, code, snippet, retry_after, rl_remaining,
-                    )
-                    if _insider_restricted(code, body if isinstance(body, str) else str(body)):
-                        if not insider_warning_logged:
-                            log.warning("insider_snapshot/transactions disabled due to subscription restriction")
-                            insider_warning_logged = True
-                        insider_disabled = True
-                        watermarks_df = touch_watermark(watermarks_df, "insider_transactions", sym, today, status="fail")
-                        break
-                else:
-                    rows = result[0] if isinstance(result, tuple) and result[0] is not None else []
-                    watermarks_df = touch_watermark(watermarks_df, "insider_transactions", sym, today, status="ok")
-                    max_d = _max_date_from_rows(rows, ["transactionDate", "date"])
-                    w = get_watermark(watermarks_df, "insider_transactions", sym)
-                    if max_d and (w is None or max_d > w):
-                        symbols_insider.append(sym)
-                        log.info("[insider] %s → update detected", sym)
-                    else:
-                        log.info("[insider] %s → skipped", sym)
-                continue
-            try:
-                rows = fetch_insider_trading_stable(session, rl, api_key, sym, page=0, limit=2, call_counter=call_counter)
-                watermarks_df = touch_watermark(watermarks_df, "insider_transactions", sym, today, status="ok")
-                max_d = _max_date_from_rows(rows, ["transactionDate", "date"])
-                w = get_watermark(watermarks_df, "insider_transactions", sym)
-                if max_d and (w is None or max_d > w):
-                    symbols_insider.append(sym)
-                    log.info("[insider] %s → update detected", sym)
-                else:
-                    log.info("[insider] %s → skipped", sym)
-            except RuntimeError as e:
-                msg = str(e).lower()
-                if "403" in msg or "402" in msg or "restricted" in msg:
-                    if not insider_warning_logged:
-                        log.warning("insider_snapshot/transactions disabled due to subscription restriction")
-                        insider_warning_logged = True
-                    insider_disabled = True
-                    watermarks_df = touch_watermark(watermarks_df, "insider_transactions", sym, today, status="fail")
-                    break
-            except Exception as e:
-                log.info("[insider] %s detection failed: %s", sym, _safe_log_message(e))
-                watermarks_df = touch_watermark(watermarks_df, "insider_transactions", sym, today, status="fail")
-        if symbols_insider and not insider_disabled:
-            def _insider_full(s: str) -> pd.DataFrame:
-                sess = make_session()
-                try:
-                    r = fetch_insider_trading_stable(sess, rl, api_key, s, page=0, limit=insider_limit, call_counter=call_counter)
-                    return build_insider_transactions(r, s)
-                except Exception as e:
-                    log.debug("%s insider full: %s", s, e)
-                    return pd.DataFrame(columns=INSIDER_TRANSACTIONS_COLUMNS)
-            if max_workers <= 1:
-                insider_dfs = [_insider_full(s) for s in symbols_insider]
-            else:
-                with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                    insider_dfs = list(ex.map(_insider_full, symbols_insider))
-            non_empty = [d for d in insider_dfs if not d.empty]
-            if non_empty:
-                combined = pd.concat(non_empty, ignore_index=True)
-                upsert_table(outdir, "insider_transactions", combined, ["symbol", "transactionDate", "reportingCik", "transactionType", "securitiesTransacted", "securityName"], INSIDER_TRANSACTIONS_COLUMNS)
-                holdings_df = build_insider_holdings_snapshot(combined, today, common_stock_only=insider_common_stock_only)
-                if not holdings_df.empty:
-                    upsert_table(outdir, "insider_holdings_snapshot", holdings_df, ["symbol", "asOfDate", "reportingCik", "securityName"], INSIDER_HOLDINGS_SNAPSHOT_COLUMNS)
-                for s in symbols_insider:
-                    log.info("[insider] %s → updated", s)
-                if "transactionDate" in combined.columns:
-                    for s in symbols_insider:
-                        sub = combined.loc[combined["symbol"] == s, "transactionDate"].dropna().astype(str)
-                        if not sub.empty:
-                            max_d = sub.str[:10].max()
-                            watermarks_df = set_watermark_date(watermarks_df, "insider_transactions", s, max_d, today)
-    save_watermarks(outdir, watermarks_df)
 
 
 def run_backfill(
@@ -2247,131 +1953,158 @@ def run_backfill(
         earn_combined = pd.concat(non_empty_earn, ignore_index=True)
         upsert_table(outdir, "earnings_events", earn_combined, ["symbol", "earningsDate"], EARNINGS_EVENTS_COLUMNS)
 
-    # (5)(6)(7) snapshots: current run only
+    # (5)(6)(7) snapshots: annual + quarter estimates, targets
     as_of = today
-    est_rows, tgt_rows = [], []
+    est_annual_rows: List[pd.DataFrame] = []
+    est_quarter_rows: List[pd.DataFrame] = []
+    tgt_rows: List[pd.DataFrame] = []
 
     for sym in universe:
         try:
-            ae = fetch_analyst_estimates(session, rl, api_key, sym, call_counter)
-            est_rows.append(build_estimates_snapshot(ae, sym, as_of))
-        except Exception:
-            pass
+            ae_a = fetch_analyst_estimates(session, rl, api_key, sym, call_counter, period="annual", page=0, limit=10)
+            est_annual_rows.append(build_estimates_snapshot_annual(ae_a, sym, as_of))
+        except Exception as e:
+            log.warning("analyst-estimates(annual) failed for %s: %s", sym, _safe_log_message(e))
+        try:
+            ae_q = fetch_analyst_estimates(session, rl, api_key, sym, call_counter, period="quarter", page=0, limit=10)
+            est_quarter_rows.append(build_estimates_snapshot_quarter(ae_q, sym, as_of))
+        except Exception as e:
+            log.warning("analyst-estimates(quarter) failed for %s: %s", sym, _safe_log_message(e))
         try:
             pt = fetch_price_target_consensus(session, rl, api_key, sym, call_counter)
             tgt_rows.append(build_targets_snapshot(pt, sym, as_of))
         except Exception:
             pass
 
-    if est_rows:
-        est_df = pd.concat(est_rows, ignore_index=True)
+    if est_annual_rows:
+        est_df = pd.concat(est_annual_rows, ignore_index=True)
         upsert_table(outdir, "estimates_snapshot", est_df, ["symbol", "asOfDate"], ESTIMATES_SNAPSHOT_COLUMNS)
+    if est_quarter_rows:
+        est_q_df = pd.concat(est_quarter_rows, ignore_index=True)
+        upsert_table(outdir, "estimates_quarterly_snapshot", est_q_df, ["symbol", "asOfDate"], ESTIMATES_QUARTERLY_SNAPSHOT_COLUMNS)
     if tgt_rows:
         tgt_df = pd.concat(tgt_rows, ignore_index=True)
         upsert_table(outdir, "targets_snapshot", tgt_df, ["symbol", "asOfDate"], TARGETS_SNAPSHOT_COLUMNS)
 
-    if include_shares_snapshot:
-        sh_rows: List[Dict[str, Any]] = []
-        shares_disabled = False
-        page = 0
-        while True:
-            try:
-                sh_list = fetch_shares_float_all(session, rl, api_key, page, 1000, call_counter)
-                if not sh_list:
-                    break
-                for r in sh_list:
-                    sym = (r.get("symbol") or r.get("ticker") or "").strip().upper()
-                    if sym not in sym_set:
-                        continue
-                    sh_rows.append(build_shares_snapshot_row(r, as_of))
-                if len(sh_list) < 1000:
-                    break
-                page += 1
-            except RuntimeError as e:
-                msg = str(e).lower()
-                if "403" in msg or "402" in msg or "restricted" in msg or "subscription" in msg:
-                    if not shares_disabled:
-                        log.warning("shares_snapshot disabled: restricted/unsupported endpoint")
-                        shares_disabled = True
-                    break
-            except Exception as e:
-                log.debug("shares_float_all page %s: %s", page, e)
-                break
-        if sh_rows and not shares_disabled:
-            sh_df = pd.DataFrame(sh_rows).reindex(columns=SHARES_SNAPSHOT_COLUMNS)
-            upsert_table(outdir, "shares_snapshot", sh_df, ["symbol", "asOfDate"], SHARES_SNAPSHOT_COLUMNS)
+    # company_facts_snapshot: 항상 실행. profile(per-symbol) + shares-float-all; 제한 시 해당 소스만 스킵.
+    facts_profile_df: Optional[pd.DataFrame] = None
+    facts_shares_df: Optional[pd.DataFrame] = None
 
-    if include_company_profile:
-        profile_disabled = False
-        profile_rows: List[Dict[str, Any]] = []
-        for sym in universe:
-            if profile_disabled:
+    sh_rows: List[Dict[str, Any]] = []
+    shares_restricted = False
+    page = 0
+    while True:
+        try:
+            sh_list = fetch_shares_float_all(session, rl, api_key, page, 1000, call_counter)
+            if not sh_list:
                 break
-            try:
-                raw = fetch_profile_symbol(session, rl, api_key, sym.strip().upper(), call_counter)
-                if raw:
-                    profile_rows.extend(raw)
-            except RuntimeError as e:
-                msg = str(e).lower()
-                if "403" in msg or "402" in msg or "restricted" in msg or "subscription" in msg:
-                    if not profile_disabled:
-                        log.warning("profile disabled: restricted by subscription")
-                        profile_disabled = True
-                    break
-            except Exception:
-                pass
-        if profile_rows and not profile_disabled:
-            profile_df = build_company_profile_snapshot_from_bulk(profile_rows, sym_set, today)
-            if not profile_df.empty:
-                upsert_table(outdir, "company_profile_snapshot", profile_df, ["symbol", "asOfDate"], COMPANY_PROFILE_SNAPSHOT_COLUMNS)
+            for r in sh_list:
+                sym = (r.get("symbol") or r.get("ticker") or "").strip().upper()
+                if sym not in sym_set:
+                    continue
+                sh_rows.append(build_company_facts_from_shares_row(r, as_of))
+            if len(sh_list) < 1000:
+                break
+            page += 1
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "403" in msg or "402" in msg or "restricted" in msg or "subscription" in msg:
+                if not shares_restricted:
+                    log.warning("shares (company_facts): endpoint restricted; skipping shares source only")
+                    shares_restricted = True
+                break
+        except Exception as e:
+            log.debug("shares_float_all page %s: %s", page, e)
+            break
+    if sh_rows and not shares_restricted:
+        facts_shares_df = pd.DataFrame(sh_rows).reindex(columns=COMPANY_FACTS_SNAPSHOT_COLUMNS)
 
-    # insider_transactions: stable /stable/insider-trading/search; 403 → skip entire block, one-time warning
-    all_insider_dfs: List[pd.DataFrame] = []
-    insider_backfill_disabled = False
-    if universe:
-        first_sym = universe[0]
-        result = fetch_insider_trading_stable(session, rl, api_key, first_sym, page=0, limit=2, call_counter=call_counter, return_status=True)
+    # profile: per-symbol only (profile-bulk 제거)
+    profile_rows_list: List[Dict[str, Any]] = []
+    profile_restricted = False
+
+    for sym in universe:
+        if profile_restricted:
+            break
+        try:
+            raw = fetch_profile_symbol(session, rl, api_key, sym.strip().upper(), call_counter)
+            if raw:
+                profile_rows_list.extend(raw)
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "403" in msg or "402" in msg or "restricted" in msg or "subscription" in msg:
+                if not profile_restricted:
+                    log.warning("profile (company_facts): endpoint restricted; skipping profile source only")
+                    profile_restricted = True
+                break
+        except Exception:
+            pass
+
+    if profile_rows_list and not profile_restricted:
+        facts_profile_df = build_company_facts_from_profile(profile_rows_list, sym_set, today)
+
+    frames = []
+    if facts_profile_df is not None and not facts_profile_df.empty:
+        frames.append(facts_profile_df)
+    if facts_shares_df is not None and not facts_shares_df.empty:
+        frames.append(facts_shares_df)
+    if frames:
+        merged = frames[0]
+        for f in frames[1:]:
+            merged = merged.merge(f, on=["symbol", "asOfDate"], how="outer", suffixes=("_p", "_s"))
+        for c in COMPANY_FACTS_SNAPSHOT_COLUMNS:
+            if c + "_p" in merged.columns and c + "_s" in merged.columns:
+                merged[c] = merged[c + "_p"].fillna(merged[c + "_s"])
+            elif c + "_p" in merged.columns:
+                merged[c] = merged[c + "_p"]
+            elif c + "_s" in merged.columns:
+                merged[c] = merged[c + "_s"]
+        for c in COMPANY_FACTS_SNAPSHOT_COLUMNS:
+            if c not in merged.columns:
+                merged[c] = pd.NA
+        merged = merged.reindex(columns=COMPANY_FACTS_SNAPSHOT_COLUMNS)
+    else:
+        merged = pd.DataFrame(columns=COMPANY_FACTS_SNAPSHOT_COLUMNS)
+    upsert_table(outdir, "company_facts_snapshot", merged, ["symbol", "asOfDate"], COMPANY_FACTS_SNAPSHOT_COLUMNS, allow_empty_overwrite=False)
+
+    # insider_transactions + insider_holdings_snapshot: 항상 실행. 402/403 시 해당 심볼만 스킵, 나머지 수집 후 upsert; 빈 결과면 기존 파일 유지.
+    def _insider_one(sym: str) -> pd.DataFrame:
+        sess = make_session()
+        result = fetch_insider_trading_stable(sess, rl, api_key, sym, page=0, limit=insider_limit, call_counter=call_counter, return_status=True)
         if isinstance(result, tuple) and len(result) == 2 and result[1] is not None:
-            code, body, headers = result[1]
-            snippet = _sanitize_snippet(body if isinstance(body, str) else str(body))
-            rl_h = _rate_limit_headers(headers)
-            log.info(
-                "insider probe: symbol=%s status=%s snippet=\"%s\" retry_after=\"%s\" rl_remaining=\"%s\"",
-                first_sym, code, snippet, rl_h.get("Retry-After", "<none>") or "<none>", rl_h.get("X-RateLimit-Remaining", ""),
-            )
-            body_str = (body if isinstance(body, str) else str(body)).lower()
-            if code in (402, 403) or (code >= 400 and ("restricted" in body_str or "subscription" in body_str)):
-                log.warning("insider_snapshot/transactions disabled due to subscription restriction")
-                insider_backfill_disabled = True
-
-    if not insider_backfill_disabled:
-
-        def _insider_one(sym: str) -> pd.DataFrame:
-            sess = make_session()
-            try:
-                rows = fetch_insider_trading_stable(sess, rl, api_key, sym, page=0, limit=insider_limit, call_counter=call_counter)
-                return build_insider_transactions(rows, sym)
-            except Exception as e:
-                log.debug("%s insider_trading: %s", sym, e)
+            code, body, _ = result[1]
+            if code in (402, 403):
+                log.debug("%s insider: restricted (status=%s), skipping symbol", sym, code)
                 return pd.DataFrame(columns=INSIDER_TRANSACTIONS_COLUMNS)
+            if code >= 400:
+                body_str = (body if isinstance(body, str) else str(body)).lower()
+                if "restricted" in body_str or "subscription" in body_str or "not available" in body_str:
+                    log.debug("%s insider: restricted, skipping symbol", sym)
+                    return pd.DataFrame(columns=INSIDER_TRANSACTIONS_COLUMNS)
+        rows = result[0] if isinstance(result, tuple) and result[0] is not None else []
+        return build_insider_transactions(rows, sym)
 
-        if max_workers <= 1:
-            for sym in universe:
-                all_insider_dfs.append(_insider_one(sym))
-        else:
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                for df in ex.map(_insider_one, universe):
-                    all_insider_dfs.append(df)
+    all_insider_dfs: List[pd.DataFrame] = []
+    if max_workers <= 1:
+        for sym in universe:
+            all_insider_dfs.append(_insider_one(sym))
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            for df in ex.map(_insider_one, universe):
+                all_insider_dfs.append(df)
     non_empty_insider = [d for d in all_insider_dfs if not d.empty]
     if non_empty_insider:
         insider_combined = pd.concat(non_empty_insider, ignore_index=True)
-        upsert_table(outdir, "insider_transactions", insider_combined, ["symbol", "transactionDate", "reportingCik", "transactionType", "securitiesTransacted", "securityName"], INSIDER_TRANSACTIONS_COLUMNS)
+        upsert_table(outdir, "insider_transactions", insider_combined, ["symbol", "transactionDate", "reportingCik", "transactionType", "securitiesTransacted", "securityName"], INSIDER_TRANSACTIONS_COLUMNS, allow_empty_overwrite=False)
         holdings_df = build_insider_holdings_snapshot(insider_combined, today, common_stock_only=insider_common_stock_only)
         if not holdings_df.empty:
-            upsert_table(outdir, "insider_holdings_snapshot", holdings_df, ["symbol", "asOfDate", "reportingCik", "securityName"], INSIDER_HOLDINGS_SNAPSHOT_COLUMNS)
+            upsert_table(outdir, "insider_holdings_snapshot", holdings_df, ["symbol", "asOfDate", "reportingCik", "securityName"], INSIDER_HOLDINGS_SNAPSHOT_COLUMNS, allow_empty_overwrite=False)
+    else:
+        upsert_table(outdir, "insider_transactions", pd.DataFrame(columns=INSIDER_TRANSACTIONS_COLUMNS), ["symbol", "transactionDate", "reportingCik", "transactionType", "securitiesTransacted", "securityName"], INSIDER_TRANSACTIONS_COLUMNS, allow_empty_overwrite=False)
+        upsert_table(outdir, "insider_holdings_snapshot", pd.DataFrame(columns=INSIDER_HOLDINGS_SNAPSHOT_COLUMNS), ["symbol", "asOfDate", "reportingCik", "securityName"], INSIDER_HOLDINGS_SNAPSHOT_COLUMNS, allow_empty_overwrite=False)
 
-    # index_membership: real fetch per index_symbol, build rows for sym_set only
-    index_list = index_symbols or ["SP500"]
+    # index_membership: 항상 실행 (기본 SP500). 실패한 인덱스만 로그 후 continue, run 정상 종료.
+    index_list = index_symbols if index_symbols is not None and len(index_symbols) > 0 else ["SP500"]
     for idx_sym in index_list:
         idx_sym = idx_sym.strip().upper()
         if not idx_sym:
@@ -2382,7 +2115,7 @@ def run_backfill(
             if not idx_df.empty:
                 upsert_table(outdir, "index_membership", idx_df, ["indexSymbol", "asOfDate", "memberSymbol"], INDEX_MEMBERSHIP_COLUMNS)
         except Exception as e:
-            log.debug("index_membership %s: %s", idx_sym, e)
+            log.warning("index_membership %s: %s (skipping index, run continues)", idx_sym, _safe_log_message(e))
 
 
 def run_debug_financials_fields(
@@ -2427,15 +2160,8 @@ def run_daily(
     max_workers: int,
     only_symbol: Optional[str],
     call_counter: Dict[str, Any],
-    insider_limit: int = 200,
-    insider_common_stock_only: bool = True,
-    index_symbols: Optional[List[str]] = None,
-    daily_include_insider: bool = False,
-    daily_include_index: bool = False,
-    include_company_profile: bool = False,
-    include_shares_snapshot: bool = False,
 ) -> None:
-    """Daily 모드: prices_eod(per-symbol 증분), estimates/targets 갱신. profile/shares는 opt-in. insider/index는 --daily-include-* 시에만."""
+    """Daily 모드: prices_eod(per-symbol 증분)만 실행. 다른 테이블은 weekly에서 실행."""
 
     sym_set = set(universe)
     if only_symbol:
@@ -2488,104 +2214,6 @@ def run_daily(
     else:
         log.info("daily prices_eod: target_trade_date=%s no new rows (per-symbol incremental)", target_trade_date)
 
-    as_of = today
-    est_rows, tgt_rows = [], []
-    for sym in universe:
-        try:
-            ae = fetch_analyst_estimates(session, rl, api_key, sym, call_counter)
-            est_rows.append(build_estimates_snapshot(ae, sym, as_of))
-        except Exception:
-            pass
-        try:
-            pt = fetch_price_target_consensus(session, rl, api_key, sym, call_counter)
-            tgt_rows.append(build_targets_snapshot(pt, sym, as_of))
-        except Exception:
-            pass
-    if est_rows:
-        upsert_table(outdir, "estimates_snapshot", pd.concat(est_rows, ignore_index=True), ["symbol", "asOfDate"], ESTIMATES_SNAPSHOT_COLUMNS)
-    if tgt_rows:
-        upsert_table(outdir, "targets_snapshot", pd.concat(tgt_rows, ignore_index=True), ["symbol", "asOfDate"], TARGETS_SNAPSHOT_COLUMNS)
-
-    if include_shares_snapshot:
-        sh_rows: List[Dict[str, Any]] = []
-        shares_disabled = False
-        page = 0
-        while True:
-            try:
-                sh_list = fetch_shares_float_all(session, rl, api_key, page, 1000, call_counter)
-                if not sh_list:
-                    break
-                for r in sh_list:
-                    sym = (r.get("symbol") or r.get("ticker") or "").strip().upper()
-                    if sym not in sym_set:
-                        continue
-                    sh_rows.append(build_shares_snapshot_row(r, as_of))
-                if len(sh_list) < 1000:
-                    break
-                page += 1
-            except RuntimeError as e:
-                msg = str(e).lower()
-                if "403" in msg or "402" in msg or "restricted" in msg or "subscription" in msg:
-                    if not shares_disabled:
-                        log.warning("shares_snapshot disabled: restricted/unsupported endpoint")
-                        shares_disabled = True
-                    break
-            except Exception:
-                break
-        if sh_rows and not shares_disabled:
-            sh_df = pd.DataFrame(sh_rows).reindex(columns=SHARES_SNAPSHOT_COLUMNS)
-            upsert_table(outdir, "shares_snapshot", sh_df, ["symbol", "asOfDate"], SHARES_SNAPSHOT_COLUMNS)
-
-    if include_company_profile:
-        profile_disabled = False
-        profile_rows_d: List[Dict[str, Any]] = []
-        for sym in universe:
-            if profile_disabled:
-                break
-            try:
-                raw = fetch_profile_symbol(session, rl, api_key, sym.strip().upper(), call_counter)
-                if raw:
-                    profile_rows_d.extend(raw)
-            except RuntimeError as e:
-                msg = str(e).lower()
-                if "403" in msg or "402" in msg or "restricted" in msg or "subscription" in msg:
-                    if not profile_disabled:
-                        log.warning("profile disabled: restricted by subscription")
-                        profile_disabled = True
-                    break
-            except Exception:
-                pass
-        if profile_rows_d and not profile_disabled:
-            profile_df_d = build_company_profile_snapshot_from_bulk(profile_rows_d, sym_set, as_of)
-            if not profile_df_d.empty:
-                upsert_table(outdir, "company_profile_snapshot", profile_df_d, ["symbol", "asOfDate"], COMPANY_PROFILE_SNAPSHOT_COLUMNS)
-
-    # Watermark-based detection (daily: dividends 감지 생략; insider는 daily_include_insider 시에만)
-    run_watermark_tables(
-        session, rl, api_key, outdir, universe, call_counter, as_of,
-        max_workers=max_workers,
-        insider_limit=insider_limit,
-        insider_common_stock_only=insider_common_stock_only,
-        include_insider=daily_include_insider,
-        run_dividends_detection=False,
-        log_start=True,
-    )
-
-    if daily_include_index:
-        # index_membership: real fetch per index_symbol (daily opt-in)
-        index_list_d = index_symbols or ["SP500"]
-        for idx_sym_d in index_list_d:
-            idx_sym_d = idx_sym_d.strip().upper()
-            if not idx_sym_d:
-                continue
-            try:
-                members_set_d = fetch_index_constituents(session, rl, api_key, idx_sym_d, call_counter)
-                idx_df_d = build_index_membership(sym_set, idx_sym_d, members_set_d, as_of)
-                if not idx_df_d.empty:
-                    upsert_table(outdir, "index_membership", idx_df_d, ["indexSymbol", "asOfDate", "memberSymbol"], INDEX_MEMBERSHIP_COLUMNS)
-            except Exception as e:
-                log.debug("index_membership %s: %s", idx_sym_d, e)
-
 
 def run_weekly(
     session: requests.Session,
@@ -2595,65 +2223,440 @@ def run_weekly(
     universe: List[str],
     call_counter: Dict[str, Any],
     max_workers: int,
+    only_symbol: Optional[str] = None,
+) -> None:
+    """Weekly 모드: estimates_snapshot, targets_snapshot만 생성/업데이트. (company_facts/index/insider/watermark 미실행)"""
+    sym_set = set(universe)
+    if only_symbol:
+        only_set = {s.strip().upper() for s in only_symbol.split(",") if s.strip()}
+        if only_set:
+            sym_set = sym_set & only_set
+            universe = [s for s in universe if s in sym_set]
+    today = date.today().isoformat()
+    log.info("mode=weekly universe_size=%s", len(universe))
+
+    as_of = today
+    est_annual_rows: List[pd.DataFrame] = []
+    est_quarter_rows: List[pd.DataFrame] = []
+    tgt_rows: List[pd.DataFrame] = []
+    for sym in universe:
+        try:
+            ae_a = fetch_analyst_estimates(session, rl, api_key, sym, call_counter, period="annual", page=0, limit=10)
+            est_annual_rows.append(build_estimates_snapshot_annual(ae_a, sym, as_of))
+        except Exception as e:
+            log.warning("analyst-estimates(annual) failed for %s: %s", sym, _safe_log_message(e))
+        try:
+            ae_q = fetch_analyst_estimates(session, rl, api_key, sym, call_counter, period="quarter", page=0, limit=10)
+            est_quarter_rows.append(build_estimates_snapshot_quarter(ae_q, sym, as_of))
+        except Exception as e:
+            log.warning("analyst-estimates(quarter) failed for %s: %s", sym, _safe_log_message(e))
+        try:
+            pt = fetch_price_target_consensus(session, rl, api_key, sym, call_counter)
+            tgt_rows.append(build_targets_snapshot(pt, sym, as_of))
+        except Exception:
+            pass
+    if est_annual_rows:
+        upsert_table(outdir, "estimates_snapshot", pd.concat(est_annual_rows, ignore_index=True), ["symbol", "asOfDate"], ESTIMATES_SNAPSHOT_COLUMNS)
+    if est_quarter_rows:
+        upsert_table(outdir, "estimates_quarterly_snapshot", pd.concat(est_quarter_rows, ignore_index=True), ["symbol", "asOfDate"], ESTIMATES_QUARTERLY_SNAPSHOT_COLUMNS)
+    if tgt_rows:
+        upsert_table(outdir, "targets_snapshot", pd.concat(tgt_rows, ignore_index=True), ["symbol", "asOfDate"], TARGETS_SNAPSHOT_COLUMNS)
+
+
+def run_monthly(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    outdir: Path,
+    universe: List[str],
+    call_counter: Dict[str, Any],
+    max_workers: int,
+    index_symbols: Optional[List[str]],
+    include_company_profile: bool,
+    include_shares_snapshot: bool,
+    include_insider: bool = True,
     insider_limit: int = 200,
     insider_common_stock_only: bool = True,
-    include_insider: bool = False,
-    weekly_dividends_full_refresh: bool = False,
-    num_shards: int = 1,
-    shard_id: int = 0,
-    monthly_financials_cap: Optional[int] = None,
+    only_symbol: Optional[str] = None,
 ) -> None:
-    """Weekly 모드: prices_eod, estimates/targets/shares/company_profile 미실행. 워터마크 테이블만(earnings/dividends/financials/insider) 감지→변경시 full fetch. dividends: limit 지원 시 light 감지; 미지원 시 --weekly-dividends-full-refresh 시에만 full refresh."""
+    """Monthly 모드: index_membership, company_facts_snapshot, insider_transactions, insider_holdings_snapshot 항상 실행. 전체 심볼(현재 shard 기준). asOfDate=today."""
     today = date.today().isoformat()
-    today_dt = date.today()
-    monthly_safeguard = today_dt.day == 1
-    run_dividends_detection = True  # weekly always attempts dividends (light or full per flag)
-    log.info(
-        "mode=weekly universe_size=%s num_shards=%s shard_id=%s include_insider=%s run_dividends_detection=%s weekly_dividends_full_refresh=%s today=%s monthly_safeguard=%s",
-        len(universe), num_shards, shard_id, include_insider, run_dividends_detection, weekly_dividends_full_refresh, today, monthly_safeguard,
+    sym_set = set(universe)
+    if only_symbol:
+        only_set = {s.strip().upper() for s in only_symbol.split(",") if s.strip()}
+        if only_set:
+            sym_set = sym_set & only_set
+            universe = [s for s in universe if s in sym_set]
+    log.info("mode=monthly universe_size=%s", len(universe))
+
+    as_of = today
+
+    # (1) company_facts_snapshot: 항상 실행 (profile + shares; 제한 시 해당 소스만 스킵)
+    facts_profile_df = None
+    facts_shares_df = None
+    sh_rows: List[Dict[str, Any]] = []
+    shares_restricted = False
+    page = 0
+    while True:
+        try:
+            sh_list = fetch_shares_float_all(session, rl, api_key, page, 1000, call_counter)
+            if not sh_list:
+                break
+            for r in sh_list:
+                sym = (r.get("symbol") or r.get("ticker") or "").strip().upper()
+                if sym not in sym_set:
+                    continue
+                sh_rows.append(build_company_facts_from_shares_row(r, as_of))
+            if len(sh_list) < 1000:
+                break
+            page += 1
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "403" in msg or "402" in msg or "restricted" in msg or "subscription" in msg:
+                if not shares_restricted:
+                    log.warning("shares (company_facts): endpoint restricted; skipping shares source only")
+                    shares_restricted = True
+                break
+        except Exception:
+            break
+    if sh_rows and not shares_restricted:
+        facts_shares_df = pd.DataFrame(sh_rows).reindex(columns=COMPANY_FACTS_SNAPSHOT_COLUMNS)
+
+    # profile: per-symbol only (profile-bulk 제거)
+    profile_rows: List[Dict[str, Any]] = []
+    profile_restricted = False
+
+    for sym in universe:
+        if profile_restricted:
+            break
+        try:
+            raw = fetch_profile_symbol(session, rl, api_key, sym.strip().upper(), call_counter)
+            if raw:
+                profile_rows.extend(raw)
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "403" in msg or "402" in msg or "restricted" in msg or "subscription" in msg:
+                if not profile_restricted:
+                    log.warning("profile (company_facts): endpoint restricted; skipping profile source only")
+                    profile_restricted = True
+                break
+        except Exception:
+            pass
+
+    if profile_rows and not profile_restricted:
+        facts_profile_df = build_company_facts_from_profile(profile_rows, sym_set, as_of)
+
+    frames = []
+    if facts_profile_df is not None and not facts_profile_df.empty:
+        frames.append(facts_profile_df)
+    if facts_shares_df is not None and not facts_shares_df.empty:
+        frames.append(facts_shares_df)
+    if frames:
+        merged = frames[0]
+        for f in frames[1:]:
+            merged = merged.merge(f, on=["symbol", "asOfDate"], how="outer", suffixes=("_p", "_s"))
+        for c in COMPANY_FACTS_SNAPSHOT_COLUMNS:
+            if c + "_p" in merged.columns and c + "_s" in merged.columns:
+                merged[c] = merged[c + "_p"].fillna(merged[c + "_s"])
+            elif c + "_p" in merged.columns:
+                merged[c] = merged[c + "_p"]
+            elif c + "_s" in merged.columns:
+                merged[c] = merged[c + "_s"]
+        for c in COMPANY_FACTS_SNAPSHOT_COLUMNS:
+            if c not in merged.columns:
+                merged[c] = pd.NA
+        merged = merged.reindex(columns=COMPANY_FACTS_SNAPSHOT_COLUMNS)
+    else:
+        merged = pd.DataFrame(columns=COMPANY_FACTS_SNAPSHOT_COLUMNS)
+    upsert_table(outdir, "company_facts_snapshot", merged, ["symbol", "asOfDate"], COMPANY_FACTS_SNAPSHOT_COLUMNS, allow_empty_overwrite=False)
+
+    # (2) index_membership: 항상 실행 (기본 SP500)
+    index_list = index_symbols if index_symbols and len(index_symbols) > 0 else ["SP500"]
+    for idx_sym in index_list:
+        idx_sym = idx_sym.strip().upper()
+        if not idx_sym:
+            continue
+        try:
+            members_set = fetch_index_constituents(session, rl, api_key, idx_sym, call_counter)
+            idx_df = build_index_membership(sym_set, idx_sym, members_set, as_of)
+            if not idx_df.empty:
+                upsert_table(outdir, "index_membership", idx_df, ["indexSymbol", "asOfDate", "memberSymbol"], INDEX_MEMBERSHIP_COLUMNS)
+        except Exception as e:
+            log.warning("index_membership %s: %s (skipping index, run continues)", idx_sym, _safe_log_message(e))
+
+    # (3) insider_transactions + insider_holdings_snapshot: 항상 실행. 402/403 시 해당 심볼만 스킵.
+    def _insider_one(sym: str) -> pd.DataFrame:
+        sess = make_session()
+        result = fetch_insider_trading_stable(sess, rl, api_key, sym, page=0, limit=insider_limit, call_counter=call_counter, return_status=True)
+        if isinstance(result, tuple) and len(result) == 2 and result[1] is not None:
+            code, body, _ = result[1]
+            if code in (402, 403):
+                log.debug("%s insider: restricted (status=%s), skipping symbol", sym, code)
+                return pd.DataFrame(columns=INSIDER_TRANSACTIONS_COLUMNS)
+            if code >= 400:
+                body_str = (body if isinstance(body, str) else str(body)).lower()
+                if "restricted" in body_str or "subscription" in body_str or "not available" in body_str:
+                    log.debug("%s insider: restricted, skipping symbol", sym)
+                    return pd.DataFrame(columns=INSIDER_TRANSACTIONS_COLUMNS)
+        rows = result[0] if isinstance(result, tuple) and result[0] is not None else []
+        return build_insider_transactions(rows, sym)
+
+    all_insider_dfs: List[pd.DataFrame] = []
+    if max_workers <= 1:
+        for sym in universe:
+            all_insider_dfs.append(_insider_one(sym))
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            all_insider_dfs = list(ex.map(_insider_one, universe))
+    non_empty_insider = [d for d in all_insider_dfs if not d.empty]
+    if non_empty_insider:
+        insider_combined = pd.concat(non_empty_insider, ignore_index=True)
+        upsert_table(outdir, "insider_transactions", insider_combined, ["symbol", "transactionDate", "reportingCik", "transactionType", "securitiesTransacted", "securityName"], INSIDER_TRANSACTIONS_COLUMNS, allow_empty_overwrite=False)
+        holdings_df = build_insider_holdings_snapshot(insider_combined, today, common_stock_only=insider_common_stock_only)
+        if not holdings_df.empty:
+            upsert_table(outdir, "insider_holdings_snapshot", holdings_df, ["symbol", "asOfDate", "reportingCik", "securityName"], INSIDER_HOLDINGS_SNAPSHOT_COLUMNS, allow_empty_overwrite=False)
+    else:
+        upsert_table(outdir, "insider_transactions", pd.DataFrame(columns=INSIDER_TRANSACTIONS_COLUMNS), ["symbol", "transactionDate", "reportingCik", "transactionType", "securitiesTransacted", "securityName"], INSIDER_TRANSACTIONS_COLUMNS, allow_empty_overwrite=False)
+        upsert_table(outdir, "insider_holdings_snapshot", pd.DataFrame(columns=INSIDER_HOLDINGS_SNAPSHOT_COLUMNS), ["symbol", "asOfDate", "reportingCik", "securityName"], INSIDER_HOLDINGS_SNAPSHOT_COLUMNS, allow_empty_overwrite=False)
+
+
+# -----------------------------------------------------------------------------
+# Trigger mode: calendar-based dividends_events + earnings_events (no financials)
+# -----------------------------------------------------------------------------
+
+
+def run_trigger_dividends_calendar(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    outdir: Path,
+    universe_set: Set[str],
+    from_date: str,
+    to_date: str,
+    call_counter: Dict[str, Any],
+) -> None:
+    """Fetch dividends-calendar for [from_date, to_date], filter by universe_set, upsert dividends_events. PK: symbol, exDate, paymentDate, dividend."""
+    rows = fetch_dividends_calendar(session, rl, api_key, from_date, to_date, call_counter)
+    if not rows:
+        log.info("trigger dividends_calendar: no rows in range %s..%s", from_date, to_date)
+        return
+    df = build_dividends_events_from_calendar(rows, universe_set)
+    if df.empty:
+        log.info("trigger dividends_calendar: no rows after universe filter")
+        return
+    upsert_table(outdir, "dividends_events", df, ["symbol", "exDate", "paymentDate", "dividend"], DIVIDENDS_EVENTS_COLUMNS)
+    log.info("trigger dividends_events upserted rows=%s", len(df))
+
+
+def run_trigger_earnings_calendar(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    outdir: Path,
+    universe_set: Set[str],
+    from_date: str,
+    to_date: str,
+    call_counter: Dict[str, Any],
+    use_lastupdated: bool = False,
+) -> Set[str]:
+    """Fetch earnings-calendar for [from_date, to_date], filter by universe_set; optionally filter by lastUpdated. Upsert earnings_events. Returns earnings_hit_symbols (symbols in calendar and in universe_set)."""
+    rows = fetch_earnings_calendar(session, rl, api_key, from_date, to_date, call_counter)
+    earnings_hit_symbols: Set[str] = {
+        (r.get("symbol") or r.get("ticker") or "").strip().upper()
+        for r in rows
+        if (r.get("symbol") or r.get("ticker") or "").strip().upper() in universe_set
+    }
+    if not rows:
+        log.info("trigger earnings_calendar: no rows in range %s..%s", from_date, to_date)
+        return set()
+    df = build_earnings_events_from_calendar(rows, universe_set, include_last_updated=use_lastupdated)
+    if df.empty:
+        log.info("trigger earnings_calendar: no rows after universe filter")
+        return earnings_hit_symbols
+    if use_lastupdated and "lastUpdated" in df.columns:
+        existing = load_existing_table(outdir, "earnings_events")
+        for c in EARNINGS_EVENTS_COLUMNS_WITH_LASTUPDATED:
+            if c not in existing.columns:
+                existing[c] = pd.NA
+        if not existing.empty and "symbol" in existing.columns and "earningsDate" in existing.columns and "lastUpdated" in existing.columns:
+            existing_lu = existing.set_index(["symbol", "earningsDate"])["lastUpdated"].to_dict()
+            def keep_row(row: Any) -> bool:
+                sym = row.get("symbol")
+                ed = row.get("earningsDate")
+                if sym is None or ed is None:
+                    return True
+                key = (str(sym).strip().upper(), str(ed).strip()[:10])
+                existing_val = existing_lu.get(key)
+                if pd.isna(existing_val) or existing_val is None or str(existing_val).strip() == "":
+                    return True
+                new_val = row.get("lastUpdated")
+                if pd.isna(new_val) or new_val is None:
+                    return True
+                return str(new_val).strip() > str(existing_val).strip()
+            mask = df.apply(keep_row, axis=1)
+            df = df.loc[mask].copy()
+        if df.empty:
+            log.info("trigger earnings_calendar: no rows after lastUpdated filter")
+            return earnings_hit_symbols
+    columns = EARNINGS_EVENTS_COLUMNS_WITH_LASTUPDATED if use_lastupdated else EARNINGS_EVENTS_COLUMNS
+    upsert_table(outdir, "earnings_events", df, ["symbol", "earningsDate"], columns)
+    log.info("trigger earnings_events upserted rows=%s", len(df))
+    return earnings_hit_symbols
+
+
+def fetch_and_build_financials_for_symbols(
+    symbols: List[str],
+    outdir: Path,
+    to_date: str,
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    call_counter: Dict[str, Any],
+    max_workers: int,
+) -> List[pd.DataFrame]:
+    """Per-symbol: load existing last_saved, fetch income/balance/cashflow (from last_saved-7d), build_financials_quarterly, enrich. Returns list of DataFrames (one per symbol; empty on fetch failure). ThreadPool with per-worker session; shared rl."""
+    existing_fin = load_existing_table(outdir, "financials_quarterly")
+    if not existing_fin.empty and "fiscalDate" in existing_fin.columns:
+        existing_fin = existing_fin.copy()
+        existing_fin["fiscalDate"] = pd.to_datetime(existing_fin["fiscalDate"], errors="coerce").dt.strftime("%Y-%m-%d")
+    last_saved_fin = last_saved_date_map(existing_fin, "symbol", "fiscalDate", CUTOFF_DATE)
+    cutoff_dt = date.fromisoformat(CUTOFF_DATE[:10])
+    fin_date_keys = ["date", "fiscalDateEnding", "fillingDate"]
+    as_reported_state: Dict[str, Any] = {
+        "disabled_cashflow": False,
+        "disabled_balance": False,
+        "warned_cashflow": False,
+        "warned_balance": False,
+        "lock": threading.Lock(),
+    }
+
+    def _one(sym: str) -> pd.DataFrame:
+        sess = make_session()
+        try:
+            last_saved = last_saved_fin.get(sym, CUTOFF_DATE)
+            try:
+                last_dt = date.fromisoformat(str(last_saved)[:10])
+            except ValueError:
+                last_dt = cutoff_dt
+            from_dt = max(last_dt - timedelta(days=7), cutoff_dt)
+            from_date_fin = from_dt.isoformat()
+            inc = fetch_income(sess, rl, api_key, sym, 200, call_counter)
+            bal = fetch_balance(sess, rl, api_key, sym, 200, call_counter)
+            cf = fetch_cashflow(sess, rl, api_key, sym, 200, call_counter)
+            inc_f = filter_rows_by_date_range(inc or [], fin_date_keys, from_date_fin, to_date)
+            bal_f = filter_rows_by_date_range(bal or [], fin_date_keys, from_date_fin, to_date)
+            cf_f = filter_rows_by_date_range(cf or [], fin_date_keys, from_date_fin, to_date)
+            new_df = build_financials_quarterly(inc_f, bal_f, cf_f, sym, from_date_fin)
+            new_df = enrich_financials_quarterly_from_as_reported(new_df, sym, sess, rl, api_key, call_counter, as_reported_state, 200)
+            return new_df
+        except Exception as e:
+            log.debug("financials fetch %s: %s", sym, _safe_log_message(e))
+            return pd.DataFrame(columns=FINANCIALS_QUARTERLY_COLUMNS)
+
+    if not symbols:
+        return []
+    if max_workers <= 1:
+        return [_one(s) for s in symbols]
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        return list(ex.map(_one, symbols))
+
+
+def run_trigger_financials_quarterly(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    outdir: Path,
+    earnings_hit_symbols: Set[str],
+    universe_list: List[str],
+    insurance_enabled: bool,
+    to_date: str,
+    call_counter: Dict[str, Any],
+    max_workers: int,
+) -> None:
+    """Trigger financials_quarterly: earnings_hit_symbols only, or full shard (universe_list) when insurance_enabled (1~5일). Fetch+build per symbol, upsert."""
+    today_str = to_date[:10] if to_date else date.today().isoformat()
+    log.info("trigger financials_quarterly: insurance_enabled=%s today=%s earnings_hit_symbols=%s", insurance_enabled, today_str, len(earnings_hit_symbols))
+    if insurance_enabled:
+        target_symbols = {s.strip().upper() for s in universe_list if s and str(s).strip()}
+        log.info("trigger financials_quarterly: insurance run, target symbols (shard universe)=%s", len(target_symbols))
+    else:
+        target_symbols = set(earnings_hit_symbols)
+    if not target_symbols:
+        log.info("trigger financials_quarterly: no target symbols, skip")
+        return
+    symbols_list = sorted(target_symbols)
+    dfs = fetch_and_build_financials_for_symbols(
+        symbols_list, outdir, to_date, session, rl, api_key, call_counter, max_workers,
     )
-    run_watermark_tables(
-        session, rl, api_key, outdir, universe, call_counter, today,
-        max_workers=max_workers,
-        insider_limit=insider_limit,
-        insider_common_stock_only=insider_common_stock_only,
-        include_insider=include_insider,
-        run_dividends_detection=run_dividends_detection,
-        weekly_dividends_full_refresh=weekly_dividends_full_refresh,
-        num_shards=num_shards,
-        shard_id=shard_id,
-        monthly_financials_cap=monthly_financials_cap,
-        log_start=True,
-    )
+    non_empty = [d for d in dfs if not d.empty]
+    if not non_empty:
+        log.info("trigger financials_quarterly: no rows to upsert")
+        return
+    combined = pd.concat(non_empty, ignore_index=True)
+    upsert_table(outdir, "financials_quarterly", combined, FINANCIALS_PK, FINANCIALS_QUARTERLY_COLUMNS)
+    n_symbols = combined["symbol"].nunique() if "symbol" in combined.columns else 0
+    log.info("trigger financials_quarterly upserted rows=%s symbols=%s", len(combined), n_symbols)
+
+
+def verify_dividends_calendar_date_matches_exdate(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    symbol: str,
+    call_counter: Dict[str, Any],
+    from_date: str,
+    to_date: str,
+) -> None:
+    """Compare dividends-calendar 'date' with /dividends?symbol=XXX exDate for one symbol. Log MATCH or MISMATCH (no data change)."""
+    sym = symbol.strip().upper()
+    if not sym:
+        log.info("verify-dividends-calendar-exdate: empty symbol, skip")
+        return
+    cal_rows = fetch_dividends_calendar(session, rl, api_key, from_date, to_date, call_counter)
+    cal_for_sym = [r for r in cal_rows if (r.get("symbol") or r.get("ticker") or "").strip().upper() == sym]
+    if not cal_for_sym:
+        log.info("verify-dividends-calendar-exdate: %s no calendar row in range %s..%s", sym, from_date, to_date)
+        return
+    cal_date = pick_date10(cal_for_sym[0], ["date", "exDate", "exDividendDate"])
+    div_rows = fetch_dividends(session, rl, api_key, sym, call_counter)
+    ex_from_div = None
+    for r in div_rows:
+        d = pick_date10(r, ["exDate", "exDividendDate", "date"])
+        if d:
+            ex_from_div = d
+            break
+    if cal_date is None:
+        log.info("verify-dividends-calendar-exdate: %s calendar date missing → MISMATCH (no calendar date)", sym)
+        return
+    if ex_from_div is None:
+        log.info("verify-dividends-calendar-exdate: %s dividends exDate missing → MISMATCH (no exDate)", sym)
+        return
+    if cal_date == ex_from_div:
+        log.info("verify-dividends-calendar-exdate: %s calendar date=%s vs exDate=%s → MATCH", sym, cal_date, ex_from_div)
+    else:
+        log.info("verify-dividends-calendar-exdate: %s calendar date=%s vs exDate=%s → MISMATCH", sym, cal_date, ex_from_div)
 
 
 def main() -> None:
-    # Example: daily 기본 (insider/index 미실행): ... --mode daily
-    # Example: daily + insider: ... --mode daily --daily-include-insider
-    # Example: daily + index: ... --mode daily --daily-include-index --index-symbols SP500
-    # Example: backfill with all index constituents: ... --mode backfill --index-symbols SP500,NASDAQ,DOWJONES
-    ap = argparse.ArgumentParser(description="FMP Premium: 11 tables (prices_eod, financials_quarterly, ..., company_profile_snapshot, insider_*, index_membership)")
+    ap = argparse.ArgumentParser(description="FMP Premium: 11 tables (prices_eod, financials_quarterly, ..., company_facts_snapshot, insider_*, index_membership)")
     ap.add_argument("--universe", required=True, help="universe_list.csv path")
     ap.add_argument("--outdir", required=True, help="Output directory")
     ap.add_argument("--from", dest="from_date", default="2020-01-01", help="Start date YYYY-MM-DD")
     ap.add_argument("--to", dest="to_date", default="", help="End date YYYY-MM-DD (backfill: today; daily: yesterday)")
     ap.add_argument("--max-workers", type=int, default=4, help="ThreadPool workers")
-    ap.add_argument("--mode", choices=["backfill", "daily", "weekly"], default="backfill", help="backfill=full fetch; daily/weekly=watermark detection for earnings/dividends/financials/insider")
+    ap.add_argument("--mode", choices=["backfill", "daily", "weekly", "monthly", "trigger"], default="backfill", help="backfill=full; daily=prices_eod only; weekly=estimates/targets only; monthly=index_membership, company_facts, insider; trigger=calendar-based dividends_events+earnings_events")
     ap.add_argument("--only-symbol", default="", help="Optional: AAPL,MSFT")
-    ap.add_argument("--include-company-profile", action="store_true", help="Daily/backfill: fetch company_profile_snapshot (per-symbol profile; may be restricted by subscription)")
-    ap.add_argument("--include-shares-snapshot", action="store_true", help="Daily/backfill: fetch shares_snapshot (shares-float-all; may be restricted/unsupported)")
+    ap.add_argument("--verify-dividends-calendar-exdate", default="", metavar="SYMBOL", help="Trigger only: verify dividends-calendar date vs exDate for SYMBOL (log MATCH/MISMATCH, no data change)")
+    ap.add_argument("--earnings-use-lastupdated", action="store_true", help="Trigger only: add lastUpdated to earnings_events and skip rows not newer than existing")
+    ap.add_argument("--include-company-profile", action="store_true", help="(Deprecated) Backfill/monthly always run company_facts; flag ignored")
+    ap.add_argument("--include-shares-snapshot", action="store_true", help="(Deprecated) Backfill/monthly always run company_facts; flag ignored")
+    ap.add_argument("--monthly-skip-insider", action="store_true", help="(Deprecated) Monthly always runs insider; flag ignored")
     ap.add_argument("--num-shards", type=int, default=1, help="Shard universe into N parts (default 1 = no sharding)")
     ap.add_argument("--shard-id", type=int, default=0, help="Which shard to process (0..num_shards-1)")
     ap.add_argument("--insider-limit", type=int, default=200, help="Max insider transactions per symbol (default 200)")
     ap.add_argument("--insider-common-stock-only", action="store_true", default=True, help="Insider holdings: only Common Stock (default True)")
     ap.add_argument("--no-insider-common-stock-only", action="store_false", dest="insider_common_stock_only")
-    ap.add_argument("--index-symbols", type=str, default="SP500", help="Index constituents to fetch, comma-separated (default SP500)")
-    ap.add_argument("--daily-include-insider", action="store_true", help="Daily mode: also run insider_transactions + insider_holdings_snapshot (default off)")
-    ap.add_argument("--daily-include-index", action="store_true", help="Daily mode: also run index_membership fetch (default off)")
-    ap.add_argument("--weekly-include-insider", action="store_true", help="Weekly mode: run insider_transactions + insider_holdings_snapshot (default off)")
-    ap.add_argument("--weekly-skip-insider", action="store_true", help="Weekly mode: do not run insider (no-op when default is already off)")
-    ap.add_argument("--weekly-dividends-full-refresh", action="store_true", help="Weekly mode: when dividends API limit is unsupported, perform full refresh (default: skip dividends in that case)")
-    ap.add_argument("--monthly-financials-cap", type=int, default=None, metavar="N", help="Cap symbols for monthly (day=1) financials refresh (default: no cap, current shard only)")
+    ap.add_argument("--index-symbols", type=str, default="SP500", help="Index constituents (backfill/monthly), comma-separated (default SP500)")
     ap.add_argument("--debug-financials-fields", action="store_true", help="Log income/balance/cashflow top-level keys and financials_quarterly 3-field non-null counts for one symbol (API key not logged)")
     ap.add_argument("--save-raw", action="store_true", help="Optional: save raw JSON")
     args = ap.parse_args()
@@ -2668,6 +2671,9 @@ def main() -> None:
     to_date = (getattr(args, "to_date") or "").strip()[:10]
     if not to_date:
         to_date = date.today().isoformat() if args.mode == "backfill" else (date.today() - timedelta(days=1)).isoformat()
+    if args.mode == "trigger":
+        from_date = (date.today() - timedelta(days=7)).isoformat()
+        to_date = date.today().isoformat()
 
     universe = read_universe(args.universe)
     num_shards = getattr(args, "num_shards", 1) or 1
@@ -2695,6 +2701,8 @@ def main() -> None:
         index_symbols_list = [s.strip() for s in args.index_symbols.split(",") if s.strip()]
 
     if args.mode == "backfill":
+        if getattr(args, "include_company_profile", False) or getattr(args, "include_shares_snapshot", False):
+            log.info("backfill: --include-company-profile / --include-shares-snapshot are deprecated; company_facts_snapshot always runs")
         run_backfill(
             session, rl, api_key, outdir, universe,
             from_date, to_date,
@@ -2704,20 +2712,50 @@ def main() -> None:
             insider_limit=getattr(args, "insider_limit", 200),
             insider_common_stock_only=getattr(args, "insider_common_stock_only", True),
             index_symbols=index_symbols_list,
-            include_company_profile=getattr(args, "include_company_profile", False),
-            include_shares_snapshot=getattr(args, "include_shares_snapshot", False),
+            include_company_profile=True,
+            include_shares_snapshot=True,
         )
     elif args.mode == "weekly":
         run_weekly(
             session, rl, api_key, outdir, universe, call_counter,
             max_workers=args.max_workers,
+            only_symbol=args.only_symbol or None,
+        )
+    elif args.mode == "monthly":
+        if getattr(args, "include_company_profile", False) or getattr(args, "include_shares_snapshot", False) or getattr(args, "monthly_skip_insider", False):
+            log.info("monthly: --include-company-profile / --include-shares-snapshot / --monthly-skip-insider are deprecated; index, company_facts, insider always run")
+        run_monthly(
+            session, rl, api_key, outdir, universe, call_counter,
+            max_workers=args.max_workers,
+            index_symbols=index_symbols_list,
+            include_company_profile=True,
+            include_shares_snapshot=True,
+            include_insider=True,
             insider_limit=getattr(args, "insider_limit", 200),
             insider_common_stock_only=getattr(args, "insider_common_stock_only", True),
-            include_insider=getattr(args, "weekly_include_insider", False) and not getattr(args, "weekly_skip_insider", False),
-            weekly_dividends_full_refresh=getattr(args, "weekly_dividends_full_refresh", False),
-            num_shards=num_shards,
-            shard_id=shard_id,
-            monthly_financials_cap=getattr(args, "monthly_financials_cap", None),
+            only_symbol=args.only_symbol or None,
+        )
+    elif args.mode == "trigger":
+        universe_set = {s.strip().upper() for s in universe if s and str(s).strip()}
+        verify_sym = (getattr(args, "verify_dividends_calendar_exdate", "") or "").strip()
+        if verify_sym:
+            verify_dividends_calendar_date_matches_exdate(
+                session, rl, api_key, verify_sym, call_counter, from_date, to_date,
+            )
+        # A) earnings-calendar → earnings_events upsert + earnings_hit_symbols
+        earnings_hit_symbols = run_trigger_earnings_calendar(
+            session, rl, api_key, outdir, universe_set, from_date, to_date, call_counter,
+            use_lastupdated=getattr(args, "earnings_use_lastupdated", False),
+        )
+        # B) dividends-calendar → dividends_events upsert
+        run_trigger_dividends_calendar(session, rl, api_key, outdir, universe_set, from_date, to_date, call_counter)
+        # C) financials_quarterly: earnings_hit_symbols + (1~5일이면 shard 전체 보험)
+        today_dt = date.today()
+        insurance_enabled = today_dt.day in (1, 2, 3, 4, 5)
+        run_trigger_financials_quarterly(
+            session, rl, api_key, outdir,
+            earnings_hit_symbols, universe, insurance_enabled,
+            to_date, call_counter, args.max_workers,
         )
     else:
         run_daily(
@@ -2726,13 +2764,6 @@ def main() -> None:
             args.max_workers,
             args.only_symbol or None,
             call_counter,
-            insider_limit=getattr(args, "insider_limit", 200),
-            insider_common_stock_only=getattr(args, "insider_common_stock_only", True),
-            index_symbols=index_symbols_list,
-            daily_include_insider=getattr(args, "daily_include_insider", False),
-            daily_include_index=getattr(args, "daily_include_index", False),
-            include_company_profile=getattr(args, "include_company_profile", False),
-            include_shares_snapshot=getattr(args, "include_shares_snapshot", False),
         )
 
     log.info("API calls: %s", call_counter.get("count", 0))

@@ -1,14 +1,25 @@
 # -*- coding: utf-8 -*-
 """
 get_data.py
-- 날짜/요일 기준으로 fmp_universe_fetch.py를 daily/weekly로 자동 실행
+- 날짜/요일 기준으로 fmp_universe_fetch.py를 trigger/daily/weekly/monthly로 자동 실행
 - 실행 후 parquet/csv를 확인해서 "오늘(또는 최근 거래일)" 데이터가 들어왔는지 검사
 - adjClose 결측률, 최신 날짜, 행 수 등 간단 요약 출력
 
+실행 스케줄 (한국시간 기준):
+  trigger: 매일
+  daily:   화(1) 수(2) 목(3) 금(4) 토(5)
+  weekly:  토(5) 일(6) 월(0)
+  monthly: 매달 1일
+
+실행 순서: trigger → daily → weekly → monthly
+
 사용:
   py -3 get_data.py
+  py -3 get_data.py --force trigger
   py -3 get_data.py --force daily
   py -3 get_data.py --force weekly
+  py -3 get_data.py --force monthly
+  py -3 get_data.py --force all
   py -3 get_data.py --dry-run
 """
 
@@ -28,31 +39,42 @@ import pandas as pd
 # Config (여기만 네 환경에 맞게)
 # -----------------------------
 PYTHON_EXE = "py"           # Windows: "py", 필요시 "python"
-PYTHON_VER_FLAG = "-3"      # Windows py 런처에서 3.x 지정. python 쓰면 ""로.
+PYTHON_VER_FLAG = "-3"     # Windows py 런처에서 3.x 지정. python 쓰면 ""로.
 FMP_SCRIPT = "fmp_universe_fetch.py"
 
 UNIVERSE_CSV = Path("./data/universe_list.csv")
 OUTDIR = Path("./data")
 
-# daily 기본 옵션: per-symbol 증분 EOD (target_trade_date=토/일→금요일, 월→금요일, 화~금→어제).
+# 실행 모드별 arguments
+TRIGGER_ARGS = [
+    "--mode", "trigger",
+    "--universe", str(UNIVERSE_CSV),
+    "--outdir", str(OUTDIR),
+]
+
 DAILY_ARGS = [
     "--mode", "daily",
     "--universe", str(UNIVERSE_CSV),
     "--outdir", str(OUTDIR),
 ]
 
-# weekly 기본 옵션 (원하면 shards, dividends, insider 등 여기에 추가)
 WEEKLY_ARGS = [
     "--mode", "weekly",
     "--universe", str(UNIVERSE_CSV),
     "--outdir", str(OUTDIR),
 ]
 
-# 요일 기준 자동 정책:
-# - 월~일: daily 항상 실행 → 언제 돌려도 최신 거래일(휴장/연휴 감안) EOD 확보
-# - 토/일: daily 먼저 실행 후 weekly 실행 (주말에도 금요일 등 직전 거래일 prices_eod 확보)
-RUN_WEEKLY_ON = {5, 6}   # 0=월 ... 5=토 6=일. 주말에만 weekly 실행
-RUN_DAILY_ON  = {0, 1, 2, 3, 4, 5, 6}  # 매일 daily 실행
+MONTHLY_ARGS = [
+    "--mode", "monthly",
+    "--universe", str(UNIVERSE_CSV),
+    "--outdir", str(OUTDIR),
+]
+
+# 요일 기준 자동 정책 (0=월 ... 6=일)
+RUN_DAILY_ON = {1, 2, 3, 4, 5}   # 화~토
+RUN_WEEKLY_ON = {5, 6, 0}        # 토, 일, 월
+# trigger: 매일 실행
+# monthly: today.day == 1 일 때 실행
 
 # 검증 기준
 ADJCLOSE_WARN_RATE = 0.20
@@ -103,9 +125,9 @@ def read_snapshots(outdir: Path) -> dict[str, int]:
     """스냅샷 테이블 row 수만 빠르게 확인"""
     names = [
         "estimates_snapshot",
+        "estimates_quarterly_snapshot",
         "targets_snapshot",
-        "shares_snapshot",
-        "company_profile_snapshot",
+        "company_facts_snapshot",
         "earnings_events",
         "dividends_events",
         "financials_quarterly",
@@ -113,7 +135,7 @@ def read_snapshots(outdir: Path) -> dict[str, int]:
         "insider_holdings_snapshot",
         "index_membership",
     ]
-    out = {}
+    out: dict[str, int] = {}
     for n in names:
         pq = outdir / f"{n}.parquet"
         if pq.exists():
@@ -183,9 +205,14 @@ def summarize_prices(df: pd.DataFrame | None, mode_run: str = "") -> None:
             print(f"[WARNING] 최신일 adjClose 결측률이 {ADJCLOSE_WARN_RATE*100:.0f}% 초과. 결측 상위 심볼(최대20): {top}")
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--force", choices=["daily", "weekly", "none"], default="none", help="모드를 강제로 지정")
+    ap.add_argument(
+        "--force",
+        choices=["trigger", "daily", "weekly", "monthly", "all", "none"],
+        default="none",
+        help="모드를 강제로 지정 (trigger/daily/weekly/monthly/all)",
+    )
     ap.add_argument("--dry-run", action="store_true", help="실행 커맨드만 출력하고 실제 실행은 안 함")
     args = ap.parse_args()
 
@@ -197,38 +224,62 @@ def main():
         print(f"[ERROR] universe 파일이 없습니다: {UNIVERSE_CSV}")
         sys.exit(2)
 
-    # 자동 모드 선택: 주말(토/일)에는 daily → weekly 순으로 둘 다 실행, 평일에는 daily만.
     now = datetime.now()
+    today = now.date()
     dow = now.weekday()  # 0=월 ... 6=일
+    day = today.day
+
+    run_trigger = False
     run_daily = False
     run_weekly = False
+    run_monthly = False
 
     if args.force != "none":
-        if args.force == "daily":
+        if args.force == "trigger":
+            run_trigger = True
+        elif args.force == "daily":
             run_daily = True
         elif args.force == "weekly":
             run_weekly = True
+        elif args.force == "monthly":
+            run_monthly = True
+        elif args.force == "all":
+            run_trigger = True
+            run_daily = True
+            run_weekly = True
+            run_monthly = True
     else:
+        run_trigger = True
         run_daily = dow in RUN_DAILY_ON
         run_weekly = dow in RUN_WEEKLY_ON
+        run_monthly = day == 1
 
-    mode_desc = []
+    mode_desc: list[str] = []
+    if run_trigger:
+        mode_desc.append("trigger")
     if run_daily:
         mode_desc.append("daily")
     if run_weekly:
         mode_desc.append("weekly")
+    if run_monthly:
+        mode_desc.append("monthly")
     mode_str = " → ".join(mode_desc) if mode_desc else "none"
 
-    print(f"[INFO] now={now.strftime('%Y-%m-%d %H:%M:%S')} weekday={dow} -> run: {mode_str}")
+    print(f"[INFO] now={now.strftime('%Y-%m-%d %H:%M:%S')} weekday={dow} day={day} -> run: {mode_str}")
 
-    if not run_daily and not run_weekly:
-        print("[INFO] 오늘은 자동 실행 정책상 수집을 수행하지 않습니다. (--force daily/weekly로 강제 가능)")
+    if not run_trigger and not run_daily and not run_weekly and not run_monthly:
+        print("[INFO] 오늘은 자동 실행 정책상 수집을 수행하지 않습니다. (--force trigger/daily/weekly/monthly/all 로 강제 가능)")
         df = read_prices_eod(OUTDIR)
         summarize_prices(df if df is not None else pd.DataFrame(), mode_run="none")
         sys.exit(0)
 
-    # 실행: 주말에는 daily 먼저(최신 거래일 EOD) → 그 다음 weekly
+    # 실행 순서: trigger → daily → weekly → monthly
     rc = 0
+    if run_trigger:
+        rc = run_fetch(TRIGGER_ARGS, dry_run=args.dry_run)
+        if rc != 0:
+            print(f"[ERROR] trigger 실행 실패. returncode={rc}")
+            sys.exit(rc)
     if run_daily:
         rc = run_fetch(DAILY_ARGS, dry_run=args.dry_run)
         if rc != 0:
@@ -236,6 +287,14 @@ def main():
             sys.exit(rc)
     if run_weekly:
         rc = run_fetch(WEEKLY_ARGS, dry_run=args.dry_run)
+        if rc != 0:
+            print(f"[ERROR] weekly 실행 실패. returncode={rc}")
+            sys.exit(rc)
+    if run_monthly:
+        rc = run_fetch(MONTHLY_ARGS, dry_run=args.dry_run)
+        if rc != 0:
+            print(f"[ERROR] monthly 실행 실패. returncode={rc}")
+            sys.exit(rc)
 
     if rc != 0:
         print(f"[ERROR] fmp_universe_fetch 실행 실패. returncode={rc}")
