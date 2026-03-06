@@ -245,7 +245,7 @@ def latest_financials_and_ttm(financials: pd.DataFrame) -> Tuple[Dict[str, Dict]
     prev_d = prev.set_index("symbol").to_dict("index") if not prev.empty else {}
 
     FLOW_SUM_COLS = [
-        "netIncome", "revenue", "EBITDA", "freeCashFlow", "dividendsPaid",
+        "netIncome", "revenue", "EBITDA", "freeCashFlow", "operatingCashFlow", "dividendsPaid",
         "operatingIncome", "incomeBeforeTax", "incomeTaxExpense",
         "grossProfit",
     ]
@@ -1123,6 +1123,315 @@ def build_financial_indicators(
 
 
 # -----------------------------------------------------------------------------
+# New factor helpers: Revenue YoY, EPS YoY, Share Dilution, Interest Coverage, OPM volatility
+# -----------------------------------------------------------------------------
+
+
+def build_revenue_yoy_map(financials: pd.DataFrame) -> Dict[str, float]:
+    """Revenue YoY = (latest TTM revenue / prior-year TTM revenue) - 1. Requires at least 8 quarterly rows per symbol."""
+    out: Dict[str, float] = {}
+    if financials.empty or "symbol" not in financials.columns or "fiscalDate" not in financials.columns or "revenue" not in financials.columns:
+        return out
+    fin = financials.copy()
+    fin["symbol"] = fin["symbol"].astype(str).str.strip().str.upper()
+    fin["fiscalDate"] = pd.to_datetime(fin["fiscalDate"], errors="coerce")
+    fin = fin.dropna(subset=["fiscalDate"])
+    fin["revenue"] = pd.to_numeric(fin["revenue"], errors="coerce")
+    for sym, g in fin.groupby("symbol"):
+        g = g.sort_values("fiscalDate", ascending=False).reset_index(drop=True)
+        if len(g) < 8:
+            continue
+        latest_4 = pd.to_numeric(g["revenue"].iloc[:4], errors="coerce")
+        prev_4 = pd.to_numeric(g["revenue"].iloc[4:8], errors="coerce")
+        if latest_4.notna().sum() < 4 or prev_4.notna().sum() < 4:
+            continue
+        rev_latest_4 = latest_4.sum()
+        rev_prev_4 = prev_4.sum()
+        if pd.isna(rev_prev_4) or rev_prev_4 <= 0:
+            continue
+        if pd.isna(rev_latest_4):
+            continue
+        try:
+            out[sym] = float(rev_latest_4) / float(rev_prev_4) - 1.0
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    return out
+
+
+def build_ocf_yoy_map(financials: pd.DataFrame) -> Dict[str, float]:
+    """OCF YoY = (latest TTM OCF / prior-year TTM OCF) - 1. Requires at least 8 quarterly rows; each 4Q block must have 4 valid operatingCashFlow values."""
+    out: Dict[str, float] = {}
+    if financials.empty or "symbol" not in financials.columns or "fiscalDate" not in financials.columns or "operatingCashFlow" not in financials.columns:
+        return out
+    fin = financials.copy()
+    fin["symbol"] = fin["symbol"].astype(str).str.strip().str.upper()
+    fin["fiscalDate"] = pd.to_datetime(fin["fiscalDate"], errors="coerce")
+    fin = fin.dropna(subset=["fiscalDate"])
+    fin["operatingCashFlow"] = pd.to_numeric(fin["operatingCashFlow"], errors="coerce")
+    for sym, g in fin.groupby("symbol"):
+        g = g.sort_values("fiscalDate", ascending=False).reset_index(drop=True)
+        if len(g) < 8:
+            continue
+        latest_4 = pd.to_numeric(g["operatingCashFlow"].iloc[:4], errors="coerce")
+        prev_4 = pd.to_numeric(g["operatingCashFlow"].iloc[4:8], errors="coerce")
+        if latest_4.notna().sum() < 4 or prev_4.notna().sum() < 4:
+            continue
+        ocf_latest_4 = latest_4.sum()
+        ocf_prev_4 = prev_4.sum()
+        if pd.isna(ocf_prev_4) or ocf_prev_4 == 0:
+            continue
+        if pd.isna(ocf_latest_4):
+            continue
+        try:
+            out[sym] = float(ocf_latest_4) / float(ocf_prev_4) - 1.0
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    return out
+
+
+def build_ocf_ni_map(financials: pd.DataFrame) -> Dict[str, float]:
+    """OCF/NI = latest TTM operatingCashFlow / latest TTM netIncome. Requires 4 quarters with 4 valid OCF and 4 valid NI."""
+    out: Dict[str, float] = {}
+    if financials.empty or "symbol" not in financials.columns or "fiscalDate" not in financials.columns:
+        return out
+    if "operatingCashFlow" not in financials.columns or "netIncome" not in financials.columns:
+        return out
+    fin = financials.copy()
+    fin["symbol"] = fin["symbol"].astype(str).str.strip().str.upper()
+    fin["fiscalDate"] = pd.to_datetime(fin["fiscalDate"], errors="coerce")
+    fin = fin.dropna(subset=["fiscalDate"])
+    fin["operatingCashFlow"] = pd.to_numeric(fin["operatingCashFlow"], errors="coerce")
+    fin["netIncome"] = pd.to_numeric(fin["netIncome"], errors="coerce")
+    for sym, g in fin.groupby("symbol"):
+        g = g.sort_values("fiscalDate", ascending=False).reset_index(drop=True)
+        if len(g) < 4:
+            continue
+        ocf_4 = pd.to_numeric(g["operatingCashFlow"].iloc[:4], errors="coerce")
+        ni_4 = pd.to_numeric(g["netIncome"].iloc[:4], errors="coerce")
+        if ocf_4.notna().sum() < 4 or ni_4.notna().sum() < 4:
+            continue
+        ocf_ttm = ocf_4.sum()
+        ni_ttm = ni_4.sum()
+        if pd.isna(ni_ttm) or ni_ttm == 0:
+            continue
+        if pd.isna(ocf_ttm):
+            continue
+        try:
+            out[sym] = float(ocf_ttm) / float(ni_ttm)
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    return out
+
+
+def build_eps_yoy_map(financials: pd.DataFrame) -> Dict[str, float]:
+    """EPS YoY = (latest EPS(TTM) / EPS(TTM) ~1 year earlier) - 1. Reuses build_eps_ttm_series and pick_eps_ttm_at_or_near."""
+    out: Dict[str, float] = {}
+    eps_series = build_eps_ttm_series(financials)
+    if not eps_series:
+        return out
+    for sym, series_df in eps_series.items():
+        if series_df is None or series_df.empty or "fiscalDate" not in series_df.columns or "eps_ttm" not in series_df.columns:
+            continue
+        series_df = series_df.sort_values("fiscalDate").reset_index(drop=True)
+        if series_df.empty:
+            continue
+        eps_latest = _float_or_nan(series_df.iloc[-1]["eps_ttm"])
+        latest_fd = pd.to_datetime(series_df.iloc[-1]["fiscalDate"], errors="coerce")
+        if eps_latest is None or np.isnan(eps_latest) or pd.isna(latest_fd):
+            continue
+        target_1y = latest_fd - pd.DateOffset(days=365)
+        eps_prev = pick_eps_ttm_at_or_near(series_df, target_1y, tolerance_days=180)
+        if eps_prev is None or np.isnan(eps_prev) or eps_prev == 0:
+            continue
+        try:
+            out[sym] = float(eps_latest) / float(eps_prev) - 1.0
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    return out
+
+
+def build_shares_history_lookup(shares: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Per-symbol DataFrame of share snapshots sorted by asOfDate descending (newest first)."""
+    out: Dict[str, pd.DataFrame] = {}
+    if shares.empty or "symbol" not in shares.columns or "asOfDate" not in shares.columns:
+        return out
+    df = shares.copy()
+    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+    df["asOfDate"] = pd.to_datetime(df["asOfDate"], errors="coerce")
+    df = df.dropna(subset=["asOfDate"])
+    if "sharesOutstanding" not in df.columns:
+        return out
+    df["sharesOutstanding"] = pd.to_numeric(df["sharesOutstanding"], errors="coerce")
+    for sym, g in df.groupby("symbol"):
+        g = g.sort_values("asOfDate", ascending=False).reset_index(drop=True)
+        out[sym] = g
+    return out
+
+
+def get_shares_at_or_before(sym: str, target_date: str, shares_lookup: Dict[str, pd.DataFrame]) -> float:
+    """Latest sharesOutstanding at or before target_date (YYYY-MM-DD). Lookup is per-symbol DF sorted asOfDate desc."""
+    if not sym:
+        return np.nan
+    sym = str(sym).strip().upper()
+    g = shares_lookup.get(sym)
+    if g is None or g.empty:
+        return np.nan
+    try:
+        tgt = pd.Timestamp(target_date)
+    except Exception:
+        return np.nan
+    dates = pd.to_datetime(g["asOfDate"], errors="coerce")
+    g = g.loc[dates <= tgt]
+    if g.empty:
+        return np.nan
+    row = g.iloc[0]
+    return _float_or_nan(row.get("sharesOutstanding"))
+
+
+def get_shares_near_past(
+    sym: str, target_date: str, shares_lookup: Dict[str, pd.DataFrame], lookback_days: int = 365
+) -> float:
+    """Shares outstanding at snapshot nearest to (target_date - lookback_days), using only snapshots on or before that date; allow within 120 days."""
+    if not sym:
+        return np.nan
+    sym = str(sym).strip().upper()
+    g = shares_lookup.get(sym)
+    if g is None or g.empty:
+        return np.nan
+    try:
+        tgt = pd.Timestamp(target_date) - pd.DateOffset(days=lookback_days)
+    except Exception:
+        return np.nan
+    dates = pd.to_datetime(g["asOfDate"], errors="coerce")
+    g = g.copy()
+    g["_dt"] = dates
+    g = g.dropna(subset=["_dt"])
+    if g.empty:
+        return np.nan
+    past = g.loc[g["_dt"] <= tgt]
+    if past.empty:
+        return np.nan
+    diffs = (past["_dt"] - tgt).abs().dt.days
+    idx = diffs.idxmin()
+    if pd.isna(diffs.loc[idx]) or diffs.loc[idx] > 120:
+        return np.nan
+    return _float_or_nan(past.loc[idx, "sharesOutstanding"])
+
+
+def build_share_dilution_map(shares: pd.DataFrame, latest_price_map: pd.Series) -> Dict[str, float]:
+    """Share Dilution = (Shares_now / Shares_1y_ago) - 1. Uses shares at/before price_date and near price_date - 365."""
+    out: Dict[str, float] = {}
+    lookup = build_shares_history_lookup(shares)
+    if not lookup:
+        return out
+    for sym in latest_price_map.index:
+        price_date = latest_price_map.get(sym)
+        if not price_date:
+            continue
+        price_date_str = str(price_date)[:10]
+        shares_now = get_shares_at_or_before(sym, price_date_str, lookup)
+        shares_1y = get_shares_near_past(sym, price_date_str, lookup, lookback_days=365)
+        if shares_1y is None or np.isnan(shares_1y) or shares_1y == 0:
+            continue
+        if shares_now is None or np.isnan(shares_now):
+            continue
+        try:
+            out[sym] = float(shares_now) / float(shares_1y) - 1.0
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    return out
+
+
+def detect_interest_expense_column(financials: pd.DataFrame) -> Optional[str]:
+    """Return first present column among known interest-expense-like column names."""
+    if financials is None or financials.empty:
+        return None
+    candidates = [
+        "interestExpense",
+        "interestAndDebtExpense",
+        "interestExpenseNonOperating",
+        "interestExpenseNet",
+        "netInterestExpense",
+        "interestExpenseTotal",
+    ]
+    for c in candidates:
+        if c in financials.columns:
+            return c
+    return None
+
+
+def build_interest_coverage_map(financials: pd.DataFrame) -> Dict[str, float]:
+    """Interest Coverage = operatingIncome_ttm / abs(interestExpense_ttm). Fallback: interest_ttm = operatingIncome_ttm - incomeBeforeTax_ttm (approximation; includes possible non-interest non-operating items) if no direct interest column."""
+    out: Dict[str, float] = {}
+    if financials.empty or "symbol" not in financials.columns or "fiscalDate" not in financials.columns:
+        return out
+    interest_col = detect_interest_expense_column(financials)
+    use_fallback = interest_col is None
+    if use_fallback:
+        log.info(
+            "Interest Coverage: no direct interest expense column in quarterly financials; "
+            "using fallback (operatingIncome_ttm - incomeBeforeTax_ttm; approximation may include non-interest items)"
+        )
+    fin = financials.copy()
+    fin["symbol"] = fin["symbol"].astype(str).str.strip().str.upper()
+    fin["fiscalDate"] = pd.to_datetime(fin["fiscalDate"], errors="coerce")
+    fin = fin.dropna(subset=["fiscalDate"])
+    fin_desc = fin.sort_values(["symbol", "fiscalDate"], ascending=[True, False])
+    for sym, g in fin_desc.groupby("symbol"):
+        g4 = g.head(4)
+        if len(g4) < 4:
+            continue
+        oi_ttm = pd.to_numeric(g4["operatingIncome"], errors="coerce").sum(min_count=1) if "operatingIncome" in g4.columns else np.nan
+        if pd.isna(oi_ttm):
+            continue
+        if use_fallback:
+            # Approximation: EBIT - EBT can include non-interest non-operating items; use only when no direct interest column.
+            ibt_ttm = pd.to_numeric(g4["incomeBeforeTax"], errors="coerce").sum(min_count=1) if "incomeBeforeTax" in g4.columns else np.nan
+            interest_ttm = oi_ttm - ibt_ttm if not pd.isna(ibt_ttm) else np.nan
+        else:
+            interest_ttm = pd.to_numeric(g4[interest_col], errors="coerce").sum(min_count=1)
+        if pd.isna(interest_ttm) or abs(interest_ttm) < 1e-12:
+            continue
+        try:
+            out[sym] = float(oi_ttm) / abs(float(interest_ttm))
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    return out
+
+
+def build_opm_volatility_map(
+    financials: pd.DataFrame, window_quarters: int = 8, min_quarters: int = 4
+) -> Dict[str, float]:
+    """OPM volatility = std(quarterly operating margin) over most recent valid quarters (up to 8, minimum 4)."""
+    out: Dict[str, float] = {}
+    if financials.empty or "symbol" not in financials.columns or "fiscalDate" not in financials.columns:
+        return out
+    if "operatingIncome" not in financials.columns or "revenue" not in financials.columns:
+        return out
+    fin = financials.copy()
+    fin["symbol"] = fin["symbol"].astype(str).str.strip().str.upper()
+    fin["fiscalDate"] = pd.to_datetime(fin["fiscalDate"], errors="coerce")
+    fin = fin.dropna(subset=["fiscalDate"])
+    fin["operatingIncome"] = pd.to_numeric(fin["operatingIncome"], errors="coerce")
+    fin["revenue"] = pd.to_numeric(fin["revenue"], errors="coerce")
+    for sym, g in fin.groupby("symbol"):
+        g = g.sort_values("fiscalDate", ascending=False).reset_index(drop=True)
+        g = g.head(window_quarters)
+        g = g.loc[g["revenue"].notna() & (g["revenue"] != 0)]
+        if len(g) < min_quarters:
+            continue
+        opm = g["operatingIncome"] / g["revenue"]
+        opm = opm.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(opm) < min_quarters:
+            continue
+        try:
+            out[sym] = float(opm.std())
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+# -----------------------------------------------------------------------------
 # Output columns order
 # -----------------------------------------------------------------------------
 
@@ -1135,14 +1444,14 @@ OUTPUT_COLUMNS = [
     "Perf Week", "Perf Month", "Perf Quarter", "Perf Half Y", "Perf Year",
     "Perf 3Y", "Perf 5Y", "Perf 10Y", "Perf YTD",
     "Beta",
-    "Income (Net)", "Sales (Rev)", "Book/sh", "Cash/sh",
+    "Income (Net)", "Sales (Rev)", "Revenue YoY", "OCF YoY", "Book/sh", "Cash/sh",
     "Dividend TTM", "Payout", "Employees", "IPO (Date)",
-    "EPS (ttm)", "P/E", "P/S", "P/B", "P/C", "P/FCF",
+    "EPS (ttm)", "EPS YoY", "P/E", "P/S", "P/B", "P/C", "P/FCF",
     "Market Cap", "Enterprise Value(EV)", "EV/EBITDA", "EV/Sales",
-    "Quick Ratio", "Current Ratio", "Debt/Eq", "LT Debt/Eq",
+    "Quick Ratio", "Current Ratio", "Debt/Eq", "LT Debt/Eq", "Interest Coverage",
     "ROA", "ROE", "ROIC",
-    "Gross Margin", "Oper. Margin", "Profit Margin",
-    "Shs Outstand", "Shs Float",
+    "Gross Margin", "Oper. Margin", "Profit Margin", "OCF/NI", "OPM volatility",
+    "Shs Outstand", "Share Dilution", "Shs Float",
     "Earnings (Date)", "Forward P/E", "PEG", "Dividend Est", "Dividend Gr. 3Y", "Dividend Gr. 5Y", "Dividend Ex-Date",
     "EPS This Y", "EPS Next Y", "EPS Next Q", "EPS Next 5Y",
     "Insider Own/Trans", "Inst Own/Trans",
@@ -1276,6 +1585,14 @@ def main() -> None:
 
         latest_price_map = latest_price_date_per_symbol(prices)
         log.info("Computed latest price date map")
+
+        revenue_yoy_map = build_revenue_yoy_map(financials)
+        ocf_yoy_map = build_ocf_yoy_map(financials)
+        ocf_ni_map = build_ocf_ni_map(financials)
+        eps_yoy_map = build_eps_yoy_map(financials)
+        share_dilution_map = build_share_dilution_map(shares_df, latest_price_map)
+        interest_coverage_map = build_interest_coverage_map(financials)
+        opm_volatility_map = build_opm_volatility_map(financials)
 
         # asOfDate = per-symbol price_date (계산 기준일)
         rows: List[Dict[str, Any]] = []
@@ -1504,6 +1821,13 @@ def main() -> None:
                 **price_inds,
                 "Dividend TTM": div_ttm,
                 **fin_inds,
+                "Revenue YoY": revenue_yoy_map.get(sym, np.nan),
+                "OCF YoY": ocf_yoy_map.get(sym, np.nan),
+                "OCF/NI": ocf_ni_map.get(sym, np.nan),
+                "EPS YoY": eps_yoy_map.get(sym, np.nan),
+                "Share Dilution": share_dilution_map.get(sym, np.nan),
+                "Interest Coverage": interest_coverage_map.get(sym, np.nan),
+                "OPM volatility": opm_volatility_map.get(sym, np.nan),
                 "Shs Float": shs_float,
                 "Target Price": target_p,
                 "Index": idx_val,
@@ -1541,6 +1865,13 @@ def main() -> None:
 
     log.info("New snapshot rows: %s", len(out_df))
     log.info("ROIC non-null: %s / %s", out_df["ROIC"].notna().sum(), len(out_df))
+    log.info("Revenue YoY non-null: %s / %s", out_df["Revenue YoY"].notna().sum(), len(out_df))
+    log.info("OCF YoY non-null: %s / %s", out_df["OCF YoY"].notna().sum(), len(out_df))
+    log.info("OCF/NI non-null: %s / %s", out_df["OCF/NI"].notna().sum(), len(out_df))
+    log.info("EPS YoY non-null: %s / %s", out_df["EPS YoY"].notna().sum(), len(out_df))
+    log.info("Share Dilution non-null: %s / %s", out_df["Share Dilution"].notna().sum(), len(out_df))
+    log.info("Interest Coverage non-null: %s / %s", out_df["Interest Coverage"].notna().sum(), len(out_df))
+    log.info("OPM volatility non-null: %s / %s", out_df["OPM volatility"].notna().sum(), len(out_df))
     eps_cols = ["EPS This Y", "EPS Next Y", "EPS Next Q", "EPS Next 5Y"]
     log.info(
         "EPS columns (float): %s",

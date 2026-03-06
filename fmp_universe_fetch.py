@@ -97,7 +97,7 @@ FINANCIALS_QUARTERLY_COLUMNS = [
     "cashAndCashEquivalents", "receivables", "shortTermInvestments",
     "currentAssets", "currentLiabilities", "totalAssets",
     "totalStockholdersEquity", "totalDebt", "longTermDebt",
-    "freeCashFlow", "dividendsPaid",
+    "freeCashFlow", "operatingCashFlow", "dividendsPaid",
     "weightedAverageSharesDiluted", "sharesOutstanding",
 ]
 FINANCIALS_PK = ["symbol", "fiscalDate", "period"]
@@ -107,7 +107,7 @@ FINANCIALS_COMPARE_COLUMNS = [
     "cashAndCashEquivalents", "receivables", "shortTermInvestments",
     "currentAssets", "currentLiabilities", "totalAssets",
     "totalStockholdersEquity", "totalDebt", "longTermDebt",
-    "freeCashFlow", "dividendsPaid",
+    "freeCashFlow", "operatingCashFlow", "dividendsPaid",
     "weightedAverageSharesDiluted", "sharesOutstanding",
 ]
 DIVIDENDS_EVENTS_COLUMNS = [
@@ -1026,6 +1026,71 @@ def _extract_shares_outstanding_from_as_reported(rows: List[Dict[str, Any]]) -> 
     return result
 
 
+def _norm_key_for_ocf(s: str) -> str:
+    """Normalize key for OCF matching: lowercase, remove spaces and underscores."""
+    return s.lower().replace(" ", "").replace("_", "")
+
+
+# As-reported exact normalized keys for operating cash flow (priority order)
+_OCF_EXACT_KEYS = [
+    "netcashprovidedbyusedinoperatingactivities",
+    "netcashprovidedbyoperatingactivities",
+    "cashfromoperations",
+    "operatingcashflow",
+]
+
+_OCF_LINE_PATTERNS = [
+    "operatingcashflow",
+    "cashfromoperations",
+    "netcashprovidedbyoperatingactivities",
+    "netcashprovidedbyusedinoperatingactivities",
+]
+
+
+def _extract_operating_cash_flow_from_as_reported(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], float]:
+    """Extract operating cash flow from as-reported cash flow rows. Returns (fiscalDate, period) -> value; also (fiscalDate, '') when period exists."""
+    result: Dict[Tuple[str, str], float] = {}
+
+    for r in rows:
+        d = pick_date10(r, ["date", "fiscalDateEnding", "fillingDate", "filingDate"])
+        if not d:
+            continue
+        per = _norm_period(pick_text(r, ["period"]))
+
+        # 1st priority: exact known keys in data dict (normalize key for comparison)
+        val_map = r.get("data") if isinstance(r.get("data"), dict) else None
+        if isinstance(val_map, dict):
+            norm_to_val: Dict[str, float] = {}
+            for k, v in val_map.items():
+                nk = _norm_key_for_ocf(k)
+                vv = _to_float(v)
+                if vv is not None:
+                    norm_to_val[nk] = vv
+            for exact in _OCF_EXACT_KEYS:
+                if exact in norm_to_val:
+                    v = norm_to_val[exact]
+                    result[(d, per)] = v
+                    if per:
+                        result[(d, "")] = v
+                    break
+            if (d, per) in result:
+                continue
+
+        # 2nd priority: scan line items for name patterns, choose by largest absolute value
+        candidates: List[Tuple[str, float]] = []
+        for name, val in _iter_as_reported_line_items(r):
+            nl = _norm_key_for_ocf(name)
+            if any(p in nl for p in _OCF_LINE_PATTERNS):
+                candidates.append((name, val))
+        if candidates:
+            best = max(candidates, key=lambda x: abs(x[1]))
+            result[(d, per)] = best[1]
+            if per:
+                result[(d, "")] = best[1]
+
+    return result
+
+
 def build_financials_quarterly(
     income: List[Dict[str, Any]],
     balance: List[Dict[str, Any]],
@@ -1086,6 +1151,12 @@ def build_financials_quarterly(
             by_key[key] = {"symbol": sym, "fiscalDate": d, "period": per if per is not None else pd.NA}
         cf_update: Dict[str, Any] = {
             "freeCashFlow": pick(r, ["freeCashFlow", "freeCashFlow"]),
+            "operatingCashFlow": pick(r, [
+                "operatingCashFlow",
+                "cashFromOperations",
+                "netCashProvidedByOperatingActivities",
+                "netCashProvidedByOperatingActivitiesContinuingOperations",
+            ]),
             "dividendsPaid": pick(r, ["dividendsPaid", "cashDividendsPaid", "dividendsPaidCommonStock", "dividendPaid", "paymentsOfDividends"]),
         }
         existing_dil = by_key[key].get("weightedAverageSharesDiluted")
@@ -1111,7 +1182,7 @@ def enrich_financials_quarterly_from_as_reported(
     as_reported_state: Dict[str, Any],
     limit: int = 80,
 ) -> pd.DataFrame:
-    """dividendsPaid/sharesOutstanding 결측 시 as-reported API로 보강. 402/403이면 1회 경고 후 fallback 비활성화."""
+    """dividendsPaid/sharesOutstanding/operatingCashFlow 결측 시 as-reported API로 보강. 402/403이면 1회 경고 후 fallback 비활성화."""
     if df.empty or "fiscalDate" not in df.columns:
         return df
     lock = as_reported_state.get("lock")
@@ -1119,27 +1190,40 @@ def enrich_financials_quarterly_from_as_reported(
         return df
 
     need_div = df["dividendsPaid"].isna().any() if "dividendsPaid" in df.columns else False
+    need_ocf = df["operatingCashFlow"].isna().any() if "operatingCashFlow" in df.columns else False
     need_shares = df["sharesOutstanding"].isna().any() if "sharesOutstanding" in df.columns else False
 
-    if need_div and not as_reported_state.get("disabled_cashflow", False):
+    if (need_div or need_ocf) and not as_reported_state.get("disabled_cashflow", False):
         cf_ar, restricted = fetch_cashflow_as_reported(session, rl, api_key, symbol, limit, call_counter)
         if restricted:
             with lock:
                 as_reported_state["disabled_cashflow"] = True
                 if not as_reported_state.get("warned_cashflow", False):
-                    log.warning("cash-flow-statement-as-reported 402/403; dividendsPaid as-reported fallback disabled for this run")
+                    log.warning("cash-flow-statement-as-reported 402/403; dividendsPaid/operatingCashFlow as-reported fallback disabled for this run")
                     as_reported_state["warned_cashflow"] = True
         elif cf_ar:
-            div_map = _extract_dividends_paid_from_as_reported(cf_ar)
-            for idx, row in df.iterrows():
-                fd = str(row.get("fiscalDate", ""))[:10]
-                per = _norm_period(row.get("period"))
-                key = (fd, per)
-                val = div_map.get(key)
-                if val is None and per:
-                    val = div_map.get((fd, ""))
-                if val is not None and pd.isna(row.get("dividendsPaid")):
-                    df.at[idx, "dividendsPaid"] = val
+            if need_div:
+                div_map = _extract_dividends_paid_from_as_reported(cf_ar)
+                for idx, row in df.iterrows():
+                    fd = str(row.get("fiscalDate", ""))[:10]
+                    per = _norm_period(row.get("period"))
+                    key = (fd, per)
+                    val = div_map.get(key)
+                    if val is None and per:
+                        val = div_map.get((fd, ""))
+                    if val is not None and pd.isna(row.get("dividendsPaid")):
+                        df.at[idx, "dividendsPaid"] = val
+            if need_ocf:
+                ocf_map = _extract_operating_cash_flow_from_as_reported(cf_ar)
+                for idx, row in df.iterrows():
+                    fd = str(row.get("fiscalDate", ""))[:10]
+                    per = _norm_period(row.get("period"))
+                    key = (fd, per)
+                    val = ocf_map.get(key)
+                    if val is None and per:
+                        val = ocf_map.get((fd, ""))
+                    if val is not None and pd.isna(row.get("operatingCashFlow")):
+                        df.at[idx, "operatingCashFlow"] = val
 
     if need_shares and not as_reported_state.get("disabled_balance", False):
         bal_ar, restricted = fetch_balance_as_reported(session, rl, api_key, symbol, limit, call_counter)
@@ -2021,6 +2105,8 @@ def run_backfill(
     if non_empty_fin:
         fin_combined = pd.concat(non_empty_fin, ignore_index=True)
         upsert_table(outdir, "financials_quarterly", fin_combined, ["symbol", "fiscalDate", "period"], FINANCIALS_QUARTERLY_COLUMNS)
+        if "operatingCashFlow" in fin_combined.columns:
+            log.info("financials_quarterly operatingCashFlow non-null: %s / %s", fin_combined["operatingCashFlow"].notna().sum(), len(fin_combined))
 
     # (4) earnings_events
     def _earn_one(sym: str) -> pd.DataFrame:
@@ -2233,7 +2319,7 @@ def run_debug_financials_fields(
     df = build_financials_quarterly(inc or [], bal or [], cf or [], sym, CUTOFF_DATE)
     as_reported_state: Dict[str, Any] = {"disabled_cashflow": False, "disabled_balance": False, "warned_cashflow": False, "warned_balance": False, "lock": threading.Lock()}
     df = enrich_financials_quarterly_from_as_reported(df, sym, session, rl, api_key, call_counter, as_reported_state, 5)
-    for col in ["weightedAverageSharesDiluted", "dividendsPaid", "sharesOutstanding"]:
+    for col in ["weightedAverageSharesDiluted", "dividendsPaid", "sharesOutstanding", "operatingCashFlow"]:
         if col in df.columns:
             n = int(df[col].notna().sum())
             log.info("[debug-financials-fields] financials_quarterly %s non-null count: %s", col, n)
@@ -2691,6 +2777,8 @@ def run_trigger_financials_quarterly(
     upsert_table(outdir, "financials_quarterly", combined, FINANCIALS_PK, FINANCIALS_QUARTERLY_COLUMNS)
     n_symbols = combined["symbol"].nunique() if "symbol" in combined.columns else 0
     log.info("trigger financials_quarterly upserted rows=%s symbols=%s", len(combined), n_symbols)
+    if "operatingCashFlow" in combined.columns:
+        log.info("financials_quarterly operatingCashFlow non-null: %s / %s", combined["operatingCashFlow"].notna().sum(), len(combined))
 
 
 def verify_dividends_calendar_date_matches_exdate(
