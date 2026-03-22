@@ -18,20 +18,21 @@ prices_eod의 adjClose는 dividend-adjusted API 또는 배당/스플릿 이벤�
 backfill/monthly: index_membership, company_facts_snapshot, insider_transactions, insider_holdings_snapshot는 옵션 없이 항상 실행. 제한(402/403) 시 해당 소스만 스킵·가능 범위만 저장; 빈 결과로 기존 파일 덮어쓰지 않음.
 
 실행 예:
-  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode daily
-  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode weekly
-  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode monthly --index-symbols SP500,NASDAQ
-  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode backfill --from 2020-01-01
-  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode trigger
-  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode trigger --earnings-use-lastupdated
-  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode trigger --verify-dividends-calendar-exdate AAPL
-  python fmp_universe_fetch.py --universe ./data/universe_list.csv --outdir ./data --mode sp500_backfill --from 2020-01-01
+  python fmp_universe_fetch.py --outdir ./data --mode daily
+  python fmp_universe_fetch.py --universe ./data/universe_current.parquet --outdir ./data --mode weekly
+  python fmp_universe_fetch.py --outdir ./data --mode monthly --index-symbols SP500,NASDAQ
+  python fmp_universe_fetch.py --outdir ./data --mode backfill --from 2020-01-01
+  python fmp_universe_fetch.py --outdir ./data --mode trigger
+  python fmp_universe_fetch.py --outdir ./data --mode trigger --earnings-use-lastupdated
+  python fmp_universe_fetch.py --outdir ./data --mode trigger --verify-dividends-calendar-exdate AAPL
+  python fmp_universe_fetch.py --outdir ./data --mode sp500_backfill --from 2020-01-01
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import logging
+import math
 import os
 import threading
 import time
@@ -73,6 +74,7 @@ PATH_EARNINGS_CALENDAR = "/stable/earnings-calendar"
 PATH_ANALYST_ESTIMATES = "/stable/analyst-estimates"
 PATH_PRICE_TARGET_CONSENSUS = "/stable/price-target-consensus"
 PATH_SHARES_FLOAT_ALL = "/stable/shares-float-all"
+PATH_SHARES_FLOAT = "/stable/shares-float"
 PATH_INSIDER_TRADING_SEARCH = "/stable/insider-trading/search"
 PATH_SP500 = "/stable/sp500-constituent"
 PATH_NASDAQ = "/stable/nasdaq-constituent"
@@ -97,7 +99,7 @@ FINANCIALS_QUARTERLY_COLUMNS = [
     "cashAndCashEquivalents", "receivables", "shortTermInvestments",
     "currentAssets", "currentLiabilities", "totalAssets",
     "totalStockholdersEquity", "totalDebt", "longTermDebt",
-    "freeCashFlow", "dividendsPaid",
+    "freeCashFlow", "operatingCashFlow", "dividendsPaid",
     "weightedAverageSharesDiluted", "sharesOutstanding",
 ]
 FINANCIALS_PK = ["symbol", "fiscalDate", "period"]
@@ -107,7 +109,7 @@ FINANCIALS_COMPARE_COLUMNS = [
     "cashAndCashEquivalents", "receivables", "shortTermInvestments",
     "currentAssets", "currentLiabilities", "totalAssets",
     "totalStockholdersEquity", "totalDebt", "longTermDebt",
-    "freeCashFlow", "dividendsPaid",
+    "freeCashFlow", "operatingCashFlow", "dividendsPaid",
     "weightedAverageSharesDiluted", "sharesOutstanding",
 ]
 DIVIDENDS_EVENTS_COLUMNS = [
@@ -324,14 +326,49 @@ def fmp_get(
 
 
 def read_universe(path: str) -> List[str]:
-    df = pd.read_csv(path)
+    """유니버스 파일을 읽어 active 종목 symbol 리스트를 반환한다.
+
+    - .parquet: symbol, status 컬럼 사용. status == 'active' 인 행만 포함.
+    - .csv: status 컬럼이 있으면 active만 포함; symbol/ticker_fixed/ticker 중 첫 번째 컬럼 사용.
+    - symbol은 strip/upper, 빈 값·중복 제거 후 반환.
+    """
+    path_obj = Path(path)
+    if not path_obj.exists():
+        raise FileNotFoundError(f"유니버스 파일을 찾을 수 없습니다: {path}")
+
+    if path_obj.suffix.lower() == ".parquet":
+        try:
+            df = pd.read_parquet(path)
+        except Exception as e:
+            raise RuntimeError(f"유니버스 parquet 읽기 실패: {path} — {e}") from e
+        cols_lower = {str(c).lower(): c for c in df.columns}
+        if "symbol" not in cols_lower:
+            raise ValueError(f"유니버스 parquet에 symbol 컬럼이 없습니다: {path}")
+        sym_col = cols_lower["symbol"]
+        df["_sym"] = df[sym_col].astype(str).str.strip().str.upper()
+        df = df[df["_sym"] != ""]
+        if "status" in cols_lower:
+            status_col = cols_lower["status"]
+            active_mask = df[status_col].astype(str).str.strip().str.lower() == "active"
+            df = df[active_mask]
+        syms = df["_sym"].dropna().unique().tolist()
+        return list(syms)
+
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        raise RuntimeError(f"유니버스 CSV 읽기 실패: {path} — {e}") from e
     cols_lower = {str(c).lower(): c for c in df.columns}
+    if "status" in cols_lower:
+        status_col = cols_lower["status"]
+        active_mask = df[status_col].astype(str).str.strip().str.lower() == "active"
+        df = df[active_mask]
     for name in ["symbol", "ticker_fixed", "ticker"]:
         if name in cols_lower:
             col = cols_lower[name]
             syms = df[col].astype(str).str.strip().str.upper()
             return syms[syms != ""].dropna().unique().tolist()
-    raise ValueError("universe_list.csv에 symbol/ticker_fixed/ticker 컬럼이 없습니다.")
+    raise ValueError(f"유니버스 CSV에 symbol/ticker_fixed/ticker 컬럼이 없습니다: {path}")
 
 
 def filter_by_shard(symbols: List[str], num_shards: int, shard_id: int) -> List[str]:
@@ -411,6 +448,31 @@ def fetch_profile_symbol(
     if isinstance(data, dict):
         return [data]
     return []
+
+
+def fetch_shares_float_symbol(
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    symbol: str,
+    call_counter: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Per-symbol shares-float (sharesOutstanding, sharesFloat). 404/empty 시 빈 dict 반환. financials_quarterly 최신 분기 보정용."""
+    try:
+        data = fmp_get(
+            session, rl, PATH_SHARES_FLOAT,
+            {"symbol": symbol},
+            api_key,
+            call_counter=call_counter,
+            allow_404_empty=True,
+        )
+        if isinstance(data, list) and len(data) > 0:
+            return data[0] if isinstance(data[0], dict) else {}
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
 
 
 def fetch_eod_full(
@@ -955,6 +1017,70 @@ def _iter_as_reported_line_items(row: Dict[str, Any]) -> List[Tuple[str, float]]
     return []
 
 
+def _norm_key_for_shares(name: str) -> str:
+    """Normalize key for shares matching: lowercase, remove spaces, hyphens, underscores."""
+    if not name:
+        return ""
+    return str(name).lower().replace(" ", "").replace("-", "").replace("_", "")
+
+
+# Exact key priority for balance-sheet sharesOutstanding (normalized)
+_SHARES_BALANCE_EXACT_PRIORITY = [
+    "commonstocksharesoutstanding",
+    "sharesoutstanding",
+    "ordinarysharesnumber",
+    "commonsharesoutstanding",
+    "commonstocksharesissued",
+]
+
+
+def _score_shares_key_fuzzy(norm_key: str) -> int:
+    """Higher = better. outstanding > ordinary > issued only."""
+    n = norm_key
+    has_share = "share" in n
+    has_outstanding = "outstanding" in n
+    has_ordinary = "ordinary" in n
+    has_issued = "issued" in n
+    if has_share and has_outstanding:
+        return 3
+    if has_ordinary and has_share:
+        return 2
+    if has_issued and not has_outstanding:
+        return 1
+    return 0
+
+
+def _extract_shares_outstanding_from_balance_row(row: Dict[str, Any]) -> Optional[float]:
+    """Extract sharesOutstanding from a single balance-sheet row. Normalize keys, exact priority then fuzzy; outstanding > ordinary > issued. Invalid/zero values discarded."""
+    if not row:
+        return None
+    norm_to_val: Dict[str, float] = {}
+    for k, v in row.items():
+        if v is None:
+            continue
+        nk = _norm_key_for_shares(str(k))
+        if not nk:
+            continue
+        vv = _to_float(v)
+        if vv is None or vv <= 0:
+            continue
+        norm_to_val[nk] = vv
+
+    for exact in _SHARES_BALANCE_EXACT_PRIORITY:
+        if exact in norm_to_val:
+            return norm_to_val[exact]
+
+    candidates: List[Tuple[str, float, int]] = []
+    for nk, vv in norm_to_val.items():
+        score = _score_shares_key_fuzzy(nk)
+        if score > 0:
+            candidates.append((nk, vv, score))
+    if not candidates:
+        return None
+    best = max(candidates, key=lambda x: (x[2], x[1]))
+    return best[1]
+
+
 def _extract_dividends_paid_from_as_reported(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], float]:
     result: Dict[Tuple[str, str], float] = {}
 
@@ -990,7 +1116,176 @@ def _extract_dividends_paid_from_as_reported(rows: List[Dict[str, Any]]) -> Dict
     return result
 
 
+# As-reported shares exact keys (normalized), priority order; issued excluded from exact.
+_AS_REPORTED_SHARES_EXACT = [
+    "commonstocksharesoutstanding",
+    "sharesoutstanding",
+    "ordinarysharesnumber",
+    "commonsharesoutstanding",
+]
+
+
+def _score_as_reported_shares_line(norm_name: str) -> int:
+    """Priority: common+outstanding(4) > share+outstanding(3) > ordinary+share(2) > issued only(1)."""
+    n = norm_name
+    has_common = "common" in n
+    has_share = "share" in n
+    has_outstanding = "outstanding" in n
+    has_ordinary = "ordinary" in n
+    has_issued = "issued" in n
+    if has_common and has_outstanding:
+        return 4
+    if has_share and has_outstanding:
+        return 3
+    if has_ordinary and has_share:
+        return 2
+    if has_issued and not has_outstanding:
+        return 1
+    return 0
+
+
 def _extract_shares_outstanding_from_as_reported(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], float]:
+    """Priority-based: exact normalized keys first; then line-item fuzzy (outstanding > ordinary > issued). Tie-break: date clarity then larger value. Reject <= 0."""
+    result: Dict[Tuple[str, str], float] = {}
+    min_valid = 1.0
+
+    for r in rows:
+        d = pick_date10(r, ["date", "fiscalDateEnding", "fillingDate", "filingDate"])
+        if not d:
+            continue
+        per = _norm_period(pick_text(r, ["period"]))
+
+        val_map = r.get("data") if isinstance(r.get("data"), dict) else None
+        chosen: Optional[float] = None
+
+        if isinstance(val_map, dict):
+            norm_to_val: Dict[str, float] = {}
+            for k, v in val_map.items():
+                nk = _norm_key_for_shares(str(k))
+                if not nk:
+                    continue
+                vv = _to_float(v)
+                if vv is None or vv < min_valid:
+                    continue
+                norm_to_val[nk] = vv
+            for exact in _AS_REPORTED_SHARES_EXACT:
+                if exact in norm_to_val:
+                    chosen = norm_to_val[exact]
+                    break
+
+        if chosen is None:
+            candidates: List[Tuple[float, int]] = []
+            for name, val in _iter_as_reported_line_items(r):
+                if val is None or val < min_valid:
+                    continue
+                nl = _norm_key_for_shares(name)
+                score = _score_as_reported_shares_line(nl)
+                if score > 0:
+                    candidates.append((val, score))
+            if candidates:
+                best_priority = max(c[1] for c in candidates)
+                same_rank = [c[0] for c in candidates if c[1] == best_priority]
+                chosen = max(same_rank)
+                chosen_priority = best_priority
+
+        if chosen is not None:
+            result[(d, per)] = chosen
+            if per:
+                result[(d, "")] = chosen
+
+    return result
+
+
+def _backfill_shares_outstanding_for_symbol(
+    df: pd.DataFrame,
+    symbol: str,
+    session: requests.Session,
+    rl: RateLimiter,
+    api_key: str,
+    call_counter: Dict[str, Any],
+) -> pd.DataFrame:
+    """보강: sharesOutstanding 결측을 weightedAverageSharesDiluted, 최신 1~2분기만 shares-float/profile, 그 다음 전파로 채움. 최신 분기 정확도 우선."""
+    if df.empty or "sharesOutstanding" not in df.columns:
+        return df
+    before_count = int(df["sharesOutstanding"].notna().sum())
+
+    # 1) 최신 1~2분기만 current snapshot으로 채우기 (fiscalDate 내림차순에서 비어 있는 최신 행부터)
+    df = df.copy()
+    missing = df["sharesOutstanding"].isna()
+    if missing.any():
+        # fiscalDate desc, period desc로 정렬 후 비어 있는 행의 인덱스 중 상위 2개
+        order = df.assign(
+            _fd=pd.to_datetime(df["fiscalDate"], errors="coerce"),
+            _per=df["period"].astype(str),
+        ).sort_values(["_fd", "_per"], ascending=[False, False])
+        order = order[missing.reindex(order.index).fillna(False)]
+        latest_missing_idx = order.index[:2].tolist()
+        if latest_missing_idx:
+            current_shares: Optional[float] = None
+            try:
+                sf = fetch_shares_float_symbol(session, rl, api_key, symbol, call_counter)
+                if sf:
+                    current_shares = _to_float(sf.get("sharesOutstanding") or sf.get("outstandingShares"))
+            except Exception:
+                log.debug("shares-float fetch failed for %s (sharesOutstanding backfill)", symbol)
+            if current_shares is None or current_shares <= 0:
+                try:
+                    prof = fetch_profile_symbol(session, rl, api_key, symbol, call_counter)
+                    if prof and isinstance(prof, list) and len(prof) > 0:
+                        current_shares = _to_float(prof[0].get("sharesOutstanding") or prof[0].get("outstandingShares"))
+                except Exception:
+                    log.debug("profile fetch failed for %s (sharesOutstanding backfill)", symbol)
+            if current_shares is not None and current_shares > 0:
+                for idx in latest_missing_idx:
+                    if idx in df.index and pd.isna(df.at[idx, "sharesOutstanding"]):
+                        df.at[idx, "sharesOutstanding"] = current_shares
+                        log.debug("sharesOutstanding latest-quarter fallback applied for %s", symbol)
+
+    # 2) 남은 결측을 같은 행의 weightedAverageSharesDiluted로 채우기
+    if "weightedAverageSharesDiluted" in df.columns:
+        still_na = df["sharesOutstanding"].isna()
+        dil = df.loc[still_na, "weightedAverageSharesDiluted"]
+        valid = dil.notna() & (dil > 0)
+        if valid.any():
+            df.loc[valid.index, "sharesOutstanding"] = df.loc[valid.index, "weightedAverageSharesDiluted"]
+
+    # 3) 과거 분기 전파: fiscalDate 오름차순 후 forward/backward fill로만 결측 채움
+    still_na = df["sharesOutstanding"].isna()
+    if still_na.any():
+        order_asc = df.assign(_fd=pd.to_datetime(df["fiscalDate"], errors="coerce")).sort_values("_fd")
+        so_filled = order_asc["sharesOutstanding"].ffill().bfill()
+        fill_val = so_filled.reindex(df.index)
+        df["sharesOutstanding"] = df["sharesOutstanding"].fillna(fill_val)
+
+    after_count = int(df["sharesOutstanding"].notna().sum())
+    if after_count != before_count:
+        log.debug("sharesOutstanding %s: non-null before=%s after=%s", symbol, before_count, after_count)
+    return df
+
+
+def _norm_key_for_ocf(s: str) -> str:
+    """Normalize key for OCF matching: lowercase, remove spaces and underscores."""
+    return s.lower().replace(" ", "").replace("_", "")
+
+
+# As-reported exact normalized keys for operating cash flow (priority order)
+_OCF_EXACT_KEYS = [
+    "netcashprovidedbyusedinoperatingactivities",
+    "netcashprovidedbyoperatingactivities",
+    "cashfromoperations",
+    "operatingcashflow",
+]
+
+_OCF_LINE_PATTERNS = [
+    "operatingcashflow",
+    "cashfromoperations",
+    "netcashprovidedbyoperatingactivities",
+    "netcashprovidedbyusedinoperatingactivities",
+]
+
+
+def _extract_operating_cash_flow_from_as_reported(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], float]:
+    """Extract operating cash flow from as-reported cash flow rows. Returns (fiscalDate, period) -> value; also (fiscalDate, '') when period exists."""
     result: Dict[Tuple[str, str], float] = {}
 
     for r in rows:
@@ -999,29 +1294,36 @@ def _extract_shares_outstanding_from_as_reported(rows: List[Dict[str, Any]]) -> 
             continue
         per = _norm_period(pick_text(r, ["period"]))
 
-        # 1순위: commonstocksharesoutstanding 정확키
+        # 1st priority: exact known keys in data dict (normalize key for comparison)
         val_map = r.get("data") if isinstance(r.get("data"), dict) else None
-        if isinstance(val_map, dict) and "commonstocksharesoutstanding" in val_map:
-            v = _to_float(val_map.get("commonstocksharesoutstanding"))
-            if v is not None and v > 0:
-                result[(d, per)] = v
-                if per:
-                    result[(d, "")] = v
+        if isinstance(val_map, dict):
+            norm_to_val: Dict[str, float] = {}
+            for k, v in val_map.items():
+                nk = _norm_key_for_ocf(k)
+                vv = _to_float(v)
+                if vv is not None:
+                    norm_to_val[nk] = vv
+            for exact in _OCF_EXACT_KEYS:
+                if exact in norm_to_val:
+                    v = norm_to_val[exact]
+                    result[(d, per)] = v
+                    if per:
+                        result[(d, "")] = v
+                    break
+            if (d, per) in result:
                 continue
 
-        # 2순위: 라인아이템 스캔
-        candidates: List[float] = []
+        # 2nd priority: scan line items for name patterns, choose by largest absolute value
+        candidates: List[Tuple[str, float]] = []
         for name, val in _iter_as_reported_line_items(r):
-            nl = name.lower().replace(" ", "").replace("_", "")
-            if "commonstocksharesoutstanding" in nl or ("shares" in nl and "outstanding" in nl):
-                if val is not None and val > 0:
-                    candidates.append(val)
-
+            nl = _norm_key_for_ocf(name)
+            if any(p in nl for p in _OCF_LINE_PATTERNS):
+                candidates.append((name, val))
         if candidates:
-            best = max(candidates)
-            result[(d, per)] = best
+            best = max(candidates, key=lambda x: abs(x[1]))
+            result[(d, per)] = best[1]
             if per:
-                result[(d, "")] = best
+                result[(d, "")] = best[1]
 
     return result
 
@@ -1073,7 +1375,7 @@ def build_financials_quarterly(
             "totalStockholdersEquity": pick(r, ["totalStockholdersEquity", "totalEquity", "stockholdersEquity"]),
             "totalDebt": pick(r, ["totalDebt"]),
             "longTermDebt": pick(r, ["longTermDebt"]),
-            "sharesOutstanding": pick(r, ["commonStockSharesOutstanding", "commonStockSharesIssued", "sharesOutstanding", "ordinarySharesNumber"]),
+            "sharesOutstanding": _extract_shares_outstanding_from_balance_row(r),
         })
     # C) dividendsPaid: cashflow 후보 키 확대; weightedAverageSharesDiluted는 income 없을 때만 fallback (현재 100% NaN: cashflow에 dividendsPaid/weighted 키 없음)
     for r in cashflow:
@@ -1086,6 +1388,12 @@ def build_financials_quarterly(
             by_key[key] = {"symbol": sym, "fiscalDate": d, "period": per if per is not None else pd.NA}
         cf_update: Dict[str, Any] = {
             "freeCashFlow": pick(r, ["freeCashFlow", "freeCashFlow"]),
+            "operatingCashFlow": pick(r, [
+                "operatingCashFlow",
+                "cashFromOperations",
+                "netCashProvidedByOperatingActivities",
+                "netCashProvidedByOperatingActivitiesContinuingOperations",
+            ]),
             "dividendsPaid": pick(r, ["dividendsPaid", "cashDividendsPaid", "dividendsPaidCommonStock", "dividendPaid", "paymentsOfDividends"]),
         }
         existing_dil = by_key[key].get("weightedAverageSharesDiluted")
@@ -1111,7 +1419,7 @@ def enrich_financials_quarterly_from_as_reported(
     as_reported_state: Dict[str, Any],
     limit: int = 80,
 ) -> pd.DataFrame:
-    """dividendsPaid/sharesOutstanding 결측 시 as-reported API로 보강. 402/403이면 1회 경고 후 fallback 비활성화."""
+    """dividendsPaid/sharesOutstanding/operatingCashFlow 결측 시 as-reported API로 보강. 402/403이면 1회 경고 후 fallback 비활성화."""
     if df.empty or "fiscalDate" not in df.columns:
         return df
     lock = as_reported_state.get("lock")
@@ -1119,27 +1427,40 @@ def enrich_financials_quarterly_from_as_reported(
         return df
 
     need_div = df["dividendsPaid"].isna().any() if "dividendsPaid" in df.columns else False
+    need_ocf = df["operatingCashFlow"].isna().any() if "operatingCashFlow" in df.columns else False
     need_shares = df["sharesOutstanding"].isna().any() if "sharesOutstanding" in df.columns else False
 
-    if need_div and not as_reported_state.get("disabled_cashflow", False):
+    if (need_div or need_ocf) and not as_reported_state.get("disabled_cashflow", False):
         cf_ar, restricted = fetch_cashflow_as_reported(session, rl, api_key, symbol, limit, call_counter)
         if restricted:
             with lock:
                 as_reported_state["disabled_cashflow"] = True
                 if not as_reported_state.get("warned_cashflow", False):
-                    log.warning("cash-flow-statement-as-reported 402/403; dividendsPaid as-reported fallback disabled for this run")
+                    log.warning("cash-flow-statement-as-reported 402/403; dividendsPaid/operatingCashFlow as-reported fallback disabled for this run")
                     as_reported_state["warned_cashflow"] = True
         elif cf_ar:
-            div_map = _extract_dividends_paid_from_as_reported(cf_ar)
-            for idx, row in df.iterrows():
-                fd = str(row.get("fiscalDate", ""))[:10]
-                per = _norm_period(row.get("period"))
-                key = (fd, per)
-                val = div_map.get(key)
-                if val is None and per:
-                    val = div_map.get((fd, ""))
-                if val is not None and pd.isna(row.get("dividendsPaid")):
-                    df.at[idx, "dividendsPaid"] = val
+            if need_div:
+                div_map = _extract_dividends_paid_from_as_reported(cf_ar)
+                for idx, row in df.iterrows():
+                    fd = str(row.get("fiscalDate", ""))[:10]
+                    per = _norm_period(row.get("period"))
+                    key = (fd, per)
+                    val = div_map.get(key)
+                    if val is None and per:
+                        val = div_map.get((fd, ""))
+                    if val is not None and pd.isna(row.get("dividendsPaid")):
+                        df.at[idx, "dividendsPaid"] = val
+            if need_ocf:
+                ocf_map = _extract_operating_cash_flow_from_as_reported(cf_ar)
+                for idx, row in df.iterrows():
+                    fd = str(row.get("fiscalDate", ""))[:10]
+                    per = _norm_period(row.get("period"))
+                    key = (fd, per)
+                    val = ocf_map.get(key)
+                    if val is None and per:
+                        val = ocf_map.get((fd, ""))
+                    if val is not None and pd.isna(row.get("operatingCashFlow")):
+                        df.at[idx, "operatingCashFlow"] = val
 
     if need_shares and not as_reported_state.get("disabled_balance", False):
         bal_ar, restricted = fetch_balance_as_reported(session, rl, api_key, symbol, limit, call_counter)
@@ -1160,6 +1481,10 @@ def enrich_financials_quarterly_from_as_reported(
                     val = shares_map.get((fd, ""))
                 if val is not None and pd.isna(row.get("sharesOutstanding")):
                     df.at[idx, "sharesOutstanding"] = val
+
+    # sharesOutstanding 전용 후처리: diluted → 최신분기만 snapshot → 전파
+    if "sharesOutstanding" in df.columns:
+        df = _backfill_shares_outstanding_for_symbol(df, symbol, session, rl, api_key, call_counter)
 
     return df
 
@@ -1357,7 +1682,7 @@ def build_estimates_snapshot_annual(rows: List[Dict[str, Any]], symbol: str, as_
     filtered = _estimates_rows_after(rows, as_of)
     eps_this = None
     eps_next = None
-    eps_next_5y: Optional[float] = None
+    eps_next_5y = pd.NA
     if len(filtered) >= 1:
         eps_this = _estimates_eps_from_row(filtered[0])
     if len(filtered) >= 2:
@@ -1365,12 +1690,16 @@ def build_estimates_snapshot_annual(rows: List[Dict[str, Any]], symbol: str, as_
     if len(filtered) >= 5:
         eps_t0 = _estimates_eps_from_row(filtered[0])
         eps_t5 = _estimates_eps_from_row(filtered[4])
-        if eps_t0 is not None and eps_t5 is not None and eps_t0 > 0:
-            try:
-                growth = (float(eps_t5) / float(eps_t0)) ** (1.0 / 5.0) - 1.0
-                eps_next_5y = growth
-            except (ZeroDivisionError, ValueError):
-                pass
+        if (
+            eps_t0 is not None and eps_t5 is not None
+            and math.isfinite(float(eps_t0))
+            and math.isfinite(float(eps_t5))
+            and float(eps_t0) > 0
+            and float(eps_t5) > 0
+        ):
+            ratio = float(eps_t5) / float(eps_t0)
+            if math.isfinite(ratio) and ratio > 0:
+                eps_next_5y = float(ratio ** (1.0 / 5.0) - 1.0)
     df = pd.DataFrame([{
         "symbol": sym,
         "asOfDate": as_of,
@@ -1618,6 +1947,11 @@ def upsert_table(
     sort_cols = [c for c in pk_avail if c in combined.columns]
     if sort_cols:
         combined = combined.sort_values(sort_cols)
+    for col in combined.columns:
+        if combined[col].dtype == object:
+            combined[col] = combined[col].map(
+                lambda v: pd.NA if isinstance(v, complex) else v
+            )
     outdir.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(path_pq, index=False, engine="pyarrow")
     combined.to_csv(path_csv, index=False)
@@ -2021,6 +2355,10 @@ def run_backfill(
     if non_empty_fin:
         fin_combined = pd.concat(non_empty_fin, ignore_index=True)
         upsert_table(outdir, "financials_quarterly", fin_combined, ["symbol", "fiscalDate", "period"], FINANCIALS_QUARTERLY_COLUMNS)
+        if "operatingCashFlow" in fin_combined.columns:
+            log.info("financials_quarterly operatingCashFlow non-null: %s / %s", fin_combined["operatingCashFlow"].notna().sum(), len(fin_combined))
+        if "sharesOutstanding" in fin_combined.columns:
+            log.info("financials_quarterly sharesOutstanding non-null: %s / %s", fin_combined["sharesOutstanding"].notna().sum(), len(fin_combined))
 
     # (4) earnings_events
     def _earn_one(sym: str) -> pd.DataFrame:
@@ -2233,7 +2571,7 @@ def run_debug_financials_fields(
     df = build_financials_quarterly(inc or [], bal or [], cf or [], sym, CUTOFF_DATE)
     as_reported_state: Dict[str, Any] = {"disabled_cashflow": False, "disabled_balance": False, "warned_cashflow": False, "warned_balance": False, "lock": threading.Lock()}
     df = enrich_financials_quarterly_from_as_reported(df, sym, session, rl, api_key, call_counter, as_reported_state, 5)
-    for col in ["weightedAverageSharesDiluted", "dividendsPaid", "sharesOutstanding"]:
+    for col in ["weightedAverageSharesDiluted", "dividendsPaid", "sharesOutstanding", "operatingCashFlow"]:
         if col in df.columns:
             n = int(df[col].notna().sum())
             log.info("[debug-financials-fields] financials_quarterly %s non-null count: %s", col, n)
@@ -2691,6 +3029,10 @@ def run_trigger_financials_quarterly(
     upsert_table(outdir, "financials_quarterly", combined, FINANCIALS_PK, FINANCIALS_QUARTERLY_COLUMNS)
     n_symbols = combined["symbol"].nunique() if "symbol" in combined.columns else 0
     log.info("trigger financials_quarterly upserted rows=%s symbols=%s", len(combined), n_symbols)
+    if "operatingCashFlow" in combined.columns:
+        log.info("financials_quarterly operatingCashFlow non-null: %s / %s", combined["operatingCashFlow"].notna().sum(), len(combined))
+    if "sharesOutstanding" in combined.columns:
+        log.info("financials_quarterly sharesOutstanding non-null: %s / %s", combined["sharesOutstanding"].notna().sum(), len(combined))
 
 
 def verify_dividends_calendar_date_matches_exdate(
@@ -2734,7 +3076,7 @@ def verify_dividends_calendar_date_matches_exdate(
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="FMP Premium: 11 tables (prices_eod, financials_quarterly, ..., company_facts_snapshot, insider_*, index_membership)")
-    ap.add_argument("--universe", required=True, help="universe_list.csv path")
+    ap.add_argument("--universe", default="./data/universe_current.parquet", help="유니버스 파일 경로 (기본: universe_current.parquet, active 종목만 사용)")
     ap.add_argument("--outdir", required=True, help="Output directory")
     ap.add_argument("--from", dest="from_date", default="2020-01-01", help="Start date YYYY-MM-DD")
     ap.add_argument("--to", dest="to_date", default="", help="End date YYYY-MM-DD (backfill: today; daily: yesterday)")

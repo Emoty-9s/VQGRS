@@ -42,31 +42,31 @@ PYTHON_EXE = "py"           # Windows: "py", 필요시 "python"
 PYTHON_VER_FLAG = "-3"     # Windows py 런처에서 3.x 지정. python 쓰면 ""로.
 FMP_SCRIPT = "fmp_universe_fetch.py"
 
-UNIVERSE_CSV = Path("./data/universe_list.csv")
+UNIVERSE_FILE = Path("./data/universe_current.parquet")
 OUTDIR = Path("./data")
 
 # 실행 모드별 arguments
 TRIGGER_ARGS = [
     "--mode", "trigger",
-    "--universe", str(UNIVERSE_CSV),
+    "--universe", str(UNIVERSE_FILE),
     "--outdir", str(OUTDIR),
 ]
 
 DAILY_ARGS = [
     "--mode", "daily",
-    "--universe", str(UNIVERSE_CSV),
+    "--universe", str(UNIVERSE_FILE),
     "--outdir", str(OUTDIR),
 ]
 
 WEEKLY_ARGS = [
     "--mode", "weekly",
-    "--universe", str(UNIVERSE_CSV),
+    "--universe", str(UNIVERSE_FILE),
     "--outdir", str(OUTDIR),
 ]
 
 MONTHLY_ARGS = [
     "--mode", "monthly",
-    "--universe", str(UNIVERSE_CSV),
+    "--universe", str(UNIVERSE_FILE),
     "--outdir", str(OUTDIR),
 ]
 
@@ -220,8 +220,8 @@ def main() -> None:
     if not Path(FMP_SCRIPT).exists():
         print(f"[ERROR] {FMP_SCRIPT} 파일이 현재 경로에 없습니다.")
         sys.exit(2)
-    if not UNIVERSE_CSV.exists():
-        print(f"[ERROR] universe 파일이 없습니다: {UNIVERSE_CSV}")
+    if not UNIVERSE_FILE.exists():
+        print(f"[ERROR] universe 파일이 없습니다: {UNIVERSE_FILE}")
         sys.exit(2)
 
     now = datetime.now()
