@@ -1,17 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Unified A/C/D/E snapshot storage: combine A, C, D, E snapshot DataFrames and save as
+Unified A/B/C/D/E snapshot storage: combine A, B, C, D, E snapshot DataFrames and save as
 a single latest file and a single history file (parquet + csv).
 
 Execution flow:
   1. python build_group_a_snapshot.py → A snapshot only; A latest saved; no unified history.
-  2. python build_group_c_snapshot.py  → C snapshot only; C latest saved; no unified history.
-  3. python build_group_d_snapshot.py  → D snapshot only; D latest saved; no unified history.
-  4. python build_group_e_snapshot.py  → E snapshot only; E latest saved; no unified history.
-  5. python group_snapshot_history.py (main) → A+C+D+E built, combined, unified latest + unified history saved.
+  2. python build_group_b_snapshot.py → B snapshot only; B latest saved; no unified history.
+  3. python build_group_c_snapshot.py  → C snapshot only; C latest saved; no unified history.
+  4. python build_group_d_snapshot.py  → D snapshot only; D latest saved; no unified history.
+  5. python build_group_e_snapshot.py  → E snapshot only; E latest saved; no unified history.
+  6. python group_snapshot_history.py (main) → A+B+C+D+E built, combined, unified latest + unified history saved.
 
 Dedup key: (as_of_date, symbol, group_type). Only unified history file is written;
   no per-group history files. Per-group latest-only files are optional.
+
+Unified outputs live under output/group_unified/ (historically group_cde; paths renamed for accuracy).
 """
 from __future__ import annotations
 
@@ -24,9 +27,10 @@ import pandas as pd
 # Path / config constants
 # ---------------------------------------------------------------------------
 DEFAULT_OUTPUT_DIR = "output"
-UNIFIED_DIR_NAME = "group_cde"
-UNIFIED_LATEST_NAME = "group_cde_snapshot_latest.parquet"
-UNIFIED_HISTORY_NAME = "group_cde_snapshot_history.parquet"
+# Combined A+B+C+D+E latest + rolling history (parquet + csv). Replaces legacy group_cde/* names.
+UNIFIED_DIR_NAME = "group_unified"
+UNIFIED_LATEST_NAME = "group_unified_snapshot_latest.parquet"
+UNIFIED_HISTORY_NAME = "group_unified_snapshot_history.parquet"
 SNAPSHOT_LATEST_SUFFIX = "_snapshot_latest.parquet"
 
 # Dedup key for history: as_of_date + symbol + group_type (same symbol, different group_type = different row)
@@ -63,7 +67,7 @@ def _save_parquet_and_csv(df: pd.DataFrame, parquet_path: Path) -> None:
 
 def combine_snapshots(snapshot_dfs: list[pd.DataFrame]) -> pd.DataFrame:
     """
-    Combine multiple snapshot DataFrames (e.g. A, C, D, E) into one.
+    Combine multiple snapshot DataFrames (e.g. A, B, C, D, E) into one.
     Empty DataFrames are skipped. Meta columns (as_of_date, symbol, group_type, group_tag)
     are moved to the front. group_type must exist in each non-empty df.
     """
@@ -84,7 +88,7 @@ def combine_snapshots(snapshot_dfs: list[pd.DataFrame]) -> pd.DataFrame:
 
 
 def _get_cde_paths(output_dir: str | Path) -> tuple[Path, Path]:
-    """Return (latest_path, history_path) for unified A/C/D/E: output/group_cde/group_cde_snapshot_*.parquet."""
+    """Return (latest_path, history_path) for unified A/B/C/D/E: output/group_unified/group_unified_snapshot_*.parquet."""
     output_dir = Path(output_dir).resolve()
     base = output_dir / UNIFIED_DIR_NAME
     latest = base / UNIFIED_LATEST_NAME
@@ -127,7 +131,7 @@ def save_cde_latest(
     snapshot_df: pd.DataFrame,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
 ) -> None:
-    """Save unified A/C/D/E snapshot to output/group_cde/group_cde_snapshot_latest.(parquet,csv)."""
+    """Save unified A/B/C/D/E snapshot to output/group_unified/group_unified_snapshot_latest.(parquet,csv)."""
     for c in KEY_COLS:
         if c not in snapshot_df.columns:
             raise ValueError(f"snapshot_df must contain column: {c}")
@@ -140,7 +144,7 @@ def upsert_cde_history(
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
 ) -> None:
     """
-    Upsert snapshot into output/group_cde/group_cde_snapshot_history.(parquet,csv).
+    Upsert snapshot into output/group_unified/group_unified_snapshot_history.(parquet,csv).
     Dedup key: as_of_date + symbol + group_type. Same key is overwritten by new data.
     """
     for c in KEY_COLS:
@@ -155,7 +159,7 @@ def upsert_cde_history(
             existing = pd.read_parquet(history_path)
         except Exception as e:
             warnings.warn(
-                f"Could not read CDE history {history_path}: {e}. Creating new.",
+                f"Could not read unified snapshot history {history_path}: {e}. Creating new.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -172,7 +176,7 @@ def save_cde_snapshot_and_history(
     snapshot_df: pd.DataFrame,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
 ) -> None:
-    """Save unified latest and upsert unified history (A/C/D/E; parquet + csv)."""
+    """Save unified latest and upsert unified history (A/B/C/D/E; parquet + csv)."""
     save_cde_latest(snapshot_df, output_dir=output_dir)
     upsert_cde_history(snapshot_df, output_dir=output_dir)
 
@@ -207,12 +211,13 @@ def main(
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
 ) -> None:
     """
-    Build A, C, D, E snapshot DataFrames, combine, save unified latest + history (parquet + csv).
+    Build A, B, C, D, E snapshot DataFrames, combine, save unified latest + history (parquet + csv).
     Entry point for: python group_snapshot_history.py
     Uses lazy imports to avoid circular imports with build_group_*_snapshot modules.
     """
     from group_snapshot_utils import DEFAULT_DATA_DIR as _DD, DEFAULT_LOGIC_DIR as _LD
     from build_group_a_snapshot import build_group_a_snapshot_df
+    from build_group_b_snapshot import build_group_b_snapshot_df
     from build_group_c_snapshot import build_group_c_snapshot_df
     from build_group_d_snapshot import build_group_d_snapshot_df
     from build_group_e_snapshot import build_group_e_snapshot_df
@@ -223,6 +228,10 @@ def main(
     print("Building Group A snapshot...")
     df_a = build_group_a_snapshot_df(logic_dir=logic_dir, data_dir=data_dir)
     print(f"  A rows: {len(df_a)}")
+
+    print("Building Group B snapshot...")
+    df_b = build_group_b_snapshot_df(logic_dir=logic_dir, data_dir=data_dir)
+    print(f"  B rows: {len(df_b)}")
 
     print("Building Group C snapshot...")
     df_c = build_group_c_snapshot_df(logic_dir=logic_dir, data_dir=data_dir)
@@ -236,11 +245,15 @@ def main(
     df_e = build_group_e_snapshot_df(logic_dir=logic_dir, data_dir=data_dir)
     print(f"  E rows: {len(df_e)}")
 
-    combined = combine_snapshots([df_a, df_c, df_d, df_e])
+    combined = combine_snapshots([df_a, df_b, df_c, df_d, df_e])
     print(f"Combined rows: {len(combined)}")
 
+    if combined.empty:
+        print("Combined snapshot is empty; skip unified save.")
+        return
+
     save_cde_snapshot_and_history(combined, output_dir=output_dir)
-    print("Unified latest and history saved (output/group_cde/).")
+    print(f"Unified latest and history saved (output/{UNIFIED_DIR_NAME}/).")
 
 
 if __name__ == "__main__":

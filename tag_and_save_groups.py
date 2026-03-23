@@ -547,42 +547,180 @@ def compute_group_b_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def build_group_b_no_market_cap_peer_pool(df: pd.DataFrame) -> set[str]:
+def build_group_b_no_market_cap_peer_pool(df: pd.DataFrame) -> list[str] | set[str]:
     """
-    Build a common fallback peer pool for B_NO_MARKET_CAP:
-    - Use only rows with valid market_cap (>0) and non-empty sector
-    - For each sector, sort by market_cap asc and pick:
+    Build a global fallback peer pool for B_NO_MARKET_CAP (shared by all B_NO_MARKET_CAP symbols):
+    - Use effective sector (Group A-style priority), not raw sector
+    - Use only rows with valid market_cap (>0) and non-empty effective sector
+    - For each effective sector, sort by market_cap asc and pick:
       - smallest (idx 0), median position, largest (idx -1)
       - unique within sector and across all sectors
+    Returns an order-preserving list of symbols.
     """
     if df.empty or "symbol" not in df.columns:
-        return set()
-    if "market_cap" not in df.columns or "sector" not in df.columns:
-        return set()
+        return []
+    if "market_cap" not in df.columns:
+        return []
 
     mcap = pd.to_numeric(df["market_cap"], errors="coerce")
-    sec = df["sector"].astype(str).str.strip()
-    valid = mcap.notna() & (mcap > 0) & (sec != "")
+    eff_sector = get_effective_sector_series_for_b_no_mcap(df).astype(str).str.strip()
+    valid = mcap.notna() & (mcap > 0) & (eff_sector != "")
     if not valid.any():
-        return set()
+        return []
 
-    base = df.loc[valid, ["symbol", "sector"]].copy()
-    base["market_cap"] = mcap.loc[valid].values
-    base["symbol"] = base["symbol"].astype(str).str.strip().str.upper()
+    base = df.loc[valid, ["symbol"]].copy()
+    base["_eff_sector"] = eff_sector.loc[valid].values
+    base["_mcap"] = mcap.loc[valid].values
+    base["_symbol"] = base["symbol"].astype(str).str.strip().str.upper()
 
-    pool: set[str] = set()
-    for sector, g in base.groupby("sector", sort=False):
-        g = g.sort_values("market_cap", ascending=True).reset_index(drop=True)
+    ordered_pool: list[str] = []
+    seen_symbols: set[str] = set()
+    for _, g in base.groupby("_eff_sector", sort=False):
+        g = g.sort_values("_mcap", ascending=True, kind="mergesort").reset_index(drop=True)
         n = len(g)
         if n <= 0:
             continue
-        idxs = {0, n - 1, n // 2}
-        for j in sorted(idxs):
-            if 0 <= j < n:
-                sym = str(g.at[j, "symbol"]).strip().upper()
-                if sym:
-                    pool.add(sym)
-    return pool
+        idxs: list[int] = [0]
+        if n >= 2:
+            idxs.append(n // 2)
+        if n >= 3:
+            idxs.append(n - 1)
+
+        seen_idx: set[int] = set()
+        for j in idxs:
+            if j in seen_idx or j < 0 or j >= n:
+                continue
+            seen_idx.add(j)
+            sym = str(g.at[j, "_symbol"]).strip().upper()
+            if not sym or sym in seen_symbols:
+                continue
+            ordered_pool.append(sym)
+            seen_symbols.add(sym)
+    return ordered_pool
+
+
+def _normalize_effective_sector_for_b_no_mcap(value: object) -> str:
+    """
+    Normalize effective sector for B_NO_MARKET_CAP using the same rules as Group A.
+    """
+    return normalize_group_a_text(value)
+
+
+def _infer_sector_from_group_a_tag(group_a: object) -> str:
+    """
+    Infer sector from group_a tag using the required suffix:
+      - group_a is like: A_{INDUSTRY}_Add_{SECTOR}
+      - return {SECTOR} when suffix exists, else empty string
+    """
+    if group_a is None or (isinstance(group_a, float) and np.isnan(group_a)):
+        return ""
+    tag = str(group_a).strip()
+    if not tag or "_Add_" not in tag:
+        return ""
+    sec = tag.rsplit("_Add_", 1)[1]
+    return _normalize_effective_sector_for_b_no_mcap(sec)
+
+
+def get_effective_sector_series_for_b_no_mcap(df: pd.DataFrame) -> pd.Series:
+    """
+    Per-row effective sector for B_NO_MARKET_CAP, following required priority:
+      1) group_a_sector
+      2) sector
+      3) group_a tag suffix _Add_{SECTOR}
+      4) else empty string
+    """
+    if df.empty:
+        return pd.Series([], dtype=str)
+
+    out = pd.Series([""] * len(df), index=df.index, dtype=object)
+
+    # 1) group_a_sector
+    if "group_a_sector" in df.columns:
+        ga_sec = df["group_a_sector"].apply(_normalize_effective_sector_for_b_no_mcap)
+        out.loc[:] = ga_sec.values
+
+    # 2) sector
+    empty_mask = (out == "") | pd.isna(out)
+    if empty_mask.any() and "sector" in df.columns:
+        sec_norm = df.loc[empty_mask, "sector"].apply(_normalize_effective_sector_for_b_no_mcap)
+        out.loc[empty_mask] = sec_norm.values
+
+    # 3) group_a tag suffix
+    empty_mask = (out == "") | pd.isna(out)
+    if empty_mask.any() and "group_a" in df.columns:
+        ga_tag_sec = df.loc[empty_mask, "group_a"].apply(_infer_sector_from_group_a_tag)
+        out.loc[empty_mask] = ga_tag_sec.values
+
+    out = out.fillna("").astype(str)
+    return out
+
+
+def build_group_b_no_market_cap_peer_pool_for_sector(
+    df: pd.DataFrame,
+    sector_value: str,
+) -> list[str] | set[str]:
+    """
+    Symbol-specific helper for a specific effective sector (NOT used for
+    B_NO_MARKET_CAP global fallback pool metadata):
+      - consider only rows with valid market_cap (>0) and effective sector != ""
+      - normalize sector_value and exact match to effective sector
+      - sort by market_cap asc
+      - pick smallest (0), median (n//2), largest (n-1)
+      - remove duplicate symbols (preserve order)
+      - return at most 3 symbols
+    """
+    if df.empty or "symbol" not in df.columns or "market_cap" not in df.columns:
+        return []
+
+    target = _normalize_effective_sector_for_b_no_mcap(sector_value)
+    if not target:
+        return []
+
+    eff_sector = get_effective_sector_series_for_b_no_mcap(df)
+    mcap = pd.to_numeric(df.get("market_cap"), errors="coerce")
+
+    valid = (mcap.notna()) & (mcap > 0) & (eff_sector.astype(str) != "")
+    if not valid.any():
+        return []
+
+    df_f = df.loc[valid & (eff_sector.astype(str) == target), ["symbol"]].copy()
+    if df_f.empty:
+        return []
+
+    df_f["_mcap"] = mcap.loc[df_f.index].values
+    df_f["_sym"] = df_f["symbol"].astype(str).str.strip().str.upper()
+
+    df_f = df_f.sort_values("_mcap", ascending=True, kind="mergesort").reset_index(drop=True)
+    n = len(df_f)
+    if n <= 0:
+        return []
+
+    idxs: list[int] = [0]
+    if n >= 2:
+        idxs.append(n // 2)
+    if n >= 3:
+        idxs.append(n - 1)
+
+    # de-duplicate indices while preserving order
+    seen_idx = set()
+    idxs2: list[int] = []
+    for j in idxs:
+        if 0 <= j < n and j not in seen_idx:
+            idxs2.append(j)
+            seen_idx.add(j)
+
+    selected = df_f.iloc[idxs2]
+    ordered_syms: list[str] = []
+    seen_syms: set[str] = set()
+    for s in selected["_sym"].tolist():
+        s2 = str(s).strip().upper() if s is not None else ""
+        if not s2 or s2 in seen_syms:
+            continue
+        ordered_syms.append(s2)
+        seen_syms.add(s2)
+        if len(ordered_syms) >= 3:
+            break
+    return ordered_syms
 
 
 def assign_group_b_tags(df: pd.DataFrame) -> pd.DataFrame:
@@ -775,21 +913,26 @@ def assign_group_b_tags(df: pd.DataFrame) -> pd.DataFrame:
     out["group_b_nearest_fill_added"] = nearest_fill_added
     out["group_b_peer_quality"] = peer_quality
 
-    # B_NO_MARKET_CAP fallback peer pool metadata (sector 3-points)
-    pool = build_group_b_no_market_cap_peer_pool(out)
-    pool_count = int(len(pool))
+    # B_NO_MARKET_CAP: shared global fallback pool metadata
     no_mcap_count = np.zeros(n, dtype=int)
     no_mcap_method = np.full(n, "", dtype=object)
     no_mcap_quality = np.full(n, "", dtype=object)
+
     is_no_mcap = out["group_b"] == "B_NO_MARKET_CAP"
     if is_no_mcap.any():
-        no_mcap_count[is_no_mcap.to_numpy()] = pool_count
-        no_mcap_method[is_no_mcap.to_numpy()] = "SECTOR_3POINTS"
+        pool = build_group_b_no_market_cap_peer_pool(out)
+        pool_count = int(len(pool))
+        mask_arr = is_no_mcap.to_numpy()
+        no_mcap_count[mask_arr] = pool_count
+        no_mcap_method[mask_arr] = "GLOBAL_SECTOR_3POINTS"
         if pool_count >= 15:
             q = "LOW"
+        elif pool_count >= 10:
+            q = "VERY_LOW"
         else:
             q = "VERY_LOW"
-        no_mcap_quality[is_no_mcap.to_numpy()] = q
+        no_mcap_quality[mask_arr] = q
+
     out["group_b_no_mcap_peer_count"] = no_mcap_count
     out["group_b_no_mcap_peer_method"] = no_mcap_method
     out["group_b_no_mcap_peer_quality"] = no_mcap_quality

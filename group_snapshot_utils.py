@@ -12,6 +12,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from tag_and_save_groups import (
+    GROUP_B_BASE_TOLERANCE,
+    GROUP_B_RELAXED_TARGET_MIN_PEERS,
+    compute_group_b_features,
+    build_group_b_no_market_cap_peer_pool,
+)
+
 # ---------------------------------------------------------------------------
 # Path / config constants
 # ---------------------------------------------------------------------------
@@ -44,6 +51,40 @@ EXCLUDE_COLUMNS_A = EXCLUDE_COLUMNS | {
     "group_a_sector",
     "group_a_industry_count",
     "group_a_sector_count",
+}
+
+# Group B: exclude Group B tag/meta + peer-set reconstruction inputs from factor stats.
+# (peer selection reconstruction logic itself is implemented in build_group_b_snapshot.py)
+EXCLUDE_COLUMNS_B = EXCLUDE_COLUMNS | {
+    "group_b",
+    "group_b_market_cap_valid",
+    "group_b_revenue_valid",
+    "group_b_assets_valid",
+    "group_b_mode",
+    "group_b_size_score",
+    "group_b_weight_mcap",
+    "group_b_weight_revenue",
+    "group_b_weight_assets",
+    "group_b_valid_components",
+    "group_b_full_peer_count",
+    "group_b_adjusted_peer_count",
+    "group_b_adjusted_peer_count_relaxed",
+    "group_b_relaxed_applied",
+    "group_b_relaxed_final_tolerance",
+    "group_b_relaxed_target_met",
+    "group_b_final_peer_count",
+    "group_b_final_peer_method",
+    "group_b_nearest_fill_added",
+    "group_b_peer_quality",
+    "group_b_no_mcap_peer_count",
+    "group_b_no_mcap_peer_method",
+    "group_b_no_mcap_peer_quality",
+    # Derived inputs used during B peer reconstruction; keep them out of rep__/dev__ factor stats.
+    "market_cap",
+    "revenue_ttm",
+    "total_assets",
+    "sector",
+    "industry",
 }
 
 # Group A sector-add: similarity factors and minimum peer count.
@@ -362,6 +403,106 @@ def load_latest_tags_and_factors_for_a(
     return base.sort_values("symbol").reset_index(drop=True), as_of_date_str, tags_path
 
 
+def _load_tags_from_path_for_b(path: Path) -> tuple[pd.DataFrame, str]:
+    """
+    Load Group B tags from a path and return (latest_only_df, as_of_date_str).
+    latest_only_df is filtered to max as_of_date and deduped to 1 row/symbol.
+    """
+    required = [
+        "symbol",
+        "as_of_date",
+        "group_b",
+        "group_b_adjusted_peer_count",
+        "group_b_adjusted_peer_count_relaxed",
+        "group_b_relaxed_final_tolerance",
+        "group_b_final_peer_count",
+        "group_b_final_peer_method",
+        "group_b_nearest_fill_added",
+        "group_b_peer_quality",
+        "group_b_no_mcap_peer_count",
+        "group_b_no_mcap_peer_method",
+        "group_b_no_mcap_peer_quality",
+    ]
+
+    if path.suffix.lower() == ".csv":
+        tags = pd.read_csv(path, low_memory=False)
+    else:
+        tags = pd.read_parquet(path)
+
+    missing = [c for c in required if c not in tags.columns]
+    if missing:
+        raise ValueError(f"Tags file missing required Group B columns: {missing}")
+
+    tags = tags[required].copy()
+    tags["as_of_date"] = pd.to_datetime(tags["as_of_date"], errors="coerce")
+    tags = tags.dropna(subset=["as_of_date"])
+    if tags.empty:
+        raise ValueError("No valid as_of_date in Group B tags file.")
+
+    latest_dt = tags["as_of_date"].max()
+    latest = tags[tags["as_of_date"] == latest_dt].copy()
+    latest["as_of_date"] = latest["as_of_date"].dt.strftime("%Y-%m-%d")
+    as_of_date_str = latest["as_of_date"].iloc[0]
+
+    latest["symbol"] = latest["symbol"].astype(str).str.strip().str.upper()
+    latest = latest.drop_duplicates(subset=["symbol"], keep="last").reset_index(drop=True)
+    return latest, as_of_date_str
+
+
+def load_latest_tags_and_factors_for_b(
+    logic_dir: str | Path | None = None,
+    data_dir: str | Path | None = None,
+) -> tuple[pd.DataFrame, str, Path]:
+    """
+    Load latest Group B tags + factors_latest and inner-join on symbol.
+    Returns (base, as_of_date_str, tags_path).
+
+    Minimal coercions for B peer reconstruction inputs:
+      - market_cap (from existing `market_cap` or `Market Cap`)
+      - revenue_ttm (from existing `revenue_ttm` or `Sales (Rev)`)
+      - total_assets (from existing `total_assets` or `Total Assets`/`totalAssets` if present)
+    """
+    logic_dir = Path(logic_dir) if logic_dir is not None else DEFAULT_LOGIC_DIR
+    data_dir = Path(data_dir) if data_dir is not None else DEFAULT_DATA_DIR
+    if not logic_dir.exists():
+        raise FileNotFoundError(f"Logic dir not found: {logic_dir}")
+
+    tags_path = _resolve_latest_tags_path(logic_dir)
+    latest_tags, as_of_date_str = _load_tags_from_path_for_b(tags_path)
+
+    factors = load_factors_latest(data_dir)
+    factors = factors.drop_duplicates(subset=["symbol"], keep="last")
+
+    base = latest_tags.merge(factors, on="symbol", how="inner")
+    base = base.drop_duplicates(subset=["symbol"], keep="last").reset_index(drop=True)
+
+    # Coerce/derive peer-selection input columns (snake_case) for later reuse.
+    if "market_cap" not in base.columns and "Market Cap" in base.columns:
+        base["market_cap"] = base["Market Cap"]
+    if "market_cap" in base.columns:
+        base["market_cap"] = pd.to_numeric(base["market_cap"], errors="coerce")
+    else:
+        base["market_cap"] = np.nan
+
+    if "revenue_ttm" not in base.columns and "Sales (Rev)" in base.columns:
+        base["revenue_ttm"] = base["Sales (Rev)"]
+    if "revenue_ttm" in base.columns:
+        base["revenue_ttm"] = pd.to_numeric(base["revenue_ttm"], errors="coerce")
+    else:
+        base["revenue_ttm"] = np.nan
+
+    if "total_assets" not in base.columns:
+        if "Total Assets" in base.columns:
+            base["total_assets"] = base["Total Assets"]
+        elif "totalAssets" in base.columns:
+            base["total_assets"] = base["totalAssets"]
+        else:
+            base["total_assets"] = np.nan
+    base["total_assets"] = pd.to_numeric(base["total_assets"], errors="coerce")
+
+    return base.sort_values("symbol").reset_index(drop=True), as_of_date_str, tags_path
+
+
 def get_factor_columns(
     df: pd.DataFrame,
     exclude_cols: set[str] | None = None,
@@ -481,6 +622,11 @@ def get_factor_columns_for_a(df: pd.DataFrame) -> list[str]:
     return get_factor_columns(df, exclude_cols=EXCLUDE_COLUMNS_A)
 
 
+def get_factor_columns_for_b(df: pd.DataFrame) -> list[str]:
+    """Return factor columns for Group B (exclude EXCLUDE_COLUMNS_B)."""
+    return get_factor_columns(df, exclude_cols=EXCLUDE_COLUMNS_B)
+
+
 def build_group_a_representative_table(
     peer_df: pd.DataFrame,
     factor_cols: list[str],
@@ -518,6 +664,286 @@ def build_group_a_representative_table(
     out["iqr"] = out["q75"] - out["q25"]
     out["group_tag"] = group_tag
     return out[["group_tag", "factor_name", "n_valid", "median", "q25", "q75", "iqr"]]
+
+
+# ---------------------------------------------------------------------------
+# Group B: per-symbol size-score peer sets (not group_b groupby)
+# ---------------------------------------------------------------------------
+
+
+def _ensure_group_b_features(base: pd.DataFrame) -> pd.DataFrame:
+    """Ensure group_b_mode / size_score / validity columns exist (reuse tag_and_save_groups)."""
+    df = base.copy()
+    need = ("group_b_mode", "group_b_size_score", "group_b_market_cap_valid")
+    if not all(c in df.columns for c in need):
+        df = compute_group_b_features(df)
+    return df
+
+
+def resolve_group_b_peer_set_for_symbol(
+    base: pd.DataFrame,
+    symbol: str,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """
+    Reconstruct the dynamic peer set for one symbol from Group B tags + size_score universe masks.
+    Returns (peer_df subset of base, metadata dict).
+    Does not use generic compute_representatives(..., group_col=\"group_b\").
+    """
+    work = _ensure_group_b_features(base).reset_index(drop=True)
+    if "symbol" not in work.columns or "group_b" not in work.columns:
+        raise ValueError("base must contain symbol and group_b")
+
+    sym_u = str(symbol).strip().upper()
+    pos = np.where(work["symbol"].astype(str).str.strip().str.upper().values == sym_u)[0]
+    if len(pos) == 0:
+        raise ValueError(f"symbol not in base: {symbol}")
+    i = int(pos[0])
+    row = work.iloc[i]
+
+    size_score = pd.to_numeric(work["group_b_size_score"], errors="coerce").to_numpy(dtype=float)
+    mcap_valid = work["group_b_market_cap_valid"].fillna(False).to_numpy(dtype=bool)
+    group_b_mode = work["group_b_mode"].astype(str).to_numpy()
+    symbols = work["symbol"].astype(str).str.strip().str.upper().to_numpy()
+
+    full_universe_mask = (group_b_mode == "MCAP_REV_ASSETS") & mcap_valid & ~np.isnan(size_score)
+    adjusted_universe_mask = (
+        np.isin(group_b_mode, ["MCAP_REV_ASSETS", "MCAP_REV", "MCAP_ASSETS", "MCAP_ONLY"])
+        & mcap_valid
+        & ~np.isnan(size_score)
+    )
+    full_indices = np.where(full_universe_mask)[0]
+    adjusted_indices = np.where(adjusted_universe_mask)[0]
+
+    tag = str(row.get("group_b", "")).strip()
+    score_i = float(size_score[i])
+    target_peer_count = int(GROUP_B_RELAXED_TARGET_MIN_PEERS)
+
+    meta: dict[str, Any] = {
+        "peer_method": "",
+        "peer_quality": "",
+        "final_peer_count": 0,
+        "tolerance_used": None,
+        "b_peer_symbols": [],
+    }
+
+    if tag == "B_NO_MARKET_CAP":
+        pool = build_group_b_no_market_cap_peer_pool(work)
+        if isinstance(pool, set):
+            peer_symbols = sorted(str(s).strip().upper() for s in pool if str(s).strip())
+        else:
+            peer_symbols = [
+                str(s).strip().upper()
+                for s in list(pool)
+                if s is not None and str(s).strip()
+            ]
+        peer_df = work.loc[work["symbol"].isin(peer_symbols)].drop_duplicates(subset=["symbol"], keep="first")
+        actual_count = int(len(peer_df))
+        method_raw = row.get("group_b_no_mcap_peer_method", "")
+        quality_raw = row.get("group_b_no_mcap_peer_quality", "")
+        method_row = str(method_raw).strip() if pd.notna(method_raw) else ""
+        quality_row = str(quality_raw).strip() if pd.notna(quality_raw) else ""
+        meta["peer_method"] = method_row or "GLOBAL_SECTOR_3POINTS"
+        if not quality_row:
+            # tag_and_save_groups quality rule: count >= 15 => LOW, else VERY_LOW
+            quality_row = "LOW" if actual_count >= 15 else "VERY_LOW"
+        meta["peer_quality"] = quality_row
+        meta["final_peer_count"] = actual_count
+        meta["tolerance_used"] = None
+        meta["b_peer_symbols"] = (
+            peer_df["symbol"].astype(str).str.strip().str.upper().tolist()
+            if not peer_df.empty
+            else []
+        )
+        return peer_df, meta
+
+    final_peer_method = str(row.get("group_b_final_peer_method", "BASE")).strip().upper()
+    relaxed_tol = pd.to_numeric(row.get("group_b_relaxed_final_tolerance"), errors="coerce")
+    tol_used = float(relaxed_tol) if pd.notna(relaxed_tol) else None
+    meta["peer_quality"] = str(row.get("group_b_peer_quality", ""))
+
+    if tag == "B_NORMAL":
+        universe_indices = full_indices
+        threshold = float(GROUP_B_BASE_TOLERANCE)
+        cand_d = np.abs(size_score[universe_indices] - score_i)
+        keep_indices = universe_indices[cand_d <= threshold]
+        peer_symbols = sorted(set(symbols[keep_indices].tolist()))
+        meta["peer_method"] = "BASE"
+        meta["tolerance_used"] = threshold
+    elif tag == "B_ADJUSTED":
+        universe_indices = adjusted_indices
+        threshold = float(GROUP_B_BASE_TOLERANCE)
+        cand_d = np.abs(size_score[universe_indices] - score_i)
+        keep_indices = universe_indices[cand_d <= threshold]
+        peer_symbols = sorted(set(symbols[keep_indices].tolist()))
+        meta["peer_method"] = "BASE"
+        meta["tolerance_used"] = threshold
+    elif tag in ("B_INSUFFICIENT", "B_RISK"):
+        universe_indices = adjusted_indices
+        method = final_peer_method
+        if method == "BASE":
+            threshold = float(GROUP_B_BASE_TOLERANCE)
+            peer_method_for_meta = "BASE"
+        elif method == "RELAXED":
+            threshold = float(tol_used if tol_used is not None else GROUP_B_BASE_TOLERANCE)
+            peer_method_for_meta = "RELAXED"
+        elif method in ("NEAREST_FILL", "VERY_LOW"):
+            threshold = float(tol_used if tol_used is not None else GROUP_B_BASE_TOLERANCE)
+            peer_method_for_meta = method
+        else:
+            threshold = float(GROUP_B_BASE_TOLERANCE)
+            peer_method_for_meta = "BASE"
+
+        if tag in ("B_INSUFFICIENT", "B_RISK") and final_peer_method in ("NEAREST_FILL", "VERY_LOW"):
+            cand_d = np.abs(size_score[universe_indices] - score_i)
+            relaxed_mask = cand_d <= threshold
+            relaxed_indices = universe_indices[relaxed_mask]
+            relaxed_syms = symbols[relaxed_indices].tolist()
+            need = max(0, target_peer_count - len(relaxed_syms))
+            if need > 0:
+                remaining_indices = universe_indices[~relaxed_mask]
+                if len(remaining_indices) > 0:
+                    rem_d = cand_d[~relaxed_mask]
+                    rem_symbols = symbols[remaining_indices]
+                    order = np.lexsort((rem_symbols, rem_d))
+                    add_indices = remaining_indices[order][:need]
+                else:
+                    add_indices = np.array([], dtype=int)
+            else:
+                add_indices = np.array([], dtype=int)
+            all_indices = np.concatenate([relaxed_indices, add_indices])
+            peer_symbols = sorted(set(symbols[all_indices].tolist()))
+        else:
+            cand_d = np.abs(size_score[universe_indices] - score_i)
+            keep_indices = universe_indices[cand_d <= threshold]
+            peer_symbols = sorted(set(symbols[keep_indices].tolist()))
+
+        tol_meta = float(threshold) if peer_method_for_meta in ("BASE", "RELAXED") else tol_used
+        meta["tolerance_used"] = tol_meta
+        meta["peer_method"] = peer_method_for_meta
+    else:
+        universe_indices = adjusted_indices
+        threshold = float(GROUP_B_BASE_TOLERANCE)
+        cand_d = np.abs(size_score[universe_indices] - score_i)
+        keep_indices = universe_indices[cand_d <= threshold]
+        peer_symbols = sorted(set(symbols[keep_indices].tolist()))
+        meta["peer_method"] = "BASE"
+        meta["tolerance_used"] = threshold
+
+    peer_df = work.loc[work["symbol"].isin(peer_symbols)].drop_duplicates(subset=["symbol"], keep="first")
+    try:
+        meta["final_peer_count"] = int(row.get("group_b_final_peer_count", len(peer_symbols)))
+    except (TypeError, ValueError):
+        meta["final_peer_count"] = len(peer_symbols)
+    meta["b_peer_symbols"] = peer_symbols
+    return peer_df, meta
+
+
+def build_peer_sets_and_reps_b(
+    base: pd.DataFrame,
+    factor_cols: list[str],
+) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    """
+    For each symbol, resolve peer set and compute long-format representative stats (per factor).
+    Returns (reps_by_symbol: dict[symbol_str, reps_df], meta_df one row per symbol).
+    """
+    work = _ensure_group_b_features(base)
+    reps_by_symbol: dict[str, pd.DataFrame] = {}
+    meta_rows: list[dict[str, Any]] = []
+
+    for sym in work["symbol"].astype(str).str.strip().str.upper().unique():
+        peer_df, meta = resolve_group_b_peer_set_for_symbol(work, sym)
+        reps = build_group_a_representative_table(peer_df, factor_cols, str(sym))
+        reps_by_symbol[str(sym)] = reps
+        meta_rows.append({"symbol": sym, **meta})
+
+    meta_df = pd.DataFrame(meta_rows)
+    if meta_df.empty:
+        meta_df = pd.DataFrame(
+            columns=[
+                "symbol",
+                "peer_method",
+                "peer_quality",
+                "final_peer_count",
+                "tolerance_used",
+                "b_peer_symbols",
+            ]
+        )
+    return reps_by_symbol, meta_df
+
+
+def attach_representatives_and_deviations_b(
+    base_df: pd.DataFrame,
+    reps_by_symbol: dict,
+    meta_df: pd.DataFrame,
+    factor_cols: list[str],
+    group_tag_col: str = "group_b",
+) -> pd.DataFrame:
+    """
+    Attach per-symbol peer-set representatives and deviations (symbol-keyed reps, not group_b groupby).
+    Left-joins meta_df (peer reconstruction summary) on symbol when provided; rep/dev use reps_by_symbol.
+    """
+    _ = group_tag_col  # row still carries group_b; peer reps are keyed by symbol string
+
+    out = base_df.copy()
+    if "symbol" not in out.columns:
+        raise ValueError("attach_representatives_and_deviations_b: base_df must contain column 'symbol'")
+    if meta_df is not None and not meta_df.empty and "symbol" in meta_df.columns:
+        m = meta_df.copy()
+        m["symbol"] = m["symbol"].astype(str).str.strip().str.upper()
+        out["symbol"] = out["symbol"].astype(str).str.strip().str.upper()
+        out = out.merge(m, on="symbol", how="left", suffixes=("", "_b_peer_meta"))
+
+    for f in factor_cols:
+        out[f"{REP_PREFIX}{f}__median"] = np.nan
+        out[f"{REP_PREFIX}{f}__q25"] = np.nan
+        out[f"{REP_PREFIX}{f}__q75"] = np.nan
+        out[f"{REP_PREFIX}{f}__iqr"] = np.nan
+        out[f"{REP_PREFIX}{f}__n_valid"] = np.nan
+        out[f"{DEV_PREFIX}{f}__abs"] = np.nan
+        out[f"{DEV_PREFIX}{f}__pct"] = np.nan
+        out[f"{DEV_PREFIX}{f}__robust_z"] = np.nan
+
+    for idx in out.index:
+        sym = str(out.at[idx, "symbol"]).strip().upper()
+        if sym not in reps_by_symbol:
+            continue
+        reps = reps_by_symbol[sym]
+        if reps.empty or "factor_name" not in reps.columns:
+            continue
+        reps_ix = reps.set_index("factor_name")
+        for f in factor_cols:
+            if f not in reps_ix.index:
+                continue
+            if f not in out.columns:
+                continue
+            rrow = reps_ix.loc[f]
+            if isinstance(rrow, pd.DataFrame):
+                rrow = rrow.iloc[0]
+            med = float(pd.to_numeric(rrow["median"], errors="coerce"))
+            iqr_val = float(pd.to_numeric(rrow["iqr"], errors="coerce"))
+            if pd.isna(med):
+                continue
+            val = out.at[idx, f]
+            if pd.isna(val):
+                continue
+            val = float(pd.to_numeric(val, errors="coerce"))
+            if pd.isna(val):
+                continue
+            q25 = pd.to_numeric(rrow.get("q25", np.nan), errors="coerce")
+            q75 = pd.to_numeric(rrow.get("q75", np.nan), errors="coerce")
+            n_valid = pd.to_numeric(rrow.get("n_valid", np.nan), errors="coerce")
+            out.at[idx, f"{REP_PREFIX}{f}__median"] = med
+            out.at[idx, f"{REP_PREFIX}{f}__q25"] = q25
+            out.at[idx, f"{REP_PREFIX}{f}__q75"] = q75
+            out.at[idx, f"{REP_PREFIX}{f}__iqr"] = iqr_val
+            out.at[idx, f"{REP_PREFIX}{f}__n_valid"] = n_valid
+            out.at[idx, f"{DEV_PREFIX}{f}__abs"] = val - med
+            if med != 0:
+                out.at[idx, f"{DEV_PREFIX}{f}__pct"] = (val - med) / abs(med)
+            if not pd.isna(iqr_val) and iqr_val > 0:
+                out.at[idx, f"{DEV_PREFIX}{f}__robust_z"] = (val - med) / iqr_val
+
+    return out
 
 
 def rank_sector_fill_candidates(
