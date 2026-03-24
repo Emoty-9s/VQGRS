@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Batch builder: convert latest group snapshots into long-format factor scores.
+Batch builder: convert latest group snapshots into long-format factor outputs.
 
 Input:
   - output/group_unified/group_unified_snapshot_latest.(parquet|csv) preferred
@@ -10,6 +10,7 @@ Output:
   - output/scoring/group_factor_scores_latest.(parquet|csv)
 
 This module does NOT modify snapshot builders/history; it only reads existing latest snapshots.
+Core engine output is evidence-first (`adjusted_evidence`); score columns are kept for compatibility.
 """
 from __future__ import annotations
 
@@ -23,6 +24,41 @@ from score_primitives import score_one_factor_one_group
 
 
 GROUP_TYPES = ["A", "B", "C", "D", "E"]
+
+# Long-table columns that downstream expects from score_one_factor_one_group.
+REQUIRED_SCORE_DETAIL_COLS: tuple[str, ...] = (
+    "raw_evidence",
+    "prior_evidence",
+    "adjusted_evidence",
+    "evidence_source",
+    "confidence",
+    "raw_score",
+    "adjusted_score",
+    "missing_reason",
+    "is_valid_score",
+    "raw_value",
+    "median_value",
+    "iqr_value",
+    "n_valid",
+)
+
+
+def _normalize_evidence_source(src: Any, missing_reason: Any) -> str:
+    s = str(src).strip().lower() if src is not None else ""
+    mr = str(missing_reason).strip().lower() if missing_reason is not None else ""
+    if s in {"observed_evidence", "observed"}:
+        return "observed"
+    if s in {"structural_missing", "disabled_factor", "invalid_direction"}:
+        return s
+    if mr == "structural_missing":
+        return "structural_missing"
+    if mr == "missing_raw_value":
+        return "missing_raw"
+    if mr == "insufficient_peer_data":
+        return "insufficient_peer_data"
+    if mr:
+        return mr
+    return "observed"
 
 
 def _read_df(path: Path) -> pd.DataFrame:
@@ -146,11 +182,29 @@ def build_group_factor_scores_df(snapshot_df: pd.DataFrame) -> pd.DataFrame:
                     "group_tag": group_tag,
                     **scored,
                 }
+                record["evidence_source"] = _normalize_evidence_source(
+                    record.get("evidence_source"),
+                    record.get("missing_reason"),
+                )
                 records.append(record)
 
     if not records:
         return pd.DataFrame()
-    return pd.DataFrame(records)
+    df = pd.DataFrame(records)
+    for c in REQUIRED_SCORE_DETAIL_COLS:
+        if c not in df.columns:
+            df[c] = pd.NA
+    preferred = [
+        "symbol",
+        "as_of_date",
+        "group_type",
+        "group_tag",
+        "factor_name",
+        "category",
+        *REQUIRED_SCORE_DETAIL_COLS,
+    ]
+    rest = [c for c in df.columns if c not in preferred]
+    return df[[c for c in preferred if c in df.columns] + rest]
 
 
 def main(input_dir: str | Path = "output", output_dir: str | Path = "output/scoring") -> None:
