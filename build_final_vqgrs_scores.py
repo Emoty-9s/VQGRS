@@ -7,6 +7,10 @@ Input:
 
 Output:
   - output/scoring/final_vqgrs_scores_latest.(parquet|csv)
+
+Debug note:
+  - A high category score with low main_coverage_* can indicate lower-confidence results.
+    This pipeline is designed to be conservative when main indicators are missing.
 """
 from __future__ import annotations
 
@@ -39,8 +43,16 @@ def _read_df(path: Path) -> pd.DataFrame:
 
 def _save_df(df: pd.DataFrame, parquet_path: Path, csv_path: Path) -> None:
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(parquet_path, index=False)
-    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    try:
+        df.to_parquet(parquet_path, index=False)
+    except Exception as e:
+        print(f"WARNING: failed to save parquet: {parquet_path} ({e})")
+    try:
+        df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    except PermissionError as e:
+        print(f"WARNING: failed to save CSV (file may be open): {csv_path} ({e})")
+    except Exception as e:
+        print(f"WARNING: failed to save CSV: {csv_path} ({e})")
 
 
 def _weighted_evidence(df: pd.DataFrame, weights: dict[str, float]) -> pd.Series:
@@ -75,6 +87,14 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         else:
             out[score_col] = out[f"final_evidence_{c}"].map(lambda x: evidence_to_score(float(x)) if pd.notna(x) else np.nan).astype(float)
 
+        # Debug passthroughs (when present).
+        mc = f"main_coverage_{c}"
+        ds = f"dominant_signal_{c}"
+        if mc in df_cat.columns:
+            out[mc] = pd.to_numeric(df_cat[mc], errors="coerce").fillna(0.0).astype(float)
+        if ds in df_cat.columns:
+            out[ds] = df_cat[ds].fillna("balanced").astype(object)
+
     out["final_evidence_equal"] = _weighted_evidence(out, TRACK_WEIGHTS["equal"])
     out["final_score_equal"] = out["final_evidence_equal"].map(lambda x: evidence_to_score(float(x)) if pd.notna(x) else np.nan).astype(float)
 
@@ -108,7 +128,18 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         "final_evidence_G",
         "final_evidence_R",
         "final_evidence_S",
+        "main_coverage_V",
+        "main_coverage_Q",
+        "main_coverage_G",
+        "main_coverage_R",
+        "main_coverage_S",
+        "dominant_signal_V",
+        "dominant_signal_Q",
+        "dominant_signal_G",
+        "dominant_signal_R",
+        "dominant_signal_S",
     ]
+    out_cols = [c for c in out_cols if c in out.columns]
     return out[out_cols].copy()
 
 

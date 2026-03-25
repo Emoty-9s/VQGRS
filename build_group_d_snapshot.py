@@ -31,6 +31,8 @@ def build_group_d_snapshot_df(
     """
     Build Group D snapshot DataFrame: latest tags + factors merge, group_d reps and deviations.
     Returns DataFrame with as_of_date, symbol, group_type, group_tag, factor cols, rep cols, dev cols.
+
+    The merged base retains all factors_latest columns; attach only appends rep__/dev__ columns.
     """
     from group_snapshot_utils import DEFAULT_DATA_DIR as _DD, DEFAULT_LOGIC_DIR as _LD
     logic_dir = Path(logic_dir) if logic_dir is not None else _LD

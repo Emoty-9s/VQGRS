@@ -46,6 +46,8 @@ def build_group_a_snapshot_df(
     a_peer_shortfall_flag, a_add_sector_value, a_add_need_count, a_add_candidate_count_*,
     a_add_selected_count, a_add_similarity_factors_used, a_add_debug_reason,
     factor cols, rep cols, dev cols.
+
+    The merged base retains all factors_latest columns; attach only appends rep__/dev__ columns.
     """
     from group_snapshot_utils import DEFAULT_DATA_DIR as _DD, DEFAULT_LOGIC_DIR as _LD
 

@@ -45,6 +45,8 @@ def build_group_b_snapshot_df(
     Returns DataFrame with as_of_date preserved, group_type, group_tag, group_b, factor cols,
     rep cols, dev cols, and peer meta from merge when present.
     Returns empty DataFrame if there are no rows after load.
+
+    The merged base retains all factors_latest columns; attach only appends rep__/dev__ columns.
     """
     from group_snapshot_utils import DEFAULT_DATA_DIR as _DD, DEFAULT_LOGIC_DIR as _LD
 

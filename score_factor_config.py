@@ -10,6 +10,13 @@ class FactorSpec:
     category: str  # V/Q/G/R/S/STI
     direction: str  # "higher_better" / "lower_better"
     tier: str  # "core" / "aux"
+    # Importance tier for downstream category aggregation logic:
+    # - "main": category primary indicators (main-factor coverage is handled separately)
+    # - "aux": secondary indicators
+    # - "drop": disabled factors (enabled=False)
+    importance_tier: str  # allowed: main | aux | drop
+    # Convenience boolean for easier downstream reads.
+    main_factor: bool
     weight: float
     enabled: bool
     use_log_scale: bool
@@ -56,12 +63,24 @@ def _spec(
     allow_donor_in_evidence: bool = True,
     structural_missing_to_prior_only: bool = True,
 ) -> FactorSpec:
+    # Main/aux importance tier + weight are derived from (category, name, enabled).
+    # This enables downstream main-factor coverage handling without breaking existing config structure.
+    is_main = name in MAIN_FACTORS_BY_CATEGORY.get(category, [])
+    importance_tier = "main" if is_main else ("drop" if not enabled else "aux")
+    main_factor = is_main
+    computed_weight = (
+        MAIN_AUX_WEIGHT_POLICY["main_weight"]
+        if importance_tier == "main"
+        else MAIN_AUX_WEIGHT_POLICY["aux_weight"]
+    )
     return FactorSpec(
         name=name,
         category=category,
         direction=direction,
         tier=tier,
-        weight=weight,
+        importance_tier=importance_tier,
+        main_factor=main_factor,
+        weight=computed_weight,
         enabled=enabled,
         use_log_scale=use_log_scale,
         neutral_on_missing=neutral_on_missing,
@@ -177,6 +196,33 @@ _STI_FACTORS: list[str] = [
     "Target Price",
     "Insider Trans",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Main/Aux factor importance tiers
+# ---------------------------------------------------------------------------
+# Category score calculation is planned to use main-factor coverage separately.
+# When main factors are missing frequently, category evidence will be shrunk more conservatively.
+# Aggregation is planned to be a split aggregation (main/aux), not a simple average.
+#
+# weight policy:
+# - main factor weight = 1.5
+# - aux factor weight = 0.75
+#
+MAIN_AUX_WEIGHT_POLICY = {
+    "main_weight": 1.5,
+    "aux_weight": 0.75,
+}
+
+# Canonical "true main 3" per category (V/Q/G/R/S).
+MAIN_FACTORS_BY_CATEGORY: dict[str, list[str]] = {
+    "V": ["P/E", "P/S", "EV/EBITDA"],
+    "Q": ["ROIC", "Oper. Margin", "OCF/NI"],
+    "G": ["Revenue YoY", "EPS YoY", "OCF YoY"],
+    "R": ["Debt/Eq", "Current Ratio", "Interest Coverage"],
+    "S": ["Beta", "Volatility", "OPM volatility"],
+    "STI": [],
+}
 
 
 FACTOR_SPECS: dict[str, FactorSpec] = {}
@@ -433,10 +479,12 @@ for cat, names in CATEGORY_TO_FACTORS.items():
         if spec is None:
             # Should never happen; keep deterministic behavior.
             continue
-        if spec.tier == "aux":
-            aux_names.append(n)
-        else:
+        # Legacy export (kept for backward compatibility): based on spec.tier ("core"/"aux").
+        if spec.tier != "aux":
             core_names.append(n)
+        # New export: enabled non-main factors are "aux" by importance_tier.
+        if spec.importance_tier == "aux" and spec.enabled:
+            aux_names.append(n)
     CORE_FACTORS_BY_CATEGORY[cat] = core_names
     AUX_FACTORS_BY_CATEGORY[cat] = aux_names
 

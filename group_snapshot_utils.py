@@ -102,19 +102,16 @@ _GROUP_A_SIMILARITY_ALIASES: tuple[tuple[str, str], ...] = (
 def _apply_group_a_similarity_factor_aliases(df: pd.DataFrame) -> pd.DataFrame:
     """
     Ensure op_margin / roic / debt_to_equity exist from factors_latest column names.
-    If standard name already present, skip; else copy from source and drop source (rename).
+    If standard name already present, skip; else copy from source. Source columns are kept
+    so factors_latest display names remain in the merged base alongside the aliases.
     """
     out = df.copy()
-    drop_src: list[str] = []
     for src, dst in _GROUP_A_SIMILARITY_ALIASES:
         if dst in out.columns:
             continue
         if src not in out.columns:
             continue
         out[dst] = out[src]
-        drop_src.append(src)
-    if drop_src:
-        out = out.drop(columns=[c for c in drop_src if c in out.columns])
     return out
 
 REP_PREFIX = "rep__"
@@ -332,6 +329,56 @@ def _load_tags_from_path_for_a(path: Path) -> tuple[pd.DataFrame, str]:
     return latest, as_of_date_str
 
 
+def _normalize_symbol_series(s: pd.Series) -> pd.Series:
+    """Consistent join key: str, strip, upper (matches load_factors_latest and tag loaders)."""
+    return s.astype(str).str.strip().str.upper()
+
+
+def log_tags_factors_inner_join_diagnostics(
+    latest_tags: pd.DataFrame,
+    factors: pd.DataFrame,
+    label: str,
+    merged: pd.DataFrame | None = None,
+) -> None:
+    """
+    Diagnostic: inner join on symbol keeps only intersection of tag and factor symbols.
+    Log row counts before merge, set overlap, and optional post-merge row count.
+    Does not change data; safe to call from load_* helpers.
+    """
+    if "symbol" not in latest_tags.columns or "symbol" not in factors.columns:
+        print(f"[{label}] inner join diagnostics: missing symbol column on tags or factors")
+        return
+    t_syms = set(_normalize_symbol_series(latest_tags["symbol"]))
+    f_syms = set(_normalize_symbol_series(factors["symbol"]))
+    only_in_tags = t_syms - f_syms
+    only_in_factors = f_syms - t_syms
+    inter = t_syms & f_syms
+    n_expect = len(inter)
+    print(
+        f"[{label}] inner join on symbol (how='inner'): "
+        f"tags_rows={len(latest_tags)} factors_rows={len(factors)} "
+        f"|unique_symbols_tags|={len(t_syms)} |unique_symbols_factors|={len(f_syms)} "
+        f"|intersection|={len(inter)} "
+        f"only_in_tags={len(only_in_tags)} only_in_factors={len(only_in_factors)} "
+        f"expected_merged_rows={n_expect}"
+    )
+    if only_in_tags:
+        sample = sorted(only_in_tags)[:12]
+        more = " ..." if len(only_in_tags) > 12 else ""
+        print(f"  [{label}] only_in_tags (sample): {sample}{more}")
+    if only_in_factors:
+        sample = sorted(only_in_factors)[:12]
+        more = " ..." if len(only_in_factors) > 12 else ""
+        print(f"  [{label}] only_in_factors (sample): {sample}{more}")
+    if merged is not None:
+        mr = len(merged)
+        ok = mr == n_expect
+        print(
+            f"  [{label}] merged_rows={mr} "
+            f"({'matches expected intersection' if ok else 'WARNING: differs from expected; check duplicate symbols'})"
+        )
+
+
 def load_factors_latest(data_dir: str | Path) -> pd.DataFrame:
     """Load factors_latest: CSV first, then parquet. Symbol normalized to str.upper().strip()."""
     data_dir = Path(data_dir)
@@ -358,6 +405,9 @@ def load_latest_tags_and_factors(
     """
     Load latest group tags (from history or fallback date-stamped file) and factors_latest;
     normalize symbol, dedupe keep last, inner join.
+    Inner join drops symbols present in only one side; see log_tags_factors_inner_join_diagnostics output.
+    Overlapping column names (other than symbol) keep factors_latest names on the right;
+    tag-side duplicates are suffixed with _tag.
     Returns (merged_df, as_of_date_str, tags_path_used).
     """
     logic_dir = Path(logic_dir)
@@ -373,7 +423,12 @@ def load_latest_tags_and_factors(
     latest_tags["symbol"] = latest_tags["symbol"].astype(str).str.strip().str.upper()
     latest_tags = latest_tags.drop_duplicates(subset=["symbol"], keep="last")
 
-    base = latest_tags.merge(factors, on="symbol", how="inner")
+    # Preserve factors_latest column names when tags share the same name (e.g. sector, industry):
+    # tag-side duplicates get _tag; right (factors) keeps unprefixed names.
+    base = latest_tags.merge(factors, on="symbol", how="inner", suffixes=("_tag", ""))
+    log_tags_factors_inner_join_diagnostics(
+        latest_tags, factors, "load_latest_tags_and_factors", merged=base
+    )
     return base.sort_values("symbol").reset_index(drop=True), as_of_date_str, tags_path
 
 
@@ -383,7 +438,9 @@ def load_latest_tags_and_factors_for_a(
 ) -> tuple[pd.DataFrame, str, Path]:
     """
     Load latest group tags (Group A columns: group_a, group_a_mode, etc.) and factors_latest;
-    inner join on symbol. Symbol normalized. Returns (merged_df, as_of_date_str, tags_path).
+    inner join on symbol. Symbol normalized. Inner join keeps only symbols in both tables.
+    Overlapping names: tag columns get _tag suffix; factors_latest columns keep their original names.
+    Returns (merged_df, as_of_date_str, tags_path).
     """
     logic_dir = Path(logic_dir)
     data_dir = Path(data_dir)
@@ -398,7 +455,10 @@ def load_latest_tags_and_factors_for_a(
     latest_tags["symbol"] = latest_tags["symbol"].astype(str).str.strip().str.upper()
     latest_tags = latest_tags.drop_duplicates(subset=["symbol"], keep="last")
 
-    base = latest_tags.merge(factors, on="symbol", how="inner")
+    base = latest_tags.merge(factors, on="symbol", how="inner", suffixes=("_tag", ""))
+    log_tags_factors_inner_join_diagnostics(
+        latest_tags, factors, "load_latest_tags_and_factors_for_a", merged=base
+    )
     base = _apply_group_a_similarity_factor_aliases(base)
     return base.sort_values("symbol").reset_index(drop=True), as_of_date_str, tags_path
 
@@ -455,6 +515,8 @@ def load_latest_tags_and_factors_for_b(
 ) -> tuple[pd.DataFrame, str, Path]:
     """
     Load latest Group B tags + factors_latest and inner-join on symbol.
+    Inner join keeps only symbols present in both sides (see diagnostics log).
+    Overlapping column names: tag-side _tag suffix; factors_latest names preserved on the right.
     Returns (base, as_of_date_str, tags_path).
 
     Minimal coercions for B peer reconstruction inputs:
@@ -473,8 +535,17 @@ def load_latest_tags_and_factors_for_b(
     factors = load_factors_latest(data_dir)
     factors = factors.drop_duplicates(subset=["symbol"], keep="last")
 
-    base = latest_tags.merge(factors, on="symbol", how="inner")
+    base = latest_tags.merge(factors, on="symbol", how="inner", suffixes=("_tag", ""))
+    log_tags_factors_inner_join_diagnostics(
+        latest_tags, factors, "load_latest_tags_and_factors_for_b", merged=base
+    )
+    n_after_merge = len(base)
     base = base.drop_duplicates(subset=["symbol"], keep="last").reset_index(drop=True)
+    if len(base) != n_after_merge:
+        print(
+            f"  [load_latest_tags_and_factors_for_b] WARNING: drop_duplicates(symbol) "
+            f"changed rows {n_after_merge} -> {len(base)}"
+        )
 
     # Coerce/derive peer-selection input columns (snake_case) for later reuse.
     if "market_cap" not in base.columns and "Market Cap" in base.columns:
