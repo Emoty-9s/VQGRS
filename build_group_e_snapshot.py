@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from group_snapshot_history import DEFAULT_OUTPUT_DIR, save_group_latest
+from group_snapshot_history import DEFAULT_OUTPUT_DIR, normalize_as_of_date_key, save_group_latest
 from group_snapshot_utils import (
     DEFAULT_DATA_DIR,
     DEFAULT_LOGIC_DIR,
@@ -18,6 +18,7 @@ from group_snapshot_utils import (
     compute_representatives,
     get_factor_columns,
     load_latest_tags_and_factors,
+    log_snapshot_as_of_date_sanity,
 )
 
 GROUP_COL = "group_e"
@@ -43,11 +44,15 @@ def build_group_e_snapshot_df(
     reps = compute_representatives(base, GROUP_COL)
     snapshot_df = attach_representatives_and_deviations(base, reps, GROUP_COL, factor_cols)
 
-    snapshot_df["group_type"] = GROUP_TYPE
-    snapshot_df["group_tag"] = snapshot_df[GROUP_COL]
+    snapshot_df = snapshot_df.assign(
+        group_type=GROUP_TYPE,
+        group_tag=snapshot_df[GROUP_COL],
+    )
+    snapshot_df = normalize_as_of_date_key(snapshot_df, "as_of_date")
 
     meta = ["as_of_date", "symbol", "group_type", "group_tag"]
     others = [c for c in snapshot_df.columns if c not in meta]
+    log_snapshot_as_of_date_sanity(snapshot_df, label="group_e_snapshot")
     return snapshot_df[meta + others].copy()
 
 

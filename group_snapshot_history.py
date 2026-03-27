@@ -39,6 +39,38 @@ META_COLS = ["as_of_date", "symbol", "group_type", "group_tag"]
 HISTORY_SORT_COLS = ["as_of_date", "symbol", "group_type"]
 
 
+def normalize_as_of_date_key(df: pd.DataFrame, col: str = "as_of_date") -> pd.DataFrame:
+    """
+    Normalize merge/save key `as_of_date` to ISO date string (YYYY-MM-DD).
+    Idempotent for already-normalized string dates.
+    """
+    if df is None or df.empty:
+        return df.copy() if df is not None else pd.DataFrame()
+    out = df.copy()
+    if col not in out.columns:
+        return out
+    parsed = pd.to_datetime(out[col], errors="coerce")
+    invalid_cnt = int(parsed.isna().sum())
+    if invalid_cnt > 0:
+        print(
+            f"WARNING [normalize_as_of_date_key]: {invalid_cnt} rows have invalid {col}; "
+            "stored as missing key values."
+        )
+    out[col] = parsed.dt.strftime("%Y-%m-%d")
+    return out
+
+
+def _log_key_dtype_diag(df: pd.DataFrame, name: str, col: str = "as_of_date") -> None:
+    if col not in df.columns:
+        print(f"  [upsert key dtype] {name}: missing column {col!r}")
+        return
+    s = df[col]
+    print(
+        f"  [upsert key dtype] {name}.{col}: dtype={s.dtype}, "
+        f"nulls={int(s.isna().sum())}, unique_non_null={int(s.dropna().nunique())}"
+    )
+
+
 def _save_parquet_and_csv(df: pd.DataFrame, parquet_path: Path) -> None:
     """
     Save DataFrame to parquet and CSV side by side.
@@ -80,6 +112,7 @@ def combine_snapshots(snapshot_dfs: list[pd.DataFrame]) -> pd.DataFrame:
             raise ValueError("Each snapshot DataFrame must contain column: group_type")
 
     combined = pd.concat(non_empty, ignore_index=True)
+    combined = normalize_as_of_date_key(combined, "as_of_date")
     combined = combined.reset_index(drop=True)
 
     meta_present = [c for c in META_COLS if c in combined.columns]
@@ -109,6 +142,10 @@ def upsert_history_df(
     """
     key_cols = key_cols or KEY_COLS
     sort_cols = sort_cols or HISTORY_SORT_COLS
+    existing = normalize_as_of_date_key(existing, "as_of_date")
+    new = normalize_as_of_date_key(new, "as_of_date")
+    _log_key_dtype_diag(existing, "existing", "as_of_date")
+    _log_key_dtype_diag(new, "new", "as_of_date")
     if new.empty:
         return existing.copy() if not existing.empty else pd.DataFrame()
     if existing.empty:
@@ -136,7 +173,8 @@ def save_cde_latest(
         if c not in snapshot_df.columns:
             raise ValueError(f"snapshot_df must contain column: {c}")
     latest_path, _ = _get_cde_paths(output_dir)
-    _save_parquet_and_csv(snapshot_df, latest_path)
+    out = normalize_as_of_date_key(snapshot_df, "as_of_date")
+    _save_parquet_and_csv(out, latest_path)
 
 
 def upsert_cde_history(
@@ -157,6 +195,7 @@ def upsert_cde_history(
     if history_path.exists():
         try:
             existing = pd.read_parquet(history_path)
+            existing = normalize_as_of_date_key(existing, "as_of_date")
         except Exception as e:
             warnings.warn(
                 f"Could not read unified snapshot history {history_path}: {e}. Creating new.",
@@ -164,8 +203,9 @@ def upsert_cde_history(
                 stacklevel=2,
             )
 
+    normalized_new = normalize_as_of_date_key(snapshot_df.copy(), "as_of_date")
     combined = upsert_history_df(
-        existing, snapshot_df.copy(),
+        existing, normalized_new,
         key_cols=KEY_COLS,
         sort_cols=HISTORY_SORT_COLS,
     )
@@ -202,7 +242,8 @@ def save_group_latest(
         if c not in snapshot_df.columns:
             raise ValueError(f"snapshot_df must contain column: {c}")
     path = get_group_latest_path(group_type, output_dir)
-    _save_parquet_and_csv(snapshot_df, path)
+    out = normalize_as_of_date_key(snapshot_df, "as_of_date")
+    _save_parquet_and_csv(out, path)
 
 
 def main(

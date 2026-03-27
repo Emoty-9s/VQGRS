@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from group_snapshot_history import DEFAULT_OUTPUT_DIR, save_group_latest
+from group_snapshot_history import DEFAULT_OUTPUT_DIR, normalize_as_of_date_key, save_group_latest
 from group_snapshot_utils import (
     DEFAULT_DATA_DIR,
     DEFAULT_LOGIC_DIR,
@@ -23,6 +23,7 @@ from group_snapshot_utils import (
     build_peer_sets_and_reps_a,
     get_factor_columns_for_a,
     load_latest_tags_and_factors_for_a,
+    log_snapshot_as_of_date_sanity,
     print_group_a_add_mode_debug_summary,
     print_group_a_similarity_factor_debug,
 )
@@ -73,13 +74,15 @@ def build_group_a_snapshot_df(
         else:
             snapshot_df["a_final_peer_count"] = pd.NA
 
-    snapshot_df["group_type"] = GROUP_TYPE
-    snapshot_df["group_tag"] = snapshot_df[GROUP_TAG_COL]
+    snapshot_df = snapshot_df.assign(
+        group_type=GROUP_TYPE,
+        group_tag=snapshot_df[GROUP_TAG_COL],
+    )
 
-    if "sector" not in snapshot_df.columns:
-        snapshot_df["sector"] = ""
-    if "industry" not in snapshot_df.columns:
-        snapshot_df["industry"] = ""
+    snapshot_df = snapshot_df.assign(
+        sector=snapshot_df["sector"] if "sector" in snapshot_df.columns else "",
+        industry=snapshot_df["industry"] if "industry" in snapshot_df.columns else "",
+    )
 
     print_group_a_similarity_factor_debug(base, snapshot_df)
 
@@ -107,6 +110,8 @@ def build_group_a_snapshot_df(
     ]
     meta_present = [c for c in meta if c in snapshot_df.columns]
     others = [c for c in snapshot_df.columns if c not in meta_present]
+    snapshot_df = normalize_as_of_date_key(snapshot_df, "as_of_date")
+    log_snapshot_as_of_date_sanity(snapshot_df, label="group_a_snapshot")
     return snapshot_df[meta_present + others].copy()
 
 

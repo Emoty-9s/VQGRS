@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from group_snapshot_utils import finalize_scoring_long_input_df
 from score_factor_config import CATEGORY_TO_FACTORS, FACTOR_SPECS, MAIN_FACTORS_BY_CATEGORY
 from score_primitives import evidence_to_score
 
@@ -474,6 +475,7 @@ def main(input_dir: str | Path = "output", output_dir: str | Path = "output/scor
         print("No symbol_factor_scores_latest input found.")
         return
 
+    df = finalize_scoring_long_input_df(df, label="build_symbol_category_scores")
     print(f"Input factor-score rows: {len(df)}")
     scores_df = build_symbol_category_scores_df(df)
     print(f"Output symbol-category rows: {len(scores_df)}")

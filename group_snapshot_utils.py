@@ -20,6 +20,271 @@ from tag_and_save_groups import (
 )
 
 # ---------------------------------------------------------------------------
+# as_of_date: content-based latest (not filename, not row order)
+# ---------------------------------------------------------------------------
+
+
+def normalize_as_of_date(df: pd.DataFrame, col: str = "as_of_date") -> pd.DataFrame:
+    """
+    Normalize `col` to datetime64 for comparisons. Idempotent for already-normalized columns.
+    If `col` is missing, logs a warning and returns a copy unchanged.
+    """
+    out = df.copy()
+    if col not in out.columns:
+        print(f"WARNING [normalize_as_of_date]: column {col!r} missing; leaving DataFrame unchanged.")
+        return out
+    out[col] = pd.to_datetime(out[col], errors="coerce")
+    return out
+
+
+def filter_to_latest_as_of_date(
+    df: pd.DataFrame,
+    col: str = "as_of_date",
+    *,
+    label: str = "",
+) -> pd.DataFrame:
+    """
+    Keep only rows where `col` equals the maximum non-null date in the frame.
+    Does not use row order. Idempotent if already a single date.
+    If `col` is missing or all values are NaT, logs a warning and returns a copy unchanged.
+    """
+    out = normalize_as_of_date(df, col=col)
+    if col not in out.columns:
+        return out
+    valid = out[col].notna()
+    if not valid.any():
+        print(
+            f"WARNING [filter_to_latest_as_of_date{(':' + label) if label else ''}]: "
+            f"no valid {col}; leaving rows unchanged."
+        )
+        return out
+    n_before = len(out)
+    uniq = pd.unique(out.loc[valid, col])
+    max_dt = out.loc[valid, col].max()
+    if len(uniq) > 1:
+        print(
+            f"WARNING [filter_to_latest_as_of_date{(':' + label) if label else ''}]: "
+            f"{col} has {len(uniq)} distinct values; keeping rows with max={max_dt} only "
+            f"(rows {n_before} -> filter)."
+        )
+    out = out.loc[valid & (out[col] == max_dt)].copy()
+    n_after = len(out)
+    print(
+        f"  [filter_to_latest_as_of_date{(':' + label) if label else ''}] "
+        f"rows {n_before} -> {n_after} | max({col})={max_dt} | n_unique_before={len(uniq)}"
+    )
+    return out
+
+
+def dedupe_by_symbol_keep_latest(
+    df: pd.DataFrame,
+    symbol_col: str = "symbol",
+    date_col: str = "as_of_date",
+) -> pd.DataFrame:
+    """
+    One row per symbol: prefer the latest `date_col`; ties on same date keep last row in original order.
+    If `date_col` is missing, falls back to drop_duplicates(symbol, keep='last') with a warning.
+    Idempotent when already unique per symbol (for a single date).
+    """
+    if df.empty:
+        return df.copy()
+    if symbol_col not in df.columns:
+        raise ValueError(f"dedupe_by_symbol_keep_latest: missing column {symbol_col!r}")
+    work = df.copy()
+    if date_col not in work.columns:
+        print(
+            "WARNING [dedupe_by_symbol_keep_latest]: "
+            f"{date_col!r} missing; using drop_duplicates({{symbol_col}}, keep='last') only."
+        )
+        n0 = len(work)
+        out = work.drop_duplicates(subset=[symbol_col], keep="last").reset_index(drop=True)
+        print(f"  [dedupe_by_symbol_keep_latest] rows {n0} -> {len(out)} (no date column)")
+        return out
+    work = normalize_as_of_date(work, col=date_col)
+    work["_orig_idx"] = np.arange(len(work), dtype=np.int64)
+    work = work.sort_values(
+        [symbol_col, date_col, "_orig_idx"],
+        ascending=[True, True, True],
+        na_position="last",
+    )
+    n_before = len(work)
+    sym_dup = work.duplicated(subset=[symbol_col], keep=False).sum()
+    out = work.drop_duplicates(subset=[symbol_col], keep="last").drop(columns=["_orig_idx"]).reset_index(drop=True)
+    print(
+        f"  [dedupe_by_symbol_keep_latest] rows {n_before} -> {len(out)} | "
+        f"rows_in_duplicate_symbol_groups={int(sym_dup)}"
+    )
+    return out
+
+
+def finalize_factors_latest_by_as_of_date(factors: pd.DataFrame, *, label: str = "factors_latest") -> pd.DataFrame:
+    """
+    After loading factors_latest: normalize date, filter to global max(as_of_date), dedupe by symbol.
+    If as_of_date is absent, logs a warning and keeps legacy drop_duplicates(symbol, keep='last').
+    """
+    if factors.empty:
+        return factors.copy()
+    if "as_of_date" not in factors.columns:
+        print(
+            f"WARNING [finalize_factors_latest_by_as_of_date:{label}]: "
+            "as_of_date column missing; cannot filter by max date; "
+            "using drop_duplicates(symbol, keep='last') (row-order legacy)."
+        )
+        out = factors.copy()
+        n0 = len(out)
+        out = out.drop_duplicates(subset=["symbol"], keep="last").reset_index(drop=True)
+        print(f"  [{label}] legacy dedupe rows {n0} -> {len(out)}")
+        return out
+    out = normalize_as_of_date(factors, col="as_of_date")
+    out = filter_to_latest_as_of_date(out, col="as_of_date", label=label)
+    out = dedupe_by_symbol_keep_latest(out, symbol_col="symbol", date_col="as_of_date")
+    return out
+
+
+def ensure_merged_snapshot_as_of_date(base: pd.DataFrame, *, label: str) -> pd.DataFrame:
+    """
+    After tags+factors inner join: ensure a single data-date `as_of_date` (max in frame),
+    one row per symbol. Does not use row order for recency.
+    If only `as_of_date_tag` exists (left-only name), coalesce from it.
+    """
+    out = base.copy()
+    if "as_of_date" not in out.columns and "as_of_date_tag" in out.columns:
+        out["as_of_date"] = out["as_of_date_tag"]
+        print(f"  [{label}] coalesced as_of_date from as_of_date_tag")
+    if "as_of_date" not in out.columns:
+        print(f"WARNING [{label}]: merged base has no as_of_date; cannot enforce latest-date filter.")
+        return out
+    out = normalize_as_of_date(out)
+    out = filter_to_latest_as_of_date(out, label=label)
+    out = dedupe_by_symbol_keep_latest(out, symbol_col="symbol", date_col="as_of_date")
+    return out
+
+
+def finalize_snapshot_for_scoring(df: pd.DataFrame, *, label: str) -> pd.DataFrame:
+    """
+    Snapshot input for build_group_factor_scores: may have multiple rows per symbol (e.g. A/B/C/D/E).
+    Enforce max(as_of_date) only; do not collapse rows that differ by group_type.
+    Drops duplicate rows for the same (symbol, group_type, as_of_date) if present.
+    """
+    if df.empty:
+        return df.copy()
+    if "as_of_date" not in df.columns:
+        print(f"WARNING [finalize_snapshot_for_scoring:{label}]: missing as_of_date; leaving unchanged.")
+        return df.copy()
+    n0 = len(df)
+    work = normalize_as_of_date(df)
+    valid = work["as_of_date"].notna()
+    if not valid.any():
+        print(f"WARNING [finalize_snapshot_for_scoring:{label}]: all as_of_date NaT; leaving unchanged.")
+        return work
+    nu = int(work.loc[valid, "as_of_date"].nunique())
+    mx = work.loc[valid, "as_of_date"].max()
+    print(
+        f"  [finalize_snapshot_for_scoring:{label}] rows={n0} unique_as_of_date={nu} max_as_of_date={mx}"
+    )
+    if nu > 1:
+        print(
+            f"WARNING [finalize_snapshot_for_scoring:{label}]: "
+            "snapshot *_latest contains multiple as_of_date values; filtering to max."
+        )
+    work = filter_to_latest_as_of_date(work, label=label)
+    if "group_type" in work.columns:
+        subset = [c for c in ("symbol", "group_type", "as_of_date") if c in work.columns]
+        dup = work.duplicated(subset=subset, keep=False)
+        if dup.any():
+            n1 = len(work)
+            work = work.drop_duplicates(subset=subset, keep="last").reset_index(drop=True)
+            print(
+                f"  [finalize_snapshot_for_scoring:{label}] removed duplicate snapshot rows "
+                f"{n1} -> {len(work)} on {subset}"
+            )
+    return work
+
+
+def finalize_scoring_long_input_df(df: pd.DataFrame, *, label: str) -> pd.DataFrame:
+    """
+    Long-format scoring inputs (e.g. symbol_factor_scores): many rows per symbol.
+    Enforce max(as_of_date) only; do not dedupe by symbol.
+    """
+    if df.empty:
+        return df.copy()
+    if "as_of_date" not in df.columns:
+        print(f"WARNING [finalize_scoring_long_input_df:{label}]: missing as_of_date; leaving unchanged.")
+        return df.copy()
+    n0 = len(df)
+    work = normalize_as_of_date(df)
+    valid = work["as_of_date"].notna()
+    if not valid.any():
+        print(f"WARNING [finalize_scoring_long_input_df:{label}]: all as_of_date NaT; leaving unchanged.")
+        return work
+    nu = int(work.loc[valid, "as_of_date"].nunique())
+    mx = work.loc[valid, "as_of_date"].max()
+    print(
+        f"  [finalize_scoring_long_input_df:{label}] rows={n0} unique_as_of_date={nu} max_as_of_date={mx}"
+    )
+    if nu > 1:
+        print(
+            f"WARNING [finalize_scoring_long_input_df:{label}]: "
+            "multiple as_of_date values in input; filtering to max."
+        )
+    return filter_to_latest_as_of_date(work, label=label)
+
+
+def log_snapshot_as_of_date_sanity(df: pd.DataFrame, *, label: str) -> None:
+    """
+    Log whether snapshot output has a single data-date; warn if multiple as_of_date values appear.
+    """
+    if df.empty:
+        return
+    if "as_of_date" not in df.columns:
+        print(f"WARNING [log_snapshot_as_of_date_sanity:{label}]: snapshot has no as_of_date column.")
+        return
+    s = pd.to_datetime(df["as_of_date"], errors="coerce").dropna()
+    if s.empty:
+        print(f"WARNING [log_snapshot_as_of_date_sanity:{label}]: snapshot as_of_date all NaT.")
+        return
+    u = pd.unique(s.values)
+    mx = s.max()
+    if len(u) > 1:
+        print(
+            f"WARNING [log_snapshot_as_of_date_sanity:{label}]: "
+            f"{len(u)} distinct as_of_date values (max={mx}); expected single date from loaders."
+        )
+    else:
+        print(f"  [snapshot as_of_date] {label}: single data-date max={mx}")
+
+
+def finalize_scoring_wide_input_df(df: pd.DataFrame, *, label: str) -> pd.DataFrame:
+    """
+    Wide per-symbol scoring inputs (e.g. symbol_category_scores): one row per symbol for a given date.
+    Enforce max(as_of_date), then at most one row per symbol for that date.
+    """
+    if df.empty:
+        return df.copy()
+    if "as_of_date" not in df.columns:
+        print(f"WARNING [finalize_scoring_wide_input_df:{label}]: missing as_of_date; leaving unchanged.")
+        return df.copy()
+    n0 = len(df)
+    work = normalize_as_of_date(df)
+    valid = work["as_of_date"].notna()
+    if not valid.any():
+        print(f"WARNING [finalize_scoring_wide_input_df:{label}]: all as_of_date NaT; leaving unchanged.")
+        return work
+    nu = int(work.loc[valid, "as_of_date"].nunique())
+    mx = work.loc[valid, "as_of_date"].max()
+    print(
+        f"  [finalize_scoring_wide_input_df:{label}] rows={n0} unique_as_of_date={nu} max_as_of_date={mx}"
+    )
+    if nu > 1:
+        print(
+            f"WARNING [finalize_scoring_wide_input_df:{label}]: "
+            "multiple as_of_date values in input; filtering to max."
+        )
+    work = filter_to_latest_as_of_date(work, label=label)
+    return dedupe_by_symbol_keep_latest(work, symbol_col="symbol", date_col="as_of_date")
+
+
+# ---------------------------------------------------------------------------
 # Path / config constants
 # ---------------------------------------------------------------------------
 DEFAULT_LOGIC_DIR = Path("logic_data")
@@ -91,28 +356,56 @@ EXCLUDE_COLUMNS_B = EXCLUDE_COLUMNS | {
 SIMILARITY_FACTORS_A = ["op_margin", "roic", "debt_to_equity"]
 MIN_A_PEER_COUNT = 12
 
-# factors_latest display names -> SIMILARITY_FACTORS_A (applied once on merged base for Group A).
-_GROUP_A_SIMILARITY_ALIASES: tuple[tuple[str, str], ...] = (
+# Cross-group factor canonical naming:
+# (source display name -> canonical factor name)
+# Applied to merged base for all groups so rep__/dev__ naming stays consistent.
+FACTOR_CANONICAL_ALIASES: tuple[tuple[str, str], ...] = (
     ("Oper. Margin", "op_margin"),
     ("ROIC", "roic"),
     ("Debt/Eq", "debt_to_equity"),
 )
 
 
-def _apply_group_a_similarity_factor_aliases(df: pd.DataFrame) -> pd.DataFrame:
+def apply_factor_canonical_aliases(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Ensure op_margin / roic / debt_to_equity exist from factors_latest column names.
-    If standard name already present, skip; else copy from source. Source columns are kept
-    so factors_latest display names remain in the merged base alongside the aliases.
+    Ensure canonical factor columns exist from source display names (cross-group).
+    Rules:
+      - if canonical column already exists, keep it
+      - else if source exists, copy source -> canonical
+      - source columns are preserved (no drop)
+
+    Idempotent: safe to call multiple times.
     """
     out = df.copy()
-    for src, dst in _GROUP_A_SIMILARITY_ALIASES:
+    for src, dst in FACTOR_CANONICAL_ALIASES:
         if dst in out.columns:
             continue
         if src not in out.columns:
             continue
         out[dst] = out[src]
     return out
+
+
+def _apply_group_a_similarity_factor_aliases(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Backward-compat wrapper.
+    Canonicalization is now cross-group via apply_factor_canonical_aliases().
+    """
+    return apply_factor_canonical_aliases(df)
+
+
+def _dedupe_alias_factor_columns(cols: list[str], df: pd.DataFrame) -> list[str]:
+    """
+    If source+canonical alias pair both exist, keep canonical only in factor columns.
+    Example: keep 'roic', drop 'ROIC' from factor_cols when both exist.
+    """
+    if not cols:
+        return cols
+    keep = set(cols)
+    for src, dst in FACTOR_CANONICAL_ALIASES:
+        if src in keep and dst in keep and dst in df.columns:
+            keep.discard(src)
+    return sorted(keep)
 
 REP_PREFIX = "rep__"
 DEV_PREFIX = "dev__"
@@ -159,16 +452,16 @@ def _load_tags_from_path(path: Path) -> tuple[pd.DataFrame, str]:
         raise ValueError(f"Tags file missing required columns: {missing}")
 
     tags = tags[need].copy()
-    tags["as_of_date"] = pd.to_datetime(tags["as_of_date"], errors="coerce")
+    tags = normalize_as_of_date(tags)
     tags = tags.dropna(subset=["as_of_date"])
     if tags.empty:
         raise ValueError("No valid as_of_date in tags file.")
 
-    latest_dt = tags["as_of_date"].max()
-    latest = tags[tags["as_of_date"] == latest_dt].copy()
-    latest["as_of_date"] = latest["as_of_date"].dt.strftime("%Y-%m-%d")
-    as_of_date_str = latest["as_of_date"].iloc[0]
-    return latest, as_of_date_str
+    tags = filter_to_latest_as_of_date(tags, label="_load_tags_from_path")
+    tags = dedupe_by_symbol_keep_latest(tags)
+    tags["symbol"] = _normalize_symbol_series(tags["symbol"])
+    as_of_date_str = pd.Timestamp(tags["as_of_date"].iloc[0]).strftime("%Y-%m-%d")
+    return tags, as_of_date_str
 
 
 CANONICAL_GROUP_A_MODES = frozenset({"TOTAL_MARKET", "INDUSTRY_ONLY", "INDUSTRY_ADD_SECTOR"})
@@ -317,16 +610,16 @@ def _load_tags_from_path_for_a(path: Path) -> tuple[pd.DataFrame, str]:
             lambda r: _normalize_or_infer_group_a_mode(r["group_a_mode"], r["group_a"]),
             axis=1,
         )
-    tags["as_of_date"] = pd.to_datetime(tags["as_of_date"], errors="coerce")
+    tags = normalize_as_of_date(tags)
     tags = tags.dropna(subset=["as_of_date"])
     if tags.empty:
         raise ValueError("No valid as_of_date in tags file.")
 
-    latest_dt = tags["as_of_date"].max()
-    latest = tags[tags["as_of_date"] == latest_dt].copy()
-    latest["as_of_date"] = latest["as_of_date"].dt.strftime("%Y-%m-%d")
-    as_of_date_str = latest["as_of_date"].iloc[0]
-    return latest, as_of_date_str
+    tags = filter_to_latest_as_of_date(tags, label="_load_tags_from_path_for_a")
+    tags = dedupe_by_symbol_keep_latest(tags)
+    tags["symbol"] = _normalize_symbol_series(tags["symbol"])
+    as_of_date_str = pd.Timestamp(tags["as_of_date"].iloc[0]).strftime("%Y-%m-%d")
+    return tags, as_of_date_str
 
 
 def _normalize_symbol_series(s: pd.Series) -> pd.Series:
@@ -380,7 +673,11 @@ def log_tags_factors_inner_join_diagnostics(
 
 
 def load_factors_latest(data_dir: str | Path) -> pd.DataFrame:
-    """Load factors_latest: CSV first, then parquet. Symbol normalized to str.upper().strip()."""
+    """
+    Load factors_latest: CSV first, then parquet. Symbol normalized to str.upper().strip().
+    If the file uses `asOfDate` but not `as_of_date`, coalesce to `as_of_date` for a single
+    canonical data-date column, then filter to max(date) and dedupe by symbol (not row order).
+    """
     data_dir = Path(data_dir)
     fcsv = data_dir / "factors_latest.csv"
     fpq = data_dir / "factors_latest.parquet"
@@ -395,7 +692,14 @@ def load_factors_latest(data_dir: str | Path) -> pd.DataFrame:
     if "symbol" not in factors.columns:
         raise ValueError("factors_latest must contain column: symbol")
     factors["symbol"] = factors["symbol"].astype(str).str.strip().str.upper()
-    return factors
+    if "as_of_date" not in factors.columns and "asOfDate" in factors.columns:
+        factors = factors.copy()
+        factors["as_of_date"] = factors["asOfDate"]
+        print(
+            "[load_factors_latest] coalesced column as_of_date from asOfDate "
+            "(canonical data-date for max-date filtering)."
+        )
+    return finalize_factors_latest_by_as_of_date(factors, label="load_factors_latest")
 
 
 def load_latest_tags_and_factors(
@@ -404,7 +708,9 @@ def load_latest_tags_and_factors(
 ) -> tuple[pd.DataFrame, str]:
     """
     Load latest group tags (from history or fallback date-stamped file) and factors_latest;
-    normalize symbol, dedupe keep last, inner join.
+    normalize symbol, inner join on symbol.
+    Tags and factors are each reduced to max(as_of_date) before join (not row-order dedupe).
+    factors_latest may use `asOfDate`; it is coalesced to `as_of_date` for filtering.
     Inner join drops symbols present in only one side; see log_tags_factors_inner_join_diagnostics output.
     Overlapping column names (other than symbol) keep factors_latest names on the right;
     tag-side duplicates are suffixed with _tag.
@@ -419,16 +725,16 @@ def load_latest_tags_and_factors(
     latest_tags, as_of_date_str = _load_tags_from_path(tags_path)
 
     factors = load_factors_latest(data_dir)
-    factors = factors.drop_duplicates(subset=["symbol"], keep="last")
     latest_tags["symbol"] = latest_tags["symbol"].astype(str).str.strip().str.upper()
-    latest_tags = latest_tags.drop_duplicates(subset=["symbol"], keep="last")
 
     # Preserve factors_latest column names when tags share the same name (e.g. sector, industry):
     # tag-side duplicates get _tag; right (factors) keeps unprefixed names.
     base = latest_tags.merge(factors, on="symbol", how="inner", suffixes=("_tag", ""))
+    base = apply_factor_canonical_aliases(base)
     log_tags_factors_inner_join_diagnostics(
         latest_tags, factors, "load_latest_tags_and_factors", merged=base
     )
+    base = ensure_merged_snapshot_as_of_date(base, label="load_latest_tags_and_factors")
     return base.sort_values("symbol").reset_index(drop=True), as_of_date_str, tags_path
 
 
@@ -451,15 +757,14 @@ def load_latest_tags_and_factors_for_a(
     latest_tags, as_of_date_str = _load_tags_from_path_for_a(tags_path)
 
     factors = load_factors_latest(data_dir)
-    factors = factors.drop_duplicates(subset=["symbol"], keep="last")
     latest_tags["symbol"] = latest_tags["symbol"].astype(str).str.strip().str.upper()
-    latest_tags = latest_tags.drop_duplicates(subset=["symbol"], keep="last")
 
     base = latest_tags.merge(factors, on="symbol", how="inner", suffixes=("_tag", ""))
+    base = apply_factor_canonical_aliases(base)
     log_tags_factors_inner_join_diagnostics(
         latest_tags, factors, "load_latest_tags_and_factors_for_a", merged=base
     )
-    base = _apply_group_a_similarity_factor_aliases(base)
+    base = ensure_merged_snapshot_as_of_date(base, label="load_latest_tags_and_factors_for_a")
     return base.sort_values("symbol").reset_index(drop=True), as_of_date_str, tags_path
 
 
@@ -494,19 +799,16 @@ def _load_tags_from_path_for_b(path: Path) -> tuple[pd.DataFrame, str]:
         raise ValueError(f"Tags file missing required Group B columns: {missing}")
 
     tags = tags[required].copy()
-    tags["as_of_date"] = pd.to_datetime(tags["as_of_date"], errors="coerce")
+    tags = normalize_as_of_date(tags)
     tags = tags.dropna(subset=["as_of_date"])
     if tags.empty:
         raise ValueError("No valid as_of_date in Group B tags file.")
 
-    latest_dt = tags["as_of_date"].max()
-    latest = tags[tags["as_of_date"] == latest_dt].copy()
-    latest["as_of_date"] = latest["as_of_date"].dt.strftime("%Y-%m-%d")
-    as_of_date_str = latest["as_of_date"].iloc[0]
-
-    latest["symbol"] = latest["symbol"].astype(str).str.strip().str.upper()
-    latest = latest.drop_duplicates(subset=["symbol"], keep="last").reset_index(drop=True)
-    return latest, as_of_date_str
+    tags = filter_to_latest_as_of_date(tags, label="_load_tags_from_path_for_b")
+    tags = dedupe_by_symbol_keep_latest(tags)
+    tags["symbol"] = _normalize_symbol_series(tags["symbol"])
+    as_of_date_str = pd.Timestamp(tags["as_of_date"].iloc[0]).strftime("%Y-%m-%d")
+    return tags, as_of_date_str
 
 
 def load_latest_tags_and_factors_for_b(
@@ -533,17 +835,17 @@ def load_latest_tags_and_factors_for_b(
     latest_tags, as_of_date_str = _load_tags_from_path_for_b(tags_path)
 
     factors = load_factors_latest(data_dir)
-    factors = factors.drop_duplicates(subset=["symbol"], keep="last")
 
     base = latest_tags.merge(factors, on="symbol", how="inner", suffixes=("_tag", ""))
+    base = apply_factor_canonical_aliases(base)
     log_tags_factors_inner_join_diagnostics(
         latest_tags, factors, "load_latest_tags_and_factors_for_b", merged=base
     )
     n_after_merge = len(base)
-    base = base.drop_duplicates(subset=["symbol"], keep="last").reset_index(drop=True)
+    base = ensure_merged_snapshot_as_of_date(base, label="load_latest_tags_and_factors_for_b")
     if len(base) != n_after_merge:
         print(
-            f"  [load_latest_tags_and_factors_for_b] WARNING: drop_duplicates(symbol) "
+            f"  [load_latest_tags_and_factors_for_b] NOTE: as-of-date merge cleanup "
             f"changed rows {n_after_merge} -> {len(base)}"
         )
 
@@ -594,7 +896,7 @@ def get_factor_columns(
         else:
             if pd.to_numeric(df[c], errors="coerce").notna().any():
                 cols.append(c)
-    return sorted(cols)
+    return _dedupe_alias_factor_columns(cols, df)
 
 
 def compute_representatives(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
@@ -645,15 +947,24 @@ def attach_representatives_and_deviations(
     out = base_df.copy()
     reps = reps_df.set_index(["group_tag", "factor_name"])
 
-    for f in factor_cols:
-        out[f"{REP_PREFIX}{f}__median"] = np.nan
-        out[f"{REP_PREFIX}{f}__q25"] = np.nan
-        out[f"{REP_PREFIX}{f}__q75"] = np.nan
-        out[f"{REP_PREFIX}{f}__iqr"] = np.nan
-        out[f"{REP_PREFIX}{f}__n_valid"] = np.nan
-        out[f"{DEV_PREFIX}{f}__abs"] = np.nan
-        out[f"{DEV_PREFIX}{f}__pct"] = np.nan
-        out[f"{DEV_PREFIX}{f}__robust_z"] = np.nan
+    # Pre-allocate rep/dev columns in one concat to avoid DataFrame fragmentation.
+    rep_dev_cols = [
+        col
+        for f in factor_cols
+        for col in (
+            f"{REP_PREFIX}{f}__median",
+            f"{REP_PREFIX}{f}__q25",
+            f"{REP_PREFIX}{f}__q75",
+            f"{REP_PREFIX}{f}__iqr",
+            f"{REP_PREFIX}{f}__n_valid",
+            f"{DEV_PREFIX}{f}__abs",
+            f"{DEV_PREFIX}{f}__pct",
+            f"{DEV_PREFIX}{f}__robust_z",
+        )
+    ]
+    if rep_dev_cols:
+        extra = pd.DataFrame(index=out.index, data={c: np.nan for c in rep_dev_cols})
+        out = pd.concat([out, extra], axis=1)
 
     for idx in out.index:
         tag = out.at[idx, group_col]
@@ -680,7 +991,7 @@ def attach_representatives_and_deviations(
             if iqr_val > 0:
                 out.at[idx, f"{DEV_PREFIX}{f}__robust_z"] = (val - med) / iqr_val
 
-    return out
+    return out.copy()
 
 
 # ---------------------------------------------------------------------------
@@ -964,15 +1275,23 @@ def attach_representatives_and_deviations_b(
         out["symbol"] = out["symbol"].astype(str).str.strip().str.upper()
         out = out.merge(m, on="symbol", how="left", suffixes=("", "_b_peer_meta"))
 
-    for f in factor_cols:
-        out[f"{REP_PREFIX}{f}__median"] = np.nan
-        out[f"{REP_PREFIX}{f}__q25"] = np.nan
-        out[f"{REP_PREFIX}{f}__q75"] = np.nan
-        out[f"{REP_PREFIX}{f}__iqr"] = np.nan
-        out[f"{REP_PREFIX}{f}__n_valid"] = np.nan
-        out[f"{DEV_PREFIX}{f}__abs"] = np.nan
-        out[f"{DEV_PREFIX}{f}__pct"] = np.nan
-        out[f"{DEV_PREFIX}{f}__robust_z"] = np.nan
+    rep_dev_cols = [
+        col
+        for f in factor_cols
+        for col in (
+            f"{REP_PREFIX}{f}__median",
+            f"{REP_PREFIX}{f}__q25",
+            f"{REP_PREFIX}{f}__q75",
+            f"{REP_PREFIX}{f}__iqr",
+            f"{REP_PREFIX}{f}__n_valid",
+            f"{DEV_PREFIX}{f}__abs",
+            f"{DEV_PREFIX}{f}__pct",
+            f"{DEV_PREFIX}{f}__robust_z",
+        )
+    ]
+    if rep_dev_cols:
+        extra = pd.DataFrame(index=out.index, data={c: np.nan for c in rep_dev_cols})
+        out = pd.concat([out, extra], axis=1)
 
     for idx in out.index:
         sym = str(out.at[idx, "symbol"]).strip().upper()
@@ -1014,7 +1333,7 @@ def attach_representatives_and_deviations_b(
             if not pd.isna(iqr_val) and iqr_val > 0:
                 out.at[idx, f"{DEV_PREFIX}{f}__robust_z"] = (val - med) / iqr_val
 
-    return out
+    return out.copy()
 
 
 def rank_sector_fill_candidates(
@@ -1342,15 +1661,23 @@ def attach_representatives_and_deviations_a(
     reps_by_group_a key = group_a tag; meta_df has symbol and a_peer_mode, a_base_count, etc.
     """
     out = base_df.copy()
-    for f in factor_cols:
-        out[f"{REP_PREFIX}{f}__median"] = np.nan
-        out[f"{REP_PREFIX}{f}__q25"] = np.nan
-        out[f"{REP_PREFIX}{f}__q75"] = np.nan
-        out[f"{REP_PREFIX}{f}__iqr"] = np.nan
-        out[f"{REP_PREFIX}{f}__n_valid"] = np.nan
-        out[f"{DEV_PREFIX}{f}__abs"] = np.nan
-        out[f"{DEV_PREFIX}{f}__pct"] = np.nan
-        out[f"{DEV_PREFIX}{f}__robust_z"] = np.nan
+    rep_dev_cols = [
+        col
+        for f in factor_cols
+        for col in (
+            f"{REP_PREFIX}{f}__median",
+            f"{REP_PREFIX}{f}__q25",
+            f"{REP_PREFIX}{f}__q75",
+            f"{REP_PREFIX}{f}__iqr",
+            f"{REP_PREFIX}{f}__n_valid",
+            f"{DEV_PREFIX}{f}__abs",
+            f"{DEV_PREFIX}{f}__pct",
+            f"{DEV_PREFIX}{f}__robust_z",
+        )
+    ]
+    if rep_dev_cols:
+        extra = pd.DataFrame(index=out.index, data={c: np.nan for c in rep_dev_cols})
+        out = pd.concat([out, extra], axis=1)
 
     if not meta_df.empty and "symbol" in meta_df.columns:
         meta_cols = [
@@ -1371,8 +1698,9 @@ def attach_representatives_and_deviations_a(
             ]
             if c in meta_df.columns
         ]
-        for c in meta_cols:
-            out[c] = pd.Series(index=out.index, dtype=object)
+        if meta_cols:
+            meta_extra = pd.DataFrame(index=out.index, data={c: pd.Series(index=out.index, dtype=object) for c in meta_cols})
+            out = pd.concat([out, meta_extra], axis=1)
         sym_to_meta = meta_df.drop_duplicates(subset=["symbol"], keep="last").set_index("symbol")
         for idx in out.index:
             sym = out.at[idx, "symbol"]
@@ -1409,7 +1737,7 @@ def attach_representatives_and_deviations_a(
             if iqr_val > 0:
                 out.at[idx, f"{DEV_PREFIX}{f}__robust_z"] = (val - med) / iqr_val
 
-    return out
+    return out.copy()
 
 
 def print_group_a_add_mode_debug_summary(df: pd.DataFrame) -> None:

@@ -9,7 +9,8 @@ Input:
 Output:
   - output/scoring/group_factor_scores_latest.(parquet|csv)
 
-This module does NOT modify snapshot builders/history; it only reads existing latest snapshots.
+This module reads snapshot *_latest files and enforces max(as_of_date) from file contents (not the filename).
+It does not modify snapshot builders/history.
 Core engine output is evidence-first (`adjusted_evidence`); score columns are kept for compatibility.
 """
 from __future__ import annotations
@@ -19,6 +20,7 @@ from typing import Any
 
 import pandas as pd
 
+from group_snapshot_utils import finalize_snapshot_for_scoring
 from score_factor_config import CATEGORY_TO_FACTORS, FACTOR_SPECS
 from score_primitives import score_one_factor_one_group
 
@@ -105,6 +107,53 @@ def _read_snapshot_latest(input_dir: str | Path) -> pd.DataFrame:
     if not dfs:
         return pd.DataFrame()
     return pd.concat(dfs, ignore_index=True)
+
+
+def _per_group_snapshot_max_dates(input_dir: Path) -> dict[str, pd.Timestamp | None]:
+    """Max as_of_date inside each group_*_snapshot_latest file (for stale-unified diagnostics)."""
+    out: dict[str, pd.Timestamp | None] = {}
+    for gt in GROUP_TYPES:
+        low = gt.lower()
+        base = input_dir / f"group_{low}"
+        found = False
+        for name in (f"group_{low}_snapshot_latest.parquet", f"group_{low}_snapshot_latest.csv"):
+            p = base / name
+            if not p.exists():
+                continue
+            df = _read_df(p)
+            found = True
+            if df.empty or "as_of_date" not in df.columns:
+                out[gt] = None
+            else:
+                d = pd.to_datetime(df["as_of_date"], errors="coerce").dropna()
+                out[gt] = pd.Timestamp(d.max()) if len(d) else None
+            break
+        if not found:
+            out[gt] = None
+    return out
+
+
+def _log_snapshot_date_audit(input_dir: Path, snapshot_df: pd.DataFrame) -> None:
+    per_g = _per_group_snapshot_max_dates(input_dir)
+    umax: pd.Timestamp | None = None
+    if not snapshot_df.empty and "as_of_date" in snapshot_df.columns:
+        d = pd.to_datetime(snapshot_df["as_of_date"], errors="coerce").dropna()
+        umax = pd.Timestamp(d.max()) if len(d) else None
+    print("  [snapshot date audit] per-group snapshot max(as_of_date):")
+    max_vals: list[pd.Timestamp] = []
+    for gt, m in per_g.items():
+        print(f"    group_{gt.lower()}: {m}")
+        if m is not None:
+            max_vals.append(m)
+    print(f"  [snapshot date audit] loaded snapshot input max(as_of_date): {umax}")
+    if max_vals and umax is not None:
+        overall_max = max(max_vals)
+        if pd.notna(overall_max) and pd.notna(umax) and umax < overall_max:
+            print(
+                "WARNING [snapshot date audit]: loaded unified snapshot is OLDER than at least one "
+                f"per-group snapshot_latest (unified max={umax}, per-group max={overall_max}). "
+                "Regenerate group_unified_snapshot_latest or rely on per-group concat path."
+            )
 
 
 def _infer_group_type_and_tag(row: pd.Series) -> tuple[str | None, str | None]:
@@ -208,10 +257,14 @@ def build_group_factor_scores_df(snapshot_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def main(input_dir: str | Path = "output", output_dir: str | Path = "output/scoring") -> None:
+    input_dir = Path(input_dir)
     snapshot_df = _read_snapshot_latest(input_dir=input_dir)
     if snapshot_df.empty:
         print("No snapshot input found; skipping scoring.")
         return
+
+    _log_snapshot_date_audit(input_dir, snapshot_df)
+    snapshot_df = finalize_snapshot_for_scoring(snapshot_df, label="build_group_factor_scores")
 
     print(f"Input snapshot rows: {len(snapshot_df)}")
     scores_df = build_group_factor_scores_df(snapshot_df)
