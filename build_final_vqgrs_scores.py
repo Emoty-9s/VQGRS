@@ -41,58 +41,135 @@ def _read_df(path: Path) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
-def _load_track_inputs_from_snapshot(input_dir: Path) -> pd.DataFrame:
+def _load_track_inputs_from_factors_latest() -> pd.DataFrame:
     """
-    Load track assignment raw inputs from unified snapshot (or legacy group_cde path).
-    Keeps one row per (symbol, as_of_date).
+    Track raw input source (strict):
+      - data/factors_latest.parquet only
+      - no CSV fallback
+      - no snapshot fallback
     """
-    candidates = [
-        input_dir / "group_unified" / "group_unified_snapshot_latest.parquet",
-        input_dir / "group_unified" / "group_unified_snapshot_latest.csv",
-        input_dir / "group_cde" / "group_cde_snapshot_latest.parquet",
-        input_dir / "group_cde" / "group_cde_snapshot_latest.csv",
+    path = Path("data") / "factors_latest.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"Required track raw source missing: {path}")
+    fac = pd.read_parquet(path)
+    if fac.empty:
+        return pd.DataFrame(
+            columns=[
+                "symbol",
+                "as_of_date",
+                "track_input_roic",
+                "track_input_oper_margin",
+                "track_input_ocf_ni",
+                "track_input_revenue_yoy",
+                "track_input_debt_to_equity",
+                "track_input_current_ratio",
+                "track_input_interest_coverage",
+                "track_input_beta",
+                "track_input_pe",
+                "track_input_ps",
+                "track_input_ev_ebitda",
+                "track_input_rule_of_40_calc",
+                "track_A_valuation_valid_count",
+                "track_input_v_market_proxy",
+            ]
+        )
+
+    if "as_of_date" not in fac.columns:
+        if "asOfDate" in fac.columns:
+            fac = fac.copy()
+            fac["as_of_date"] = fac["asOfDate"]
+        else:
+            raise ValueError("factors_latest.parquet must contain as_of_date (or asOfDate).")
+    if "symbol" not in fac.columns:
+        raise ValueError("factors_latest.parquet must contain symbol.")
+
+    needed = [
+        "symbol",
+        "as_of_date",
+        "ROIC",
+        "Oper. Margin",
+        "OCF/NI",
+        "Revenue YoY",
+        "Debt/Eq",
+        "Current Ratio",
+        "Interest Coverage",
+        "Beta",
+        "P/E",
+        "P/S",
+        "EV/EBITDA",
     ]
-    snap = pd.DataFrame()
-    for p in candidates:
-        if p.exists():
-            snap = _read_df(p)
-            if not snap.empty:
-                break
-    if snap.empty or "symbol" not in snap.columns or "as_of_date" not in snap.columns:
-        return pd.DataFrame(columns=["symbol", "as_of_date", "track_input_roic", "track_input_revenue_yoy", "track_input_rule_of_40", "track_input_v_market"])
+    for c in needed:
+        if c not in fac.columns:
+            fac[c] = np.nan
+    work = fac[needed].copy()
+    work["symbol"] = work["symbol"].astype(str).str.strip().str.upper()
+    work["as_of_date"] = pd.to_datetime(work["as_of_date"], errors="coerce")
+    work = work.dropna(subset=["as_of_date"])
+    if work.empty:
+        return pd.DataFrame(columns=["symbol", "as_of_date"])
 
-    for c in ("ROIC", "Revenue YoY", "Rule of 40", "V_market"):
-        if c not in snap.columns:
-            snap[c] = np.nan
+    latest_dt = work["as_of_date"].max()
+    print(f"Track raw source: {path} | max(as_of_date)={latest_dt}")
+    work = work.loc[work["as_of_date"] == latest_dt].copy()
 
-    out = snap[["symbol", "as_of_date", "ROIC", "Revenue YoY", "Rule of 40", "V_market"]].copy()
-    out["symbol"] = out["symbol"].astype(str).str.strip().str.upper()
-    out["as_of_date"] = pd.to_datetime(out["as_of_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    out["ROIC"] = pd.to_numeric(out["ROIC"], errors="coerce")
-    out["Revenue YoY"] = pd.to_numeric(out["Revenue YoY"], errors="coerce")
-    out["Rule of 40"] = pd.to_numeric(out["Rule of 40"], errors="coerce")
-    out["V_market"] = pd.to_numeric(out["V_market"], errors="coerce")
+    num_cols = [c for c in needed if c not in ("symbol", "as_of_date")]
+    for c in num_cols:
+        work[c] = pd.to_numeric(work[c], errors="coerce")
+    work["as_of_date"] = work["as_of_date"].dt.strftime("%Y-%m-%d")
 
-    out = (
-        out.groupby(["symbol", "as_of_date"], dropna=False, as_index=False)
-        .agg(
-            {
-                "ROIC": "median",
-                "Revenue YoY": "median",
-                "Rule of 40": "median",
-                "V_market": "median",
-            }
-        )
-        .rename(
-            columns={
-                "ROIC": "track_input_roic",
-                "Revenue YoY": "track_input_revenue_yoy",
-                "Rule of 40": "track_input_rule_of_40",
-                "V_market": "track_input_v_market",
-            }
-        )
+    work = (
+        work.groupby(["symbol", "as_of_date"], as_index=False, dropna=False)
+        .agg({c: "median" for c in num_cols})
     )
-    return out
+
+    work = work.rename(
+        columns={
+            "ROIC": "track_input_roic",
+            "Oper. Margin": "track_input_oper_margin",
+            "OCF/NI": "track_input_ocf_ni",
+            "Revenue YoY": "track_input_revenue_yoy",
+            "Debt/Eq": "track_input_debt_to_equity",
+            "Current Ratio": "track_input_current_ratio",
+            "Interest Coverage": "track_input_interest_coverage",
+            "Beta": "track_input_beta",
+            "P/E": "track_input_pe",
+            "P/S": "track_input_ps",
+            "EV/EBITDA": "track_input_ev_ebitda",
+        }
+    )
+
+    work["track_input_rule_of_40_calc"] = np.where(
+        pd.to_numeric(work["track_input_revenue_yoy"], errors="coerce").notna()
+        & pd.to_numeric(work["track_input_oper_margin"], errors="coerce").notna(),
+        pd.to_numeric(work["track_input_revenue_yoy"], errors="coerce")
+        + pd.to_numeric(work["track_input_oper_margin"], errors="coerce"),
+        np.nan,
+    )
+
+    def _lower_better_score(series: pd.Series) -> pd.Series:
+        x = pd.to_numeric(series, errors="coerce")
+        med = float(x.median(skipna=True))
+        q25 = float(x.quantile(0.25))
+        q75 = float(x.quantile(0.75))
+        iqr = q75 - q25
+        if not np.isfinite(iqr) or iqr <= 0:
+            return pd.Series(np.nan, index=x.index, dtype=float)
+        z = (x - med) / iqr
+        return pd.Series(np.clip(50.0 - 20.0 * z, 0.0, 100.0), index=x.index, dtype=float)
+
+    pe_s = _lower_better_score(work["track_input_pe"])
+    ps_s = _lower_better_score(work["track_input_ps"])
+    ev_s = _lower_better_score(work["track_input_ev_ebitda"])
+    valid_pe = pe_s.notna()
+    valid_ps = ps_s.notna()
+    valid_ev = ev_s.notna()
+    val_count = valid_pe.astype(int) + valid_ps.astype(int) + valid_ev.astype(int)
+    work["track_A_valuation_valid_count"] = val_count.astype(float)
+
+    den = valid_pe.astype(float) * 0.4 + valid_ps.astype(float) * 0.3 + valid_ev.astype(float) * 0.3
+    num = pe_s.fillna(0.0) * 0.4 + ps_s.fillna(0.0) * 0.3 + ev_s.fillna(0.0) * 0.3
+    work["track_input_v_market_proxy"] = np.where((val_count >= 2) & (den > 0), num / den, np.nan)
+    return work
 
 
 def _save_df(df: pd.DataFrame, parquet_path: Path, csv_path: Path) -> None:
@@ -127,23 +204,37 @@ def _build_track_reason(df: pd.DataFrame) -> pd.Series:
     reasons: list[str] = []
     for _, r in df.iterrows():
         if bool(r.get("is_track_B_candidate", False)):
-            reasons.append("B: Q>=80,R>=70,S>=70,ROIC>=15")
+            reasons.append("B: raw quality/risk/stability pass")
             continue
         if bool(r.get("is_track_C_candidate", False)):
-            reasons.append("C: Revenue YoY>=20, Rule of 40>=30")
+            reasons.append("C: Revenue YoY>=20 and rule_of_40_calc>=30")
             continue
         if bool(r.get("is_track_A_candidate", False)):
-            reasons.append("A: V>=70, V_market>=50")
+            reasons.append("A: v_market_proxy>=70")
             continue
 
         missing: list[str] = []
-        for c in ("track_input_roic", "track_input_revenue_yoy", "track_input_rule_of_40", "track_input_v_market"):
+        for c in (
+            "track_input_roic",
+            "track_input_oper_margin",
+            "track_input_ocf_ni",
+            "track_input_revenue_yoy",
+            "track_input_debt_to_equity",
+            "track_input_current_ratio",
+            "track_input_interest_coverage",
+            "track_input_beta",
+            "track_input_pe",
+            "track_input_ps",
+            "track_input_ev_ebitda",
+            "track_input_rule_of_40_calc",
+            "track_input_v_market_proxy",
+        ):
             if pd.isna(pd.to_numeric(r.get(c), errors="coerce")):
                 missing.append(c.replace("track_input_", ""))
         if missing:
             reasons.append("N: missing_inputs=" + ",".join(missing))
         else:
-            reasons.append("N: thresholds_not_met")
+            reasons.append("N: no raw-track condition met")
     return pd.Series(reasons, index=df.index, dtype=object)
 
 
@@ -159,7 +250,22 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
     out = df_cat[["symbol", "as_of_date"]].copy()
     out["symbol"] = out["symbol"].astype(str).str.strip().str.upper()
     out["as_of_date"] = pd.to_datetime(out["as_of_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    for c in ("track_input_roic", "track_input_revenue_yoy", "track_input_rule_of_40", "track_input_v_market"):
+    for c in (
+        "track_input_roic",
+        "track_input_oper_margin",
+        "track_input_ocf_ni",
+        "track_input_revenue_yoy",
+        "track_input_debt_to_equity",
+        "track_input_current_ratio",
+        "track_input_interest_coverage",
+        "track_input_beta",
+        "track_input_pe",
+        "track_input_ps",
+        "track_input_ev_ebitda",
+        "track_input_rule_of_40_calc",
+        "track_A_valuation_valid_count",
+        "track_input_v_market_proxy",
+    ):
         if c in df_cat.columns:
             out[c] = pd.to_numeric(df_cat[c], errors="coerce")
 
@@ -188,29 +294,53 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
     out["final_evidence_track_C"] = np.nan
     out["final_score_track_C"] = _weighted_score(out, TRACK_WEIGHTS["track_C"]).astype(float)
 
-    # Track inputs from visible category scores.
-    out["track_input_V"] = pd.to_numeric(out["score_V"], errors="coerce")
-    out["track_input_Q"] = pd.to_numeric(out["score_Q"], errors="coerce")
-    out["track_input_R"] = pd.to_numeric(out["score_R"], errors="coerce")
-    out["track_input_S"] = pd.to_numeric(out["score_S"], errors="coerce")
-
-    # Track inputs from external raw-source join (snapshot), injected in main().
-    for c in ("track_input_roic", "track_input_revenue_yoy", "track_input_rule_of_40", "track_input_v_market"):
+    # Track inputs from factors_latest raw-source join, injected in main().
+    for c in (
+        "track_input_roic",
+        "track_input_oper_margin",
+        "track_input_ocf_ni",
+        "track_input_revenue_yoy",
+        "track_input_debt_to_equity",
+        "track_input_current_ratio",
+        "track_input_interest_coverage",
+        "track_input_beta",
+        "track_input_pe",
+        "track_input_ps",
+        "track_input_ev_ebitda",
+        "track_input_rule_of_40_calc",
+        "track_A_valuation_valid_count",
+        "track_input_v_market_proxy",
+    ):
         if c not in out.columns:
             out[c] = np.nan
 
-    q = pd.to_numeric(out["track_input_Q"], errors="coerce")
-    r = pd.to_numeric(out["track_input_R"], errors="coerce")
-    s = pd.to_numeric(out["track_input_S"], errors="coerce")
-    v = pd.to_numeric(out["track_input_V"], errors="coerce")
     roic = pd.to_numeric(out["track_input_roic"], errors="coerce")
+    opm = pd.to_numeric(out["track_input_oper_margin"], errors="coerce")
+    ocf_ni = pd.to_numeric(out["track_input_ocf_ni"], errors="coerce")
     rev = pd.to_numeric(out["track_input_revenue_yoy"], errors="coerce")
-    rule40 = pd.to_numeric(out["track_input_rule_of_40"], errors="coerce")
-    v_market = pd.to_numeric(out["track_input_v_market"], errors="coerce")
+    debt = pd.to_numeric(out["track_input_debt_to_equity"], errors="coerce")
+    current = pd.to_numeric(out["track_input_current_ratio"], errors="coerce")
+    icov = pd.to_numeric(out["track_input_interest_coverage"], errors="coerce")
+    beta = pd.to_numeric(out["track_input_beta"], errors="coerce")
+    rule40 = pd.to_numeric(out["track_input_rule_of_40_calc"], errors="coerce")
+    v_proxy = pd.to_numeric(out["track_input_v_market_proxy"], errors="coerce")
+    val_count = pd.to_numeric(out["track_A_valuation_valid_count"], errors="coerce").fillna(0.0)
 
-    out["is_track_B_candidate"] = ((q >= 80.0) & (r >= 70.0) & (s >= 70.0) & (roic >= 15.0)).astype(bool)
+    quality_count = (roic >= 15.0).astype(int) + (opm >= 10.0).astype(int) + (ocf_ni >= 0.8).astype(int)
+    risk_count = (debt <= 1.0).astype(int) + (current >= 1.5).astype(int) + (icov >= 3.0).astype(int)
+    stability_pass = (beta <= 1.2)
+    out["track_B_quality_pass"] = (quality_count >= 2).astype(bool)
+    out["track_B_risk_pass"] = (risk_count >= 2).astype(bool)
+    out["track_B_stability_pass"] = stability_pass.astype(bool)
+
+    out["is_track_B_candidate"] = (
+        out["track_B_quality_pass"]
+        & out["track_B_risk_pass"]
+        & out["track_B_stability_pass"]
+        & (roic >= 15.0)
+    ).astype(bool)
     out["is_track_C_candidate"] = ((rev >= 20.0) & (rule40 >= 30.0)).astype(bool)
-    out["is_track_A_candidate"] = ((v >= 70.0) & (v_market >= 50.0)).astype(bool)
+    out["is_track_A_candidate"] = ((v_proxy >= 70.0) & (val_count >= 2.0)).astype(bool)
 
     out["assigned_track"] = np.select(
         [
@@ -286,17 +416,26 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         "final_evidence_R",
         "final_evidence_S",
         "track_reason",
+        "track_B_quality_pass",
+        "track_B_risk_pass",
+        "track_B_stability_pass",
+        "track_A_valuation_valid_count",
         "is_track_A_candidate",
         "is_track_B_candidate",
         "is_track_C_candidate",
-        "track_input_V",
-        "track_input_Q",
-        "track_input_R",
-        "track_input_S",
         "track_input_roic",
+        "track_input_oper_margin",
+        "track_input_ocf_ni",
         "track_input_revenue_yoy",
-        "track_input_rule_of_40",
-        "track_input_v_market",
+        "track_input_debt_to_equity",
+        "track_input_current_ratio",
+        "track_input_interest_coverage",
+        "track_input_beta",
+        "track_input_pe",
+        "track_input_ps",
+        "track_input_ev_ebitda",
+        "track_input_rule_of_40_calc",
+        "track_input_v_market_proxy",
         "investment_warning",
         "hard_stop_triggered",
         "main_coverage_V",
@@ -329,15 +468,12 @@ def main(input_dir: str | Path = "output", output_dir: str | Path = "output/scor
         return
 
     df = finalize_scoring_wide_input_df(df, label="build_final_vqgrs_scores")
-    track_inputs = _load_track_inputs_from_snapshot(input_dir)
-    if not track_inputs.empty:
-        print(f"Track input rows from snapshot: {len(track_inputs)}")
-        df = df.copy()
-        df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
-        df["as_of_date"] = pd.to_datetime(df["as_of_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-        df = df.merge(track_inputs, on=["symbol", "as_of_date"], how="left")
-    else:
-        print("WARNING: No track raw inputs found in snapshot; C/A track conditions use conservative missing=False.")
+    track_inputs = _load_track_inputs_from_factors_latest()
+    print(f"Track input rows from factors_latest.parquet: {len(track_inputs)}")
+    df = df.copy()
+    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+    df["as_of_date"] = pd.to_datetime(df["as_of_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df = df.merge(track_inputs, on=["symbol", "as_of_date"], how="left")
     print(f"Input category rows: {len(df)}")
     out = build_final_vqgrs_scores_df(df)
     print(f"Output final-score rows: {len(out)}")
