@@ -251,6 +251,60 @@ def _read_df(path: Path) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
+def _merge_sector_industry_from_group_unified(df: pd.DataFrame, group_unified_dir: Path) -> pd.DataFrame:
+    """
+    Attach sector/industry for hierarchical imputation (donor_imputation) from group_unified snapshot.
+    Prefers existing non-empty sector/industry on df; fills from unified where missing.
+    """
+    pq = group_unified_dir / "group_unified_snapshot_latest.parquet"
+    csv_path = group_unified_dir / "group_unified_snapshot_latest.csv"
+    uni = _read_df(pq)
+    if uni.empty:
+        uni = _read_df(csv_path)
+    if uni.empty or "symbol" not in uni.columns:
+        return df
+    if "sector" not in uni.columns and "industry" not in uni.columns:
+        return df
+
+    key_cols = ["symbol"]
+    if "as_of_date" in df.columns and "as_of_date" in uni.columns:
+        key_cols.append("as_of_date")
+
+    take = list(key_cols)
+    for c in ("sector", "industry"):
+        if c in uni.columns:
+            take.append(c)
+    sub = uni[take].drop_duplicates(subset=key_cols, keep="first")
+    ren = {}
+    if "sector" in sub.columns:
+        ren["sector"] = "sector_unified"
+    if "industry" in sub.columns:
+        ren["industry"] = "industry_unified"
+    sub = sub.rename(columns=ren)
+
+    left = df.copy()
+    if "as_of_date" in key_cols:
+        left["as_of_date"] = pd.to_datetime(left["as_of_date"], errors="coerce")
+        sub["as_of_date"] = pd.to_datetime(sub["as_of_date"], errors="coerce")
+
+    out = left.merge(sub, on=key_cols, how="left")
+
+    def _fill_from_unified(col: str, ucol: str) -> None:
+        if ucol not in out.columns:
+            return
+        if col not in out.columns:
+            out[col] = out[ucol]
+        else:
+            s = out[col].astype(str).str.strip()
+            empty = out[col].isna() | s.eq("") | s.str.lower().isin(("nan", "none"))
+            out.loc[empty, col] = out.loc[empty, ucol]
+        out.drop(columns=[ucol], inplace=True, errors="ignore")
+
+    _fill_from_unified("sector", "sector_unified")
+    _fill_from_unified("industry", "industry_unified")
+    return out
+
+
 def _infer_group_type_from_columns(df: pd.DataFrame) -> pd.DataFrame:
     if "group_type" in df.columns:
         return df
@@ -460,6 +514,7 @@ def main(input_dir: str | Path = "output", output_dir: str | Path = "output/scor
         df["adjusted_evidence"] = pd.NA
     if "confidence" not in df.columns:
         df["confidence"] = pd.NA
+    df = _merge_sector_industry_from_group_unified(df, input_dir / "group_unified")
     df = _enrich_imputed_scores(df, priors_df)
     scores_df = _aggregate_symbol_factor_scores(df)
     print(f"Input rows: {rows_in}")

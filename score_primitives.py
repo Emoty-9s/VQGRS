@@ -530,8 +530,5 @@ def score_one_factor_one_group(
 
 
 # Donor helpers (factor-score dimension; optional for downstream batch wiring).
-from donor_imputation import (  # noqa: E402
-    estimate_missing_factor_score_from_donors,
-    find_donor_candidates,
-)
+from donor_imputation import estimate_missing_factor_score_from_donors  # noqa: E402
 

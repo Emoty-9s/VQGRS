@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Donor-based auxiliary factor score estimation (factor-score dimension only).
+Hierarchical mean (median) imputation for missing factor evidence — VQGRS 3.3 transparency.
 
-Does not reconstruct raw fundamentals. Intended for use after group_factor_scores
-long table exists; not wired into score_one_factor_one_group by default.
+Sector → industry peer medians (min 3 peers each); no k-NN / similarity distance.
+Does not reconstruct raw fundamentals. Used after group_factor_scores long table exists.
 """
 from __future__ import annotations
 
@@ -12,66 +12,90 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-# Optional similarity columns (use only those present in base_df and target_row).
-DONOR_SIMILARITY_COLS: tuple[str, ...] = (
-    "Market Cap",
-    "Revenue YoY",
-    "Oper. Margin",
-    "Debt/Eq",
-    "Beta",
-)
+# Minimum peer count (excluding target symbol) to impute from sector or industry cohort.
+MIN_PEER_COUNT = 3
+# Imputed values are not observed; cap confidence so shrink stays near neutral prior.
+IMPUTED_DONOR_CONFIDENCE_CAP = 0.1
 
 
-def _target_has_col(target_row: Mapping[str, Any] | Any, col: str) -> bool:
-    if hasattr(target_row, "index") and col in getattr(target_row, "index", []):
-        return True
-    if isinstance(target_row, dict) and col in target_row:
-        return True
-    return False
-
-
-def _normalize_gt_cat(val: Any) -> str:
+def _normalize_cat(val: Any) -> str:
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return ""
-    s = str(val).strip()
-    return s
+    return str(val).strip()
 
 
-def find_donor_candidates(
+def _sector_from_row(row: Mapping[str, Any] | Any) -> str:
+    from score_primitives import _row_get
+
+    for key in ("sector", "group_a_sector"):
+        v = _row_get(row, key)
+        s = _normalize_cat(v)
+        if s:
+            return s
+    return ""
+
+
+def _industry_from_row(row: Mapping[str, Any] | Any) -> str:
+    from score_primitives import _row_get
+
+    for key in ("industry", "group_a_industry"):
+        v = _row_get(row, key)
+        s = _normalize_cat(v)
+        if s:
+            return s
+    return ""
+
+
+def _sector_series(df: pd.DataFrame) -> pd.Series:
+    if "sector" in df.columns:
+        s = df["sector"]
+    elif "group_a_sector" in df.columns:
+        s = df["group_a_sector"]
+    else:
+        s = pd.Series(np.nan, index=df.index)
+    return s.fillna("").astype(str).map(_normalize_cat)
+
+
+def _industry_series(df: pd.DataFrame) -> pd.Series:
+    if "industry" in df.columns:
+        s = df["industry"]
+    elif "group_a_industry" in df.columns:
+        s = df["group_a_industry"]
+    else:
+        s = pd.Series(np.nan, index=df.index)
+    return s.fillna("").astype(str).map(_normalize_cat)
+
+
+def _prepare_peer_pool(
     base_df: pd.DataFrame,
-    target_row: Mapping[str, Any] | Any,
     factor_name: str,
-    max_donors: int = 20,
+    target_row: Mapping[str, Any] | Any,
 ) -> pd.DataFrame:
-    """
-    Select donor rows (other symbols) with valid adjusted evidence/score for the same factor.
+    """Same factor, valid evidence or score, excluding target symbol."""
+    from score_primitives import _row_get
 
-    Priority: same group_type, then same category, then mean absolute standardized
-    difference on available similarity columns (lower is closer).
-    """
-    from score_primitives import _row_get, safe_to_float
-
-    if base_df is None or base_df.empty or max_donors <= 0:
-        return pd.DataFrame()
-
-    if "factor_name" not in base_df.columns:
+    fn = str(factor_name)
+    if base_df is None or base_df.empty or "factor_name" not in base_df.columns:
         return pd.DataFrame()
     if "symbol" not in base_df.columns:
         return pd.DataFrame()
 
-    fn = str(factor_name)
     work = base_df[base_df["factor_name"].astype(str) == fn].copy()
     if work.empty:
         return pd.DataFrame()
 
-    if "adjusted_evidence" in work.columns:
-        work["adjusted_evidence"] = pd.to_numeric(work["adjusted_evidence"], errors="coerce")
-        ok = work["adjusted_evidence"].notna()
-    elif "adjusted_score" in work.columns:
-        work["adjusted_score"] = pd.to_numeric(work["adjusted_score"], errors="coerce")
-        ok = work["adjusted_score"].notna()
-    else:
-        return pd.DataFrame()
+    ev = (
+        pd.to_numeric(work["adjusted_evidence"], errors="coerce")
+        if "adjusted_evidence" in work.columns
+        else pd.Series(np.nan, index=work.index)
+    )
+    sc = (
+        pd.to_numeric(work["adjusted_score"], errors="coerce")
+        if "adjusted_score" in work.columns
+        else pd.Series(np.nan, index=work.index)
+    )
+    ok = ev.notna() | sc.notna()
+
     if "is_valid_score" in work.columns:
         iv = work["is_valid_score"]
         if iv.dtype == object:
@@ -82,61 +106,87 @@ def find_donor_candidates(
             )
         else:
             ok = ok & iv.fillna(0).astype(bool)
-    work = work.loc[ok]
+
+    work = work.loc[ok].copy()
     if work.empty:
         return pd.DataFrame()
 
-    tsym = _row_get(target_row, "symbol")
-    if tsym is not None and str(tsym).strip() != "":
-        work = work[work["symbol"].astype(str) != str(tsym).strip()]
+    tsym = str(_row_get(target_row, "symbol")).strip().upper()
+    work = work[work["symbol"].astype(str).str.strip().str.upper() != tsym]
     if work.empty:
         return pd.DataFrame()
 
-    if "group_type" not in work.columns:
-        work["group_type"] = "ALL"
-    if "category" not in work.columns:
-        work["category"] = ""
+    work["_sec"] = _sector_series(work)
+    work["_ind"] = _industry_series(work)
+    return work
 
-    tgt_gt = _normalize_gt_cat(_row_get(target_row, "group_type"))
-    tgt_cat = _normalize_gt_cat(_row_get(target_row, "category"))
 
-    work["_same_gt"] = work["group_type"].map(_normalize_gt_cat) == tgt_gt
-    work["_same_cat"] = work["category"].fillna("").astype(str) == tgt_cat
+def _median_dispersion(vals: pd.Series) -> tuple[float, float]:
+    v = pd.to_numeric(vals, errors="coerce").dropna()
+    n = int(len(v))
+    if n == 0:
+        return float("nan"), 0.0
+    med = float(v.median())
+    disp = float(v.std(ddof=0)) if n > 1 else 0.0
+    return med, disp
 
-    aux_cols = [c for c in DONOR_SIMILARITY_COLS if c in work.columns and _target_has_col(target_row, c)]
-    n = len(work)
-    dist = np.zeros(n, dtype=float)
 
-    if aux_cols:
-        used_cols = 0
-        for c in aux_cols:
-            col_vals = pd.to_numeric(work[c], errors="coerce")
-            mu = float(col_vals.mean())
-            sig = float(col_vals.std(ddof=0))
-            if sig < 1e-12:
-                continue
-            t = safe_to_float(_row_get(target_row, c))
-            if t is None:
-                continue
-            used_cols += 1
-            z_t = (t - mu) / sig
-            z_i = (col_vals - mu) / sig
-            dist += np.abs(z_t - z_i.to_numpy(dtype=float))
-        if used_cols > 0:
-            dist /= float(used_cols)
-    else:
-        dist[:] = 0.0
+def _cohort_median_imputation(
+    sub: pd.DataFrame,
+    method: str,
+) -> dict[str, Any] | None:
+    """
+    Prefer median(adjusted_evidence) with >= MIN_PEER_COUNT rows; else median(adjusted_score).
+    """
+    from score_primitives import evidence_to_score, score_to_evidence_approx
 
-    work["_dist"] = dist
-    work = work.sort_values(
-        by=["_same_gt", "_same_cat", "_dist"],
-        ascending=[False, False, True],
-        kind="mergesort",
+    if sub.empty:
+        return None
+
+    ev = (
+        pd.to_numeric(sub["adjusted_evidence"], errors="coerce")
+        if "adjusted_evidence" in sub.columns
+        else pd.Series(np.nan, index=sub.index)
     )
-    out = work.head(int(max_donors)).copy()
-    drop_cols = [x for x in out.columns if str(x).startswith("_")]
-    out = out.drop(columns=drop_cols, errors="ignore")
-    return out
+    ce = sub.loc[ev.notna()]
+    if len(ce) >= MIN_PEER_COUNT:
+        med, disp = _median_dispersion(ce["adjusted_evidence"])
+        if np.isnan(med):
+            return None
+        return {
+            "donor_score_estimate": float(evidence_to_score(med)),
+            "donor_evidence_estimate": float(med),
+            "donor_count": int(len(ce)),
+            "donor_dispersion": float(disp),
+            "donor_confidence": float(IMPUTED_DONOR_CONFIDENCE_CAP),
+            "donor_method": method,
+            "donor_missing_reason": None,
+        }
+
+    sc = (
+        pd.to_numeric(sub["adjusted_score"], errors="coerce")
+        if "adjusted_score" in sub.columns
+        else pd.Series(np.nan, index=sub.index)
+    )
+    cs = sub.loc[sc.notna()]
+    if len(cs) >= MIN_PEER_COUNT:
+        med, disp = _median_dispersion(cs["adjusted_score"])
+        if np.isnan(med):
+            return None
+        med_ev = score_to_evidence_approx(med, beta=0.7)
+        if med_ev is None:
+            med_ev = 0.0
+        return {
+            "donor_score_estimate": float(med),
+            "donor_evidence_estimate": float(med_ev),
+            "donor_count": int(len(cs)),
+            "donor_dispersion": float(disp),
+            "donor_confidence": float(IMPUTED_DONOR_CONFIDENCE_CAP),
+            "donor_method": method,
+            "donor_missing_reason": None,
+        }
+
+    return None
 
 
 def estimate_missing_factor_score_from_donors(
@@ -147,11 +197,16 @@ def estimate_missing_factor_score_from_donors(
     max_donors: int = 20,
 ) -> dict[str, Any]:
     """
-    Median donor adjusted evidence (preferred) / score (fallback) + confidence (0~1).
+    Hierarchical median imputation: same-sector peers, then same-industry, then prior fallback.
 
-    structural_missing: no donor math; donor_method='structural_skip'.
+    Returns donor_evidence_estimate when imputation applies; else None so downstream uses prior.
+    donor_confidence is capped at IMPUTED_DONOR_CONFIDENCE_CAP.
+
+    structural_missing: no imputation; donor_method='structural_skip'.
     """
-    from score_primitives import _structural_missing_from_row, clip_value
+    from score_primitives import _structural_missing_from_row
+
+    _ = max_donors  # API compatibility; hierarchical imputation does not use k-NN.
 
     fn = str(getattr(factor_spec, "name", "") or factor_name)
 
@@ -177,54 +232,37 @@ def estimate_missing_factor_score_from_donors(
             "donor_missing_reason": "structural_missing",
         }
 
-    donors = find_donor_candidates(base_df, target_row, fn, max_donors=max_donors)
-    if donors.empty:
+    work = _prepare_peer_pool(base_df, fn, target_row)
+    if work.empty:
         return {
             "donor_score_estimate": None,
             "donor_evidence_estimate": None,
             "donor_count": 0,
             "donor_dispersion": None,
             "donor_confidence": 0.0,
-            "donor_method": "median_donors",
-            "donor_missing_reason": "no_donors",
+            "donor_method": "no_valid_peer_avg",
+            "donor_missing_reason": "no_peer_pool",
         }
 
-    evidences = pd.to_numeric(donors.get("adjusted_evidence"), errors="coerce").dropna() if "adjusted_evidence" in donors.columns else pd.Series(dtype=float)
-    scores = pd.to_numeric(donors.get("adjusted_score"), errors="coerce").dropna() if "adjusted_score" in donors.columns else pd.Series(dtype=float)
-    base = evidences if not evidences.empty else scores
-    if base.empty:
-        return {
-            "donor_score_estimate": None,
-            "donor_evidence_estimate": None,
-            "donor_count": 0,
-            "donor_dispersion": None,
-            "donor_confidence": 0.0,
-            "donor_method": "median_donors",
-            "donor_missing_reason": "no_valid_donor_scores",
-        }
+    tgt_sec = _sector_from_row(target_row)
+    tgt_ind = _industry_from_row(target_row)
 
-    n = int(len(base))
-    med = float(base.median())
-    std = float(base.std(ddof=0)) if n > 1 else 0.0
-    q25 = float(base.quantile(0.25))
-    q75 = float(base.quantile(0.75))
-    iqr = max(q75 - q25, 0.0)
-    # Combine std and IQR scale (scores are ~0–100): higher spread lowers confidence.
-    dispersion = float(max(std, iqr / 1.349)) if n > 1 else 0.0
+    if tgt_sec:
+        m = _cohort_median_imputation(work.loc[work["_sec"] == tgt_sec], "imputed_sector_avg")
+        if m is not None:
+            return m
 
-    conf_n = min(1.0, n / float(max(1, max_donors)))
-    # Penalize wide donor score spread; ~15 score points ~ moderate.
-    spread_penalty = 1.0 / (1.0 + dispersion / 15.0)
-    if n < 3:
-        conf_n *= 0.65
-    donor_confidence = float(clip_value(conf_n * spread_penalty, 0.0, 1.0))
+    if tgt_ind:
+        m = _cohort_median_imputation(work.loc[work["_ind"] == tgt_ind], "imputed_industry_avg")
+        if m is not None:
+            return m
 
     return {
-        "donor_score_estimate": float(scores.median()) if not scores.empty else None,
-        "donor_evidence_estimate": float(evidences.median()) if not evidences.empty else None,
-        "donor_count": n,
-        "donor_dispersion": dispersion,
-        "donor_confidence": donor_confidence,
-        "donor_method": "median_donors",
-        "donor_missing_reason": None,
+        "donor_score_estimate": None,
+        "donor_evidence_estimate": None,
+        "donor_count": 0,
+        "donor_dispersion": None,
+        "donor_confidence": 0.0,
+        "donor_method": "no_valid_peer_avg",
+        "donor_missing_reason": "no_valid_peer_avg",
     }
