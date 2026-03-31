@@ -27,7 +27,7 @@ from score_primitives import score_one_factor_one_group
 
 GROUP_TYPES = ["A", "B", "C", "D", "E"]
 
-# Long-table columns that downstream expects from score_one_factor_one_group.
+# Long-table columns from score_one_factor_one_group (hybrid fields optional-safe via pd.NA fill below).
 REQUIRED_SCORE_DETAIL_COLS: tuple[str, ...] = (
     "raw_evidence",
     "prior_evidence",
@@ -36,6 +36,11 @@ REQUIRED_SCORE_DETAIL_COLS: tuple[str, ...] = (
     "confidence",
     "raw_score",
     "adjusted_score",
+    "relative_evidence",
+    "absolute_evidence",
+    "absolute_weight",
+    "blend_method",
+    "absolute_enabled",
     "missing_reason",
     "is_valid_score",
     "raw_value",

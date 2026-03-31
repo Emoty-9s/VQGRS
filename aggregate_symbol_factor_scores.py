@@ -25,6 +25,23 @@ from score_primitives import evidence_to_score, score_to_evidence_approx
 
 GROUP_TYPES = ["A", "B", "C", "D", "E"]
 
+# From group_factor_scores (score_one_factor_one_group); not recomputed here — only carried or cleared.
+HYBRID_TRANSPARENCY_COLS: tuple[str, ...] = (
+    "relative_evidence",
+    "absolute_evidence",
+    "absolute_weight",
+    "blend_method",
+    "absolute_enabled",
+)
+
+
+def _clear_hybrid_transparency_columns(out: pd.DataFrame, idx: Any) -> None:
+    """Imputed rows must not carry group-level hybrid diagnostics as if they were observed."""
+    for c in HYBRID_TRANSPARENCY_COLS:
+        if c in out.columns:
+            out.loc[idx, c] = pd.NA
+
+
 def _load_missing_priors(scoring_dir: Path) -> pd.DataFrame:
     """Prefer parquet; fallback to csv. Empty if neither exists."""
     p = scoring_dir / "missing_priors_latest.parquet"
@@ -139,6 +156,9 @@ def _enrich_imputed_scores(df: pd.DataFrame, priors_df: pd.DataFrame) -> pd.Data
         out["n_valid"] = pd.NA
     if "adjusted_evidence" not in out.columns:
         out["adjusted_evidence"] = pd.NA
+    for c in HYBRID_TRANSPARENCY_COLS:
+        if c not in out.columns:
+            out[c] = pd.NA
 
     idx_list = list(out.index)
     for j, idx in enumerate(idx_list):
@@ -164,6 +184,7 @@ def _enrich_imputed_scores(df: pd.DataFrame, priors_df: pd.DataFrame) -> pd.Data
             sl[j] = 0.0
             dcf[j] = 0.0
             dc[j] = 0.0
+            _clear_hybrid_transparency_columns(out, idx)
             continue
 
         pe, _pl = _lookup_prior_score(priors_df, fn, cat, gt)
@@ -192,6 +213,7 @@ def _enrich_imputed_scores(df: pd.DataFrame, priors_df: pd.DataFrame) -> pd.Data
             out.loc[idx, "confidence"] = _imputation_confidence(0.0, 0.0)
             out.loc[idx, "is_valid_score"] = True
             sl[j] = lambda_f
+            _clear_hybrid_transparency_columns(out, idx)
             continue
         elif d_est is not None and not (isinstance(d_est, float) and np.isnan(d_est)):
             lambda_raw = float(np.clip(dconf * avail, 0.0, 1.0))
@@ -211,6 +233,7 @@ def _enrich_imputed_scores(df: pd.DataFrame, priors_df: pd.DataFrame) -> pd.Data
         out.loc[idx, "adjusted_score"] = evidence_to_score(float(fe))
         out.loc[idx, "confidence"] = _imputation_confidence(lambda_f, dconf if d_est is not None else 0.0)
         out.loc[idx, "is_valid_score"] = True
+        _clear_hybrid_transparency_columns(out, idx)
 
     out["factor_source_row"] = src
     out["prior_evidence"] = pp
@@ -387,6 +410,13 @@ def _aggregate_symbol_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
         agg_spec["shrink_lambda"] = "mean"
     if "donor_count" in df.columns:
         agg_spec["donor_count"] = "max"
+    for c in HYBRID_TRANSPARENCY_COLS:
+        if c not in df.columns:
+            continue
+        if c in ("blend_method", "absolute_enabled"):
+            agg_spec[c] = "first"
+        else:
+            agg_spec[c] = "mean"
     for g in GROUP_TYPES:
         agg_spec[f"group_evidence_{g}"] = "first"
         agg_spec[f"weight_{g}"] = "sum"
@@ -461,6 +491,11 @@ def _aggregate_symbol_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
         "donor_count",
         "donor_confidence",
         "shrink_lambda",
+        "relative_evidence",
+        "absolute_evidence",
+        "absolute_weight",
+        "blend_method",
+        "absolute_enabled",
         "final_factor_evidence",
         "final_factor_score",
         "valid_group_count",

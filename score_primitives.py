@@ -92,6 +92,102 @@ def compute_signed_evidence(
     return sign * (raw_value - median_value) / denom
 
 
+def compute_absolute_evidence(
+    raw_value: float | None,
+    direction: str,
+    good: float | None,
+    neutral: float | None,
+    bad: float | None,
+    cap: float,
+    mode: str | None,
+) -> float | None:
+    """
+    Piecewise-linear absolute (anchor) evidence with neutral=0, clipped to [-cap, +cap].
+
+    - higher_better: requires bad < neutral < good (raw increases toward "good").
+    - lower_better: requires good < neutral < bad (raw decreases toward "good").
+
+    If anchors are missing or ordering is invalid, returns None.
+    ``mode`` reserved for future variants; None / piecewise_linear / anchor_band use the same mapping.
+    """
+    if raw_value is None:
+        return None
+    if direction not in ("higher_better", "lower_better"):
+        return None
+    if good is None or neutral is None or bad is None:
+        return None
+    c = float(cap)
+    if c <= 0.0 or math.isnan(c) or math.isinf(c):
+        return None
+
+    g, n, b = float(good), float(neutral), float(bad)
+    if any(math.isnan(x) or math.isinf(x) for x in (g, n, b, float(raw_value))):
+        return None
+
+    _mode = (mode or "").strip().lower() if isinstance(mode, str) else ""
+    if _mode not in ("", "piecewise_linear", "anchor_band"):
+        return None
+
+    x = float(raw_value)
+
+    def _lin(x0: float, x1: float, y0: float, y1: float, t: float) -> float:
+        if x1 == x0:
+            return y0
+        u = (t - x0) / (x1 - x0)
+        return y0 + u * (y1 - y0)
+
+    ev: float
+    if direction == "higher_better":
+        if not (b < n < g):
+            return None
+        if x <= b:
+            ev = -c
+        elif x < n:
+            ev = _lin(b, n, -c, 0.0, x)
+        elif x < g:
+            ev = _lin(n, g, 0.0, c, x)
+        else:
+            ev = c
+    else:
+        # lower_better: good < neutral < bad
+        if not (g < n < b):
+            return None
+        if x <= g:
+            ev = c
+        elif x < n:
+            ev = _lin(g, n, c, 0.0, x)
+        elif x < b:
+            ev = _lin(n, b, 0.0, -c, x)
+        else:
+            ev = -c
+
+    return float(clip_value(ev, -c, c))
+
+
+def blend_evidences(
+    relative_evidence: float | None,
+    absolute_evidence: float | None,
+    absolute_weight: float | None,
+) -> tuple[float | None, str]:
+    """
+    Combine relative and absolute evidence. ``absolute_weight`` is clipped to [0, 1].
+
+    Returns (blended_evidence_or_None, blend_method).
+    """
+    w = 0.0 if absolute_weight is None else float(absolute_weight)
+    w = float(clip_value(w, 0.0, 1.0))
+    rel = relative_evidence
+    abs_e = absolute_evidence
+    if rel is None and abs_e is None:
+        return None, "none"
+    if rel is None and abs_e is not None:
+        return float(abs_e), "absolute_only"
+    if rel is not None and abs_e is None:
+        return float(rel), "relative_only"
+    blended = (1.0 - w) * float(rel) + w * float(abs_e)
+    return float(blended), "weighted_blend"
+
+
 def robust_z_to_score(
     robust_z: float | None,
     clip_z: float = 3.0,
@@ -268,6 +364,11 @@ def _base_score_dict(
     adjusted_evidence: float | None = None,
     evidence_source: str | None = None,
     evidence_beta: float | None = None,
+    relative_evidence: float | None = None,
+    absolute_evidence: float | None = None,
+    absolute_weight: float | None = None,
+    blend_method: str | None = None,
+    absolute_enabled: bool | None = None,
 ) -> dict[str, Any]:
     return {
         "factor_name": factor_name,
@@ -290,6 +391,11 @@ def _base_score_dict(
         "adjusted_evidence": adjusted_evidence,
         "evidence_source": evidence_source,
         "evidence_beta": evidence_beta,
+        "relative_evidence": relative_evidence,
+        "absolute_evidence": absolute_evidence,
+        "absolute_weight": absolute_weight,
+        "blend_method": blend_method,
+        "absolute_enabled": absolute_enabled,
     }
 
 
@@ -323,6 +429,9 @@ def score_one_factor_one_group(
     category = str(getattr(factor_spec, "category", None) or "")
     direction = str(getattr(factor_spec, "direction", None) or "")
     enabled = bool(getattr(factor_spec, "enabled", True))
+    absolute_enabled_flag = bool(getattr(factor_spec, "absolute_enabled", False))
+    _aw_in = safe_to_float(getattr(factor_spec, "absolute_weight", None))
+    absolute_weight_eff = clip_value(float(_aw_in if _aw_in is not None else 0.0), 0.0, 1.0)
 
     rep_cols = get_rep_columns(factor_name) if factor_name else {}
 
@@ -380,6 +489,11 @@ def score_one_factor_one_group(
             adjusted_evidence=None,
             evidence_source="structural_missing",
             evidence_beta=evidence_beta,
+            relative_evidence=None,
+            absolute_evidence=None,
+            absolute_weight=absolute_weight_eff,
+            blend_method=None,
+            absolute_enabled=absolute_enabled_flag,
         )
 
     if not enabled:
@@ -404,6 +518,11 @@ def score_one_factor_one_group(
             adjusted_evidence=None,
             evidence_source="disabled_factor",
             evidence_beta=evidence_beta,
+            relative_evidence=None,
+            absolute_evidence=None,
+            absolute_weight=absolute_weight_eff,
+            blend_method=None,
+            absolute_enabled=absolute_enabled_flag,
         )
 
     if direction not in ("higher_better", "lower_better"):
@@ -428,13 +547,38 @@ def score_one_factor_one_group(
             adjusted_evidence=None,
             evidence_source="invalid_direction",
             evidence_beta=evidence_beta,
+            relative_evidence=None,
+            absolute_evidence=None,
+            absolute_weight=absolute_weight_eff,
+            blend_method=None,
+            absolute_enabled=absolute_enabled_flag,
         )
 
-    raw_evidence = compute_signed_evidence(
+    relative_evidence = compute_signed_evidence(
         raw_value=raw_value,
         median_value=median_value,
         iqr_value=iqr_value,
         direction=direction,
+    )
+    absolute_evidence: float | None = None
+    if absolute_enabled_flag:
+        _cap = safe_to_float(getattr(factor_spec, "absolute_cap", 3.0))
+        if _cap is None or _cap <= 0.0:
+            _cap = 3.0
+        absolute_evidence = compute_absolute_evidence(
+            raw_value=raw_value,
+            direction=direction,
+            good=safe_to_float(getattr(factor_spec, "absolute_good", None)),
+            neutral=safe_to_float(getattr(factor_spec, "absolute_neutral", None)),
+            bad=safe_to_float(getattr(factor_spec, "absolute_bad", None)),
+            cap=float(_cap),
+            mode=getattr(factor_spec, "absolute_mode", None),
+        )
+
+    raw_evidence, blend_method = blend_evidences(
+        relative_evidence,
+        absolute_evidence,
+        absolute_weight_eff,
     )
     robust_z = raw_evidence
 
@@ -463,6 +607,11 @@ def score_one_factor_one_group(
             adjusted_evidence=None,
             evidence_source="missing_evidence",
             evidence_beta=evidence_beta,
+            relative_evidence=relative_evidence,
+            absolute_evidence=absolute_evidence,
+            absolute_weight=absolute_weight_eff,
+            blend_method=blend_method,
+            absolute_enabled=absolute_enabled_flag,
         )
 
     raw_score = evidence_to_score(evidence=raw_evidence, beta=evidence_beta, clip_evidence=4.0)
@@ -488,6 +637,11 @@ def score_one_factor_one_group(
             adjusted_evidence=None,
             evidence_source="missing_evidence",
             evidence_beta=evidence_beta,
+            relative_evidence=relative_evidence,
+            absolute_evidence=absolute_evidence,
+            absolute_weight=absolute_weight_eff,
+            blend_method=blend_method,
+            absolute_enabled=absolute_enabled_flag,
         )
 
     confidence = compute_group_confidence(n_valid=n_valid, peer_quality=peer_quality)
@@ -526,6 +680,11 @@ def score_one_factor_one_group(
         adjusted_evidence=adjusted_evidence,
         evidence_source=evidence_source,
         evidence_beta=evidence_beta,
+        relative_evidence=relative_evidence,
+        absolute_evidence=absolute_evidence,
+        absolute_weight=absolute_weight_eff,
+        blend_method=blend_method,
+        absolute_enabled=absolute_enabled_flag,
     )
 
 

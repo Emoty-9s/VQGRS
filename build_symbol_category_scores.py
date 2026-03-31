@@ -7,6 +7,10 @@ Input:
 
 Output:
   - output/scoring/symbol_category_scores_latest.(parquet|csv)
+
+Evidence-first: category weights and main/aux splits use ``final_factor_evidence`` only (already
+group→symbol aggregated, including hybrid blended factor evidence). Extra transparency columns on
+the input, if present, are ignored here and do not affect groupby.
 """
 from __future__ import annotations
 
@@ -158,6 +162,7 @@ def _compute_category_block(df_factor_scores: pd.DataFrame, category: str) -> pd
         df_cat["factor_source"] = df_cat["factor_source"].fillna("unknown")
 
     df_cat["factor_weight"] = df_cat["factor_name"].map(lambda x: float(FACTOR_SPECS[x].weight))
+    # Hybrid factor path is sealed into final_factor_evidence upstream; no separate relative/absolute here.
     df_cat["final_factor_evidence"] = pd.to_numeric(df_cat["final_factor_evidence"], errors="coerce")
     valid = df_cat["final_factor_evidence"].notna()
     is_observed = df_cat["factor_source"].astype(str).str.strip().str.lower() == "observed"

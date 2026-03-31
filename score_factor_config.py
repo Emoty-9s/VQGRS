@@ -37,6 +37,14 @@ class FactorSpec:
     category_weight: float | None = None
     allow_donor_in_evidence: bool = True
     structural_missing_to_prior_only: bool = True
+    # Absolute (anchor) evaluation — factor-owned; hybrid relative+absolute uses these at factor stage.
+    absolute_enabled: bool = False
+    absolute_weight: float = 0.0
+    absolute_mode: str | None = None
+    absolute_good: float | None = None
+    absolute_neutral: float | None = None
+    absolute_bad: float | None = None
+    absolute_cap: float = 3.0
 
 
 def _spec(
@@ -62,6 +70,13 @@ def _spec(
     category_weight: float | None = None,
     allow_donor_in_evidence: bool = True,
     structural_missing_to_prior_only: bool = True,
+    absolute_enabled: bool | None = None,
+    absolute_weight: float | None = None,
+    absolute_mode: str | None = None,
+    absolute_good: float | None = None,
+    absolute_neutral: float | None = None,
+    absolute_bad: float | None = None,
+    absolute_cap: float | None = None,
 ) -> FactorSpec:
     # Main/aux importance tier + weight are derived from (category, name, enabled).
     # This enables downstream main-factor coverage handling without breaking existing config structure.
@@ -73,6 +88,37 @@ def _spec(
         if importance_tier == "main"
         else MAIN_AUX_WEIGHT_POLICY["aux_weight"]
     )
+    dcat = ABSOLUTE_DEFAULTS_BY_CATEGORY.get(category)
+    if is_main and dcat is not None:
+        if absolute_enabled is None:
+            absolute_enabled = True
+        if absolute_weight is None:
+            absolute_weight = float(dcat["absolute_weight"])
+        if absolute_mode is None:
+            absolute_mode = dcat.get("absolute_mode")
+        if absolute_good is None:
+            absolute_good = dcat.get("absolute_good")
+        if absolute_neutral is None:
+            absolute_neutral = dcat.get("absolute_neutral")
+        if absolute_bad is None:
+            absolute_bad = dcat.get("absolute_bad")
+        if absolute_cap is None:
+            absolute_cap = float(dcat.get("absolute_cap", 3.0))
+    else:
+        if absolute_enabled is None:
+            absolute_enabled = False
+        if absolute_weight is None:
+            absolute_weight = 0.0
+        if absolute_mode is None:
+            absolute_mode = None
+        if absolute_good is None:
+            absolute_good = None
+        if absolute_neutral is None:
+            absolute_neutral = None
+        if absolute_bad is None:
+            absolute_bad = None
+        if absolute_cap is None:
+            absolute_cap = 3.0
     return FactorSpec(
         name=name,
         category=category,
@@ -97,6 +143,13 @@ def _spec(
         category_weight=category_weight,
         allow_donor_in_evidence=allow_donor_in_evidence,
         structural_missing_to_prior_only=structural_missing_to_prior_only,
+        absolute_enabled=absolute_enabled,
+        absolute_weight=absolute_weight,
+        absolute_mode=absolute_mode,
+        absolute_good=absolute_good,
+        absolute_neutral=absolute_neutral,
+        absolute_bad=absolute_bad,
+        absolute_cap=absolute_cap,
     )
 
 
@@ -222,6 +275,51 @@ MAIN_FACTORS_BY_CATEGORY: dict[str, list[str]] = {
     "R": ["Debt/Eq", "Current Ratio", "Interest Coverage"],
     "S": ["Beta", "Volatility", "OPM volatility"],
     "STI": [],
+}
+
+# Category-level defaults for absolute evaluation. Merged in _spec() for main factors; resolved values live on FactorSpec.
+# Thresholds (good/neutral/bad) are placeholders until calibrated; scoring primitives consume FactorSpec fields only.
+ABSOLUTE_DEFAULTS_BY_CATEGORY: dict[str, dict[str, float | str | None]] = {
+    "V": {
+        "absolute_weight": 0.5,
+        "absolute_mode": "anchor_band",
+        "absolute_good": None,
+        "absolute_neutral": None,
+        "absolute_bad": None,
+        "absolute_cap": 3.0,
+    },
+    "Q": {
+        "absolute_weight": 0.5,
+        "absolute_mode": "anchor_band",
+        "absolute_good": None,
+        "absolute_neutral": None,
+        "absolute_bad": None,
+        "absolute_cap": 3.0,
+    },
+    "G": {
+        "absolute_weight": 0.5,
+        "absolute_mode": "anchor_band",
+        "absolute_good": None,
+        "absolute_neutral": None,
+        "absolute_bad": None,
+        "absolute_cap": 3.0,
+    },
+    "R": {
+        "absolute_weight": 0.5,
+        "absolute_mode": "anchor_band",
+        "absolute_good": None,
+        "absolute_neutral": None,
+        "absolute_bad": None,
+        "absolute_cap": 3.0,
+    },
+    "S": {
+        "absolute_weight": 0.5,
+        "absolute_mode": "anchor_band",
+        "absolute_good": None,
+        "absolute_neutral": None,
+        "absolute_bad": None,
+        "absolute_cap": 3.0,
+    },
 }
 
 

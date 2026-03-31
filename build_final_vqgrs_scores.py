@@ -8,6 +8,10 @@ Input:
 Output:
   - output/scoring/final_vqgrs_scores_latest.(parquet|csv)
 
+Per-track LTI: renormalized weighted average of ``final_evidence_V``…``final_evidence_S`` (same
+weight profiles as TRACK_WEIGHTS), then ``evidence_to_score`` — not a weighted average of category
+scores.
+
 Debug note:
   - A high category score with low main_coverage_* can indicate lower-confidence results.
     This pipeline is designed to be conservative when main indicators are missing.
@@ -21,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 from group_snapshot_utils import finalize_scoring_wide_input_df
+from score_primitives import evidence_to_score
 
 
 CORE_CATS = ["V", "Q", "G", "R", "S"]
@@ -186,18 +191,36 @@ def _save_df(df: pd.DataFrame, parquet_path: Path, csv_path: Path) -> None:
         print(f"WARNING: failed to save CSV: {csv_path} ({e})")
 
 
-def _weighted_score(df: pd.DataFrame, weights: dict[str, float]) -> pd.Series:
+def _weighted_evidence(df: pd.DataFrame, weights: dict[str, float]) -> pd.Series:
+    """
+    Renormalized weighted average of per-category ``final_evidence_*`` (same pattern as legacy
+    score weighting: NaN categories are excluded; weights over available categories renormalize).
+    """
     num = pd.Series(0.0, index=df.index, dtype=float)
     den = pd.Series(0.0, index=df.index, dtype=float)
     for cat, w in weights.items():
-        col = f"score_{cat}"
+        col = f"final_evidence_{cat}"
+        if col not in df.columns:
+            continue
         vals = pd.to_numeric(df[col], errors="coerce")
         valid = vals.notna()
         wf = float(w)
         num = num + vals.fillna(0.0) * wf
         den = den + np.where(valid, wf, 0.0)
-    out = pd.Series(np.where(den > 0.0, num / den, np.nan), index=df.index, dtype=float)
-    return out.clip(lower=0.0, upper=100.0)
+    return pd.Series(np.where(den > 0.0, num / den, np.nan), index=df.index, dtype=float)
+
+
+def _evidence_series_to_score(ev: pd.Series) -> pd.Series:
+    def _one(x: Any) -> float:
+        try:
+            if x is None or pd.isna(x):
+                return np.nan
+        except (TypeError, ValueError):
+            return np.nan
+        s = evidence_to_score(float(x))
+        return np.nan if s is None else float(s)
+
+    return ev.map(_one).astype(float)
 
 
 def _build_track_reason(df: pd.DataFrame) -> pd.Series:
@@ -242,7 +265,7 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
     if df_cat is None or df_cat.empty:
         return pd.DataFrame()
 
-    required = {"symbol", "as_of_date", *[f"score_{c}" for c in CORE_CATS]}
+    required = {"symbol", "as_of_date", *[f"final_evidence_{c}" for c in CORE_CATS]}
     missing = [c for c in required if c not in df_cat.columns]
     if missing:
         raise ValueError(f"Missing required input columns: {missing}")
@@ -270,9 +293,12 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
             out[c] = pd.to_numeric(df_cat[c], errors="coerce")
 
     for c in CORE_CATS:
-        out[f"final_evidence_{c}"] = pd.to_numeric(df_cat[f"final_evidence_{c}"], errors="coerce").fillna(0.0).astype(float)
+        out[f"final_evidence_{c}"] = pd.to_numeric(df_cat[f"final_evidence_{c}"], errors="coerce")
         score_col = f"score_{c}"
-        out[score_col] = pd.to_numeric(df_cat[score_col], errors="coerce").clip(lower=0.0, upper=100.0).astype(float)
+        if score_col in df_cat.columns:
+            out[score_col] = pd.to_numeric(df_cat[score_col], errors="coerce").clip(lower=0.0, upper=100.0).astype(float)
+        else:
+            out[score_col] = _evidence_series_to_score(out[f"final_evidence_{c}"])
 
         # Debug passthroughs (when present).
         mc = f"main_coverage_{c}"
@@ -282,17 +308,17 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         if ds in df_cat.columns:
             out[ds] = df_cat[ds].fillna("balanced").astype(object)
 
-    out["final_evidence_equal"] = np.nan
-    out["final_score_equal"] = _weighted_score(out, TRACK_WEIGHTS["equal"]).astype(float)
+    out["final_evidence_equal"] = _weighted_evidence(out, TRACK_WEIGHTS["equal"])
+    out["final_score_equal"] = _evidence_series_to_score(out["final_evidence_equal"])
 
-    out["final_evidence_track_A"] = np.nan
-    out["final_score_track_A"] = _weighted_score(out, TRACK_WEIGHTS["track_A"]).astype(float)
+    out["final_evidence_track_A"] = _weighted_evidence(out, TRACK_WEIGHTS["track_A"])
+    out["final_score_track_A"] = _evidence_series_to_score(out["final_evidence_track_A"])
 
-    out["final_evidence_track_B"] = np.nan
-    out["final_score_track_B"] = _weighted_score(out, TRACK_WEIGHTS["track_B"]).astype(float)
+    out["final_evidence_track_B"] = _weighted_evidence(out, TRACK_WEIGHTS["track_B"])
+    out["final_score_track_B"] = _evidence_series_to_score(out["final_evidence_track_B"])
 
-    out["final_evidence_track_C"] = np.nan
-    out["final_score_track_C"] = _weighted_score(out, TRACK_WEIGHTS["track_C"]).astype(float)
+    out["final_evidence_track_C"] = _weighted_evidence(out, TRACK_WEIGHTS["track_C"])
+    out["final_score_track_C"] = _evidence_series_to_score(out["final_evidence_track_C"])
 
     # Track inputs from factors_latest raw-source join, injected in main().
     for c in (
@@ -370,6 +396,7 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         default=pd.to_numeric(out["final_score_equal"], errors="coerce"),
     )
     out["final_score"] = pd.to_numeric(out["final_score"], errors="coerce").clip(lower=0.0, upper=100.0).astype(float)
+    # Method labels: profile names unchanged; aggregation is evidence-space then evidence_to_score.
     out["final_score_method"] = np.select(
         [
             out["assigned_track"] == "A",
