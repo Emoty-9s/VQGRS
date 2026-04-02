@@ -48,15 +48,41 @@ def _read_df(path: Path) -> pd.DataFrame:
 
 def _load_track_inputs_from_factors_latest() -> pd.DataFrame:
     """
-    Track raw input source (strict):
-      - data/factors_latest.parquet only
-      - no CSV fallback
-      - no snapshot fallback
+    Track raw input source with safe fallback:
+      - data/factors_latest.parquet
+      - if missing: data/factors_latest.csv
+      - if both missing/empty: return empty DataFrame with required columns
     """
-    path = Path("data") / "factors_latest.parquet"
-    if not path.exists():
-        raise FileNotFoundError(f"Required track raw source missing: {path}")
-    fac = pd.read_parquet(path)
+    pq_path = Path("data") / "factors_latest.parquet"
+    csv_path = Path("data") / "factors_latest.csv"
+
+    fac: pd.DataFrame
+    if pq_path.exists():
+        fac = pd.read_parquet(pq_path)
+    elif csv_path.exists():
+        fac = pd.read_csv(csv_path, low_memory=False)
+    else:
+        print(f"WARNING: track inputs missing: neither {pq_path} nor {csv_path} found. Using empty track inputs.")
+        return pd.DataFrame(
+            columns=[
+                "symbol",
+                "as_of_date",
+                "track_input_roic",
+                "track_input_oper_margin",
+                "track_input_ocf_ni",
+                "track_input_revenue_yoy",
+                "track_input_debt_to_equity",
+                "track_input_current_ratio",
+                "track_input_interest_coverage",
+                "track_input_beta",
+                "track_input_pe",
+                "track_input_ps",
+                "track_input_ev_ebitda",
+                "track_input_rule_of_40_calc",
+                "track_A_valuation_valid_count",
+                "track_input_v_market_proxy",
+            ]
+        )
     if fac.empty:
         return pd.DataFrame(
             columns=[
@@ -500,7 +526,62 @@ def main(input_dir: str | Path = "output", output_dir: str | Path = "output/scor
     df = df.copy()
     df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
     df["as_of_date"] = pd.to_datetime(df["as_of_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    # 1) Exact match merge (symbol + as_of_date) first; keep legacy behavior.
     df = df.merge(track_inputs, on=["symbol", "as_of_date"], how="left")
+
+    # 2~6) If exact-merged track inputs are mostly missing, fall back to symbol-only latest-row merge.
+    track_cols_to_fill = [c for c in df.columns if c.startswith("track_input_")]
+    if "track_A_valuation_valid_count" in df.columns:
+        track_cols_to_fill.append("track_A_valuation_valid_count")
+
+    if "track_input_roic" in df.columns:
+        roic_na_ratio = float(df["track_input_roic"].isna().mean()) if len(df) > 0 else 0.0
+    else:
+        roic_na_ratio = 1.0
+
+    FALLBACK_NA_RATIO_THRESHOLD = 0.30
+    if len(df) > 0 and roic_na_ratio >= FALLBACK_NA_RATIO_THRESHOLD and track_inputs is not None and not track_inputs.empty:
+        # Only fill rows where track_input_roic is still missing.
+        need_mask = df["track_input_roic"].isna()
+
+        # Build per-symbol latest table from track_inputs.
+        aux = track_inputs.copy()
+        if "as_of_date" not in aux.columns:
+            if "asOfDate" in aux.columns:
+                aux["as_of_date"] = aux["asOfDate"]
+        aux["as_of_date"] = pd.to_datetime(aux["as_of_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        aux["symbol"] = aux["symbol"].astype(str).str.strip().str.upper()
+        # Keep latest as_of_date per symbol.
+        aux = aux.sort_values(["symbol", "as_of_date"], ascending=[True, True]).groupby("symbol", as_index=False).last()
+
+        if need_mask.any() and track_cols_to_fill:
+            aux_latest = aux.copy()
+            # Use latest as_of_date per symbol as the symbol-only fallback.
+            aux_latest = aux_latest.sort_values(["symbol", "as_of_date"], ascending=[True, True]).groupby(
+                "symbol", as_index=False
+            ).last()
+            aux_latest = aux_latest.set_index("symbol", drop=True)
+
+            # Fill only rows whose exact-match track inputs were missing.
+            for c in track_cols_to_fill:
+                if c not in aux_latest.columns or c not in df.columns:
+                    continue
+                fill_mask = need_mask & df[c].isna()
+                if fill_mask.any():
+                    df.loc[fill_mask, c] = df.loc[fill_mask, "symbol"].map(aux_latest[c].to_dict())
+
+            filled_cnt = int((need_mask & df["track_input_roic"].notna()).sum()) if "track_input_roic" in df.columns else 0
+            print(
+                f"Fallback merge applied (roic missing ratio {roic_na_ratio:.1%} >= {FALLBACK_NA_RATIO_THRESHOLD:.0%}). "
+                f"Filled roic rows={filled_cnt}. Exact-match rows preserved."
+            )
+    else:
+        if len(df) > 0:
+            print(
+                f"Exact merge only (roic missing ratio {roic_na_ratio:.1%} < {FALLBACK_NA_RATIO_THRESHOLD:.0%})."
+            )
+
     print(f"Input category rows: {len(df)}")
     out = build_final_vqgrs_scores_df(df)
     print(f"Output final-score rows: {len(out)}")

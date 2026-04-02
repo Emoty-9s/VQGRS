@@ -165,6 +165,7 @@ def _compute_category_block(df_factor_scores: pd.DataFrame, category: str) -> pd
     # Hybrid factor path is sealed into final_factor_evidence upstream; no separate relative/absolute here.
     df_cat["final_factor_evidence"] = pd.to_numeric(df_cat["final_factor_evidence"], errors="coerce")
     valid = df_cat["final_factor_evidence"].notna()
+    # Only "observed" is treated as observed for coverage; "mixed" must not inflate coverage.
     is_observed = df_cat["factor_source"].astype(str).str.strip().str.lower() == "observed"
 
     df_cat["valid_factor"] = valid

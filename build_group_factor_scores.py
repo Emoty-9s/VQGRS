@@ -84,34 +84,73 @@ def _read_snapshot_latest(input_dir: str | Path) -> pd.DataFrame:
     """
     input_dir = Path(input_dir)
 
+    def _read_per_group_concat() -> pd.DataFrame:
+        dfs: list[pd.DataFrame] = []
+        for gt in GROUP_TYPES:
+            low = gt.lower()
+            base = input_dir / f"group_{low}"
+            candidates = [
+                base / f"group_{low}_snapshot_latest.parquet",
+                base / f"group_{low}_snapshot_latest.csv",
+            ]
+            loaded = pd.DataFrame()
+            for p in candidates:
+                if p.exists():
+                    loaded = _read_df(p)
+                    break
+            if loaded is not None and not loaded.empty:
+                dfs.append(loaded)
+        if not dfs:
+            return pd.DataFrame()
+        return pd.concat(dfs, ignore_index=True)
+
+    # Load a unified candidate, but only use it if it is not older than per-group maxima.
     unified_candidates = [
         input_dir / "group_unified" / "group_unified_snapshot_latest.parquet",
         input_dir / "group_unified" / "group_unified_snapshot_latest.csv",
         input_dir / "group_cde" / "group_cde_snapshot_latest.parquet",
         input_dir / "group_cde" / "group_cde_snapshot_latest.csv",
     ]
+    unified_path: Path | None = None
+    unified_df = pd.DataFrame()
     for p in unified_candidates:
         if p.exists():
-            return _read_df(p)
+            unified_path = p
+            unified_df = _read_df(p)
+            break
 
-    dfs: list[pd.DataFrame] = []
-    for gt in GROUP_TYPES:
-        low = gt.lower()
-        base = input_dir / f"group_{low}"
-        candidates = [
-            base / f"group_{low}_snapshot_latest.parquet",
-            base / f"group_{low}_snapshot_latest.csv",
-        ]
-        loaded = pd.DataFrame()
-        for p in candidates:
-            if p.exists():
-                loaded = _read_df(p)
-                break
-        if loaded is not None and not loaded.empty:
-            dfs.append(loaded)
-    if not dfs:
-        return pd.DataFrame()
-    return pd.concat(dfs, ignore_index=True)
+    per_group_max = _per_group_snapshot_max_dates(input_dir)
+    per_group_overall_max: pd.Timestamp | None = None
+    max_vals: list[pd.Timestamp] = [v for v in per_group_max.values() if v is not None]
+    if max_vals:
+        per_group_overall_max = max(max_vals)
+
+    unified_asof_max: pd.Timestamp | None = None
+    if not unified_df.empty and "as_of_date" in unified_df.columns:
+        d = pd.to_datetime(unified_df["as_of_date"], errors="coerce").dropna()
+        unified_asof_max = pd.Timestamp(d.max()) if len(d) else None
+
+    # Fallback when unified is empty or missing as_of_date, or when it's stale.
+    if unified_df.empty or unified_asof_max is None or per_group_overall_max is None:
+        print(
+            "[snapshot selection] Using per-group concat (unified missing/empty/stale). "
+            f"unified_path={unified_path} unified_max={unified_asof_max} per_group_overall_max={per_group_overall_max}"
+        )
+        return _read_per_group_concat()
+
+    if unified_asof_max < per_group_overall_max:
+        print(
+            "[snapshot selection] Unified snapshot is OLDER than per-group latest; "
+            f"using per-group concat. unified_max={unified_asof_max} < per_group_overall_max={per_group_overall_max} "
+            f"(unified_path={unified_path})"
+        )
+        return _read_per_group_concat()
+
+    print(
+        "[snapshot selection] Using unified snapshot. "
+        f"unified_path={unified_path} unified_max={unified_asof_max} per_group_overall_max={per_group_overall_max}"
+    )
+    return unified_df
 
 
 def _per_group_snapshot_max_dates(input_dir: Path) -> dict[str, pd.Timestamp | None]:
@@ -191,9 +230,12 @@ def _save_long_scores(df: pd.DataFrame, output_dir: str | Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     parquet_path = output_dir / "group_factor_scores_latest.parquet"
     csv_path = output_dir / "group_factor_scores_latest.csv"
-
-    df.to_parquet(parquet_path, index=False)
+    # CSV must remain even if parquet engine is unavailable / parquet write fails.
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    try:
+        df.to_parquet(parquet_path, index=False)
+    except Exception as e:
+        print(f"WARNING: failed to save parquet ({parquet_path}): {e}. CSV saved successfully.")
 
 
 def build_group_factor_scores_df(snapshot_df: pd.DataFrame) -> pd.DataFrame:

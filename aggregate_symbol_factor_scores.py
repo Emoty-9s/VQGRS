@@ -36,10 +36,22 @@ HYBRID_TRANSPARENCY_COLS: tuple[str, ...] = (
 
 
 def _clear_hybrid_transparency_columns(out: pd.DataFrame, idx: Any) -> None:
-    """Imputed rows must not carry group-level hybrid diagnostics as if they were observed."""
+    """Imputed rows must not carry group-level hybrid diagnostics as if they were observed.
+    numpy/pandas plain bool dtype rejects pd.NA in .loc (TypeError); nullable dtypes are required."""
     for c in HYBRID_TRANSPARENCY_COLS:
-        if c in out.columns:
-            out.loc[idx, c] = pd.NA
+        if c not in out.columns:
+            continue
+        if c == "absolute_enabled" and str(out[c].dtype) != "boolean":
+            out[c] = out[c].astype("boolean")
+        elif c == "blend_method" and not (
+            out[c].dtype == object or pd.api.types.is_string_dtype(out[c])
+        ):
+            out[c] = out[c].astype("object")
+        elif c in ("relative_evidence", "absolute_evidence", "absolute_weight") and str(
+            out[c].dtype
+        ) != "Float64":
+            out[c] = pd.to_numeric(out[c], errors="coerce").astype("Float64")
+        out.loc[idx, c] = pd.NA
 
 
 def _load_missing_priors(scoring_dir: Path) -> pd.DataFrame:
@@ -160,6 +172,17 @@ def _enrich_imputed_scores(df: pd.DataFrame, priors_df: pd.DataFrame) -> pd.Data
         if c not in out.columns:
             out[c] = pd.NA
 
+    # Imputed-row clears assign pd.NA; numpy bool (e.g. absolute_enabled) raises TypeError on Python 3.13/pandas.
+    # Use nullable dtypes so observed semantics stay the same but imputed clears are storable.
+    if "absolute_enabled" in out.columns:
+        out["absolute_enabled"] = out["absolute_enabled"].astype("boolean")
+    if "blend_method" in out.columns:
+        if not (out["blend_method"].dtype == object or pd.api.types.is_string_dtype(out["blend_method"])):
+            out["blend_method"] = out["blend_method"].astype("object")
+    for _hc in ("relative_evidence", "absolute_evidence", "absolute_weight"):
+        if _hc in out.columns:
+            out[_hc] = pd.to_numeric(out[_hc], errors="coerce").astype("Float64")
+
     idx_list = list(out.index)
     for j, idx in enumerate(idx_list):
         row = out.loc[idx]
@@ -254,9 +277,15 @@ def _enrich_imputed_scores(df: pd.DataFrame, priors_df: pd.DataFrame) -> pd.Data
 
 
 def _dominant_factor_source(s: pd.Series) -> str:
-    u = set(pd.Series(s).dropna().astype(str).unique().tolist())
-    if "observed" in u:
-        return "observed"
+    # Preserve mixed observed+imputed composition.
+    # - all observed -> "observed"
+    # - observed + any of {donor_shrink, prior_only, structural_prior} -> "mixed"
+    # - observed absent -> donor_shrink > structural_prior > prior_only
+    u = set(pd.Series(s).dropna().astype(str).str.strip().str.lower().unique().tolist())
+    has_observed = "observed" in u
+    if has_observed:
+        others = u - {"observed"}
+        return "observed" if not others else "mixed"
     if "donor_shrink" in u:
         return "donor_shrink"
     if "structural_prior" in u:
@@ -356,6 +385,7 @@ def _infer_group_type_from_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _aggregate_symbol_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
+    df = _infer_group_type_from_columns(df)
     required = [
         "symbol",
         "as_of_date",
@@ -366,8 +396,6 @@ def _aggregate_symbol_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns in score input: {missing}")
-
-    df = _infer_group_type_from_columns(df)
     if "group_type" not in df.columns:
         raise ValueError("Cannot infer group_type; missing both group_type and group_tag.")
 
@@ -518,9 +546,14 @@ def _aggregate_symbol_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _save_df(df: pd.DataFrame, parquet_path: Path, csv_path: Path) -> None:
+    # Always save CSV first (parquet engine might be unavailable).
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(parquet_path, index=False)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    try:
+        df.to_parquet(parquet_path, index=False)
+    except Exception as e:
+        print(f"Warning: failed to save parquet ({parquet_path}): {e}. CSV saved successfully.")
 
 
 def main(input_dir: str | Path = "output", output_dir: str | Path = "output/scoring") -> None:
