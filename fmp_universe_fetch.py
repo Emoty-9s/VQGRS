@@ -92,9 +92,18 @@ ADJCLOSE_MISSING_RATE_THRESHOLD = 0.05
 ADJCLOSE_FALLBACK_MISSING_RATE = 0.80
 ADJCLOSE_WARN_MISSING_RATE = 0.20
 ADJCLOSE_TOP_SYMBOLS_WARN = 20
+#
+# financials_quarterly EBITDA split
+# - `EBITDA` (legacy): raw reported EBITDA (backward compatibility)
+# - new split fields: reported + operating variants
+#
 FINANCIALS_QUARTERLY_COLUMNS = [
     "symbol", "fiscalDate", "period",
     "revenue", "netIncome", "grossProfit", "operatingIncome", "EBITDA",
+    "EBITDA_reported",
+    "reconciledDepreciation",
+    "depreciationAndAmortization",
+    "EBITDA_operating",
     "incomeBeforeTax", "incomeTaxExpense",
     "cashAndCashEquivalents", "receivables", "shortTermInvestments",
     "currentAssets", "currentLiabilities", "totalAssets",
@@ -105,6 +114,10 @@ FINANCIALS_QUARTERLY_COLUMNS = [
 FINANCIALS_PK = ["symbol", "fiscalDate", "period"]
 FINANCIALS_COMPARE_COLUMNS = [
     "revenue", "netIncome", "grossProfit", "operatingIncome", "EBITDA",
+    "EBITDA_reported",
+    "reconciledDepreciation",
+    "depreciationAndAmortization",
+    "EBITDA_operating",
     "incomeBeforeTax", "incomeTaxExpense",
     "cashAndCashEquivalents", "receivables", "shortTermInvestments",
     "currentAssets", "currentLiabilities", "totalAssets",
@@ -1351,7 +1364,38 @@ def build_financials_quarterly(
             "netIncome": pick(r, ["netIncome", "NetIncome"]),
             "grossProfit": pick(r, ["grossProfit", "GrossProfit"]),
             "operatingIncome": pick(r, ["operatingIncome", "OperatingIncome"]),
+            # Legacy: raw reported EBITDA alias (keep `EBITDA` for backward compatibility)
             "EBITDA": pick(r, ["ebitda", "EBITDA"]),
+            # New raw reported EBITDA (no operating split applied here).
+            "EBITDA_reported": pick(r, ["ebitda", "EBITDA"]),
+            # D&A raw decomposition (reported variants).
+            "reconciledDepreciation": pick(
+                r,
+                [
+                    "reconciledDepreciation",
+                    "depreciationAndAmortization",
+                    "depreciationAmortizationAndAccretion",
+                    "depreciationAndAmortizationExpense",
+                    "depreciation",
+                    "DepreciationAndAmortization",
+                    "DepreciationAmortizationAndAccretion",
+                    "DepreciationAndAmortizationExpense",
+                    "Depreciation",
+                ],
+            ),
+            "depreciationAndAmortization": pick(
+                r,
+                [
+                    "depreciationAndAmortization",
+                    "depreciationAmortizationAndAccretion",
+                    "depreciationAndAmortizationExpense",
+                    "depreciation",
+                    "DepreciationAndAmortization",
+                    "DepreciationAmortizationAndAccretion",
+                    "DepreciationAndAmortizationExpense",
+                    "Depreciation",
+                ],
+            ),
             "incomeBeforeTax": pick(r, ["incomeBeforeTax", "incomeBeforeTax"]),
             "incomeTaxExpense": pick(r, ["incomeTaxExpense", "incomeTaxExpense"]),
             "weightedAverageSharesDiluted": pick(r, ["weightedAverageShsOutDil", "weightedAverageShsOutDiluted", "weightedAverageSharesDiluted"]),
@@ -1386,6 +1430,25 @@ def build_financials_quarterly(
         key = (d, per if per is not None else "")
         if key not in by_key:
             by_key[key] = {"symbol": sym, "fiscalDate": d, "period": per if per is not None else pd.NA}
+        # D&A enrichment (do not overwrite income reconciledDepreciation when present).
+        cf_dna_reconciled = pick(
+            r,
+            [
+                "depreciationAndAmortization",
+                "depreciationAmortizationAndAccretion",
+                "depreciationAndAmortizationExpense",
+                "depreciation",
+            ],
+        )
+        cf_dna_generic = pick(
+            r,
+            [
+                "depreciationAndAmortization",
+                "depreciationAmortizationAndAccretion",
+                "depreciationAndAmortizationExpense",
+                "depreciation",
+            ],
+        )
         cf_update: Dict[str, Any] = {
             "freeCashFlow": pick(r, ["freeCashFlow", "freeCashFlow"]),
             "operatingCashFlow": pick(r, [
@@ -1400,9 +1463,29 @@ def build_financials_quarterly(
         if existing_dil is None or (isinstance(existing_dil, float) and pd.isna(existing_dil)):
             cf_update["weightedAverageSharesDiluted"] = pick(r, ["weightedAverageShsOutDil", "weightedAverageSharesDiluted"])
         by_key[key].update(cf_update)
+
+        # Only fill reported D&A fields when missing from income parsing.
+        # reconciledDepreciation: preserve if income already produced a value.
+        if ("reconciledDepreciation" not in by_key[key]) or pd.isna(by_key[key].get("reconciledDepreciation")):
+            if cf_dna_reconciled is not None:
+                by_key[key]["reconciledDepreciation"] = cf_dna_reconciled
+        if ("depreciationAndAmortization" not in by_key[key]) or pd.isna(by_key[key].get("depreciationAndAmortization")):
+            if cf_dna_generic is not None:
+                by_key[key]["depreciationAndAmortization"] = cf_dna_generic
     if not by_key:
         return pd.DataFrame(columns=FINANCIALS_QUARTERLY_COLUMNS)
     df = pd.DataFrame(list(by_key.values()))
+
+    # C) Post-build: enforce backward compatibility and compute operating EBITDA split.
+    # - `EBITDA` should remain a raw reported alias equal to `EBITDA_reported`.
+    # - `EBITDA_operating = operatingIncome + reconciledDepreciation` when both exist; else NaN.
+    df["EBITDA_reported"] = pd.to_numeric(df.get("EBITDA_reported"), errors="coerce")
+    df["EBITDA"] = df["EBITDA_reported"]
+    op_inc = pd.to_numeric(df.get("operatingIncome"), errors="coerce")
+    rec_dep = pd.to_numeric(df.get("reconciledDepreciation"), errors="coerce")
+    both = op_inc.notna() & rec_dep.notna()
+    df["EBITDA_operating"] = np.where(both, op_inc + rec_dep, pd.NA)
+
     for c in FINANCIALS_QUARTERLY_COLUMNS:
         if c not in df.columns:
             df[c] = pd.NA
@@ -1429,8 +1512,19 @@ def enrich_financials_quarterly_from_as_reported(
     need_div = df["dividendsPaid"].isna().any() if "dividendsPaid" in df.columns else False
     need_ocf = df["operatingCashFlow"].isna().any() if "operatingCashFlow" in df.columns else False
     need_shares = df["sharesOutstanding"].isna().any() if "sharesOutstanding" in df.columns else False
+    need_reconciled_dep = (
+        df["reconciledDepreciation"].isna().any()
+        if "reconciledDepreciation" in df.columns
+        else False
+    )
+    need_depr_and_amort = (
+        df["depreciationAndAmortization"].isna().any()
+        if "depreciationAndAmortization" in df.columns
+        else False
+    )
+    need_dna = need_reconciled_dep or need_depr_and_amort
 
-    if (need_div or need_ocf) and not as_reported_state.get("disabled_cashflow", False):
+    if (need_div or need_ocf or need_dna) and not as_reported_state.get("disabled_cashflow", False):
         cf_ar, restricted = fetch_cashflow_as_reported(session, rl, api_key, symbol, limit, call_counter)
         if restricted:
             with lock:
@@ -1461,6 +1555,67 @@ def enrich_financials_quarterly_from_as_reported(
                         val = ocf_map.get((fd, ""))
                     if val is not None and pd.isna(row.get("operatingCashFlow")):
                         df.at[idx, "operatingCashFlow"] = val
+            if need_dna:
+                # Extract D&A line items from as-reported cashflow payload.
+                # If keys are absent, map stays empty and we silently skip.
+                try:
+                    dna_priority_keys = [
+                        "reconcileddepreciation",
+                        "depreciationandamortization",
+                        "depreciationamortizationandaccretion",
+                        "depreciationandamortizationexpense",
+                        "depreciation",
+                        "depreciationandamortizationexpense",
+                    ]
+
+                    def _extract_dna_from_as_reported(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], float]:
+                        result: Dict[Tuple[str, str], float] = {}
+                        for r in rows:
+                            d = pick_date10(r, ["date", "fiscalDateEnding", "fillingDate", "filingDate"])
+                            if not d:
+                                continue
+                            per = _norm_period(pick_text(r, ["period"]))
+                            candidates: List[Tuple[int, float]] = []
+                            for name, val in _iter_as_reported_line_items(r):
+                                nl = str(name).strip().lower()
+                                if not nl:
+                                    continue
+                                best_i = None
+                                for i, k in enumerate(dna_priority_keys):
+                                    if k in nl:
+                                        best_i = i
+                                        break
+                                if best_i is None:
+                                    continue
+                                if val is None or (isinstance(val, float) and pd.isna(val)):
+                                    continue
+                                candidates.append((best_i, float(val)))
+                            if not candidates:
+                                continue
+                            # Lower priority index is better; tie-break by larger absolute value.
+                            candidates.sort(key=lambda x: (x[0], -abs(x[1])))
+                            chosen = candidates[0][1]
+                            result[(d, per)] = chosen
+                            if per:
+                                result[(d, "")] = chosen
+                        return result
+
+                    dna_map = _extract_dna_from_as_reported(cf_ar)
+                    for idx, row in df.iterrows():
+                        fd = str(row.get("fiscalDate", ""))[:10]
+                        per = _norm_period(row.get("period"))
+                        key = (fd, per)
+                        val = dna_map.get(key)
+                        if val is None and per:
+                            val = dna_map.get((fd, ""))
+                        if val is None:
+                            continue
+                        if "reconciledDepreciation" in df.columns and pd.isna(row.get("reconciledDepreciation")):
+                            df.at[idx, "reconciledDepreciation"] = val
+                        if "depreciationAndAmortization" in df.columns and pd.isna(row.get("depreciationAndAmortization")):
+                            df.at[idx, "depreciationAndAmortization"] = val
+                except Exception as e:
+                    log.warning("D&A as-reported enrichment skipped due to error: %s", _safe_log_message(e))
 
     if need_shares and not as_reported_state.get("disabled_balance", False):
         bal_ar, restricted = fetch_balance_as_reported(session, rl, api_key, symbol, limit, call_counter)
@@ -1485,6 +1640,18 @@ def enrich_financials_quarterly_from_as_reported(
     # sharesOutstanding 전용 후처리: diluted → 최신분기만 snapshot → 전파
     if "sharesOutstanding" in df.columns:
         df = _backfill_shares_outstanding_for_symbol(df, symbol, session, rl, api_key, call_counter)
+
+    # Recompute EBITDA_operating after D&A enrichment.
+    if (
+        "operatingIncome" in df.columns
+        and "reconciledDepreciation" in df.columns
+    ):
+        op_inc = pd.to_numeric(df.get("operatingIncome"), errors="coerce")
+        rec_dep = pd.to_numeric(df.get("reconciledDepreciation"), errors="coerce")
+        both = op_inc.notna() & rec_dep.notna()
+        if "EBITDA_operating" not in df.columns:
+            df["EBITDA_operating"] = pd.NA
+        df["EBITDA_operating"] = np.where(both, op_inc + rec_dep, pd.NA)
 
     return df
 
@@ -2577,6 +2744,33 @@ def run_debug_financials_fields(
             log.info("[debug-financials-fields] financials_quarterly %s non-null count: %s", col, n)
         else:
             log.info("[debug-financials-fields] financials_quarterly %s: column missing", col)
+
+    # Debug-only: EBITDA split / D&A fields after financials_quarterly construction.
+    try:
+        want_cols = [
+            "symbol",
+            "fiscalDate",
+            "period",
+            "operatingIncome",
+            "EBITDA_reported",
+            "reconciledDepreciation",
+            "EBITDA_operating",
+        ]
+        existing = [c for c in want_cols if c in df.columns]
+        if existing:
+            df_show = df[existing].copy()
+            if "symbol" in df_show.columns:
+                df_show["symbol"] = df_show["symbol"].astype(str)
+            log.info(
+                "[debug-financials-ebitda-split] symbol=%s rows=%s\n%s",
+                sym,
+                len(df_show),
+                df_show.to_string(index=False),
+            )
+        else:
+            log.info("[debug-financials-ebitda-split] required columns missing; cannot print split table")
+    except Exception as e:
+        log.info("[debug-financials-ebitda-split] failed to print split table: %s", _safe_log_message(e))
 
 
 def run_daily(

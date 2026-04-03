@@ -644,13 +644,10 @@ def score_one_factor_one_group(
             absolute_enabled=absolute_enabled_flag,
         )
 
-    confidence = compute_group_confidence(n_valid=n_valid, peer_quality=peer_quality)
-    adjusted_evidence = shrink_evidence_to_prior(
-        evidence=raw_evidence,
-        confidence=confidence,
-        prior_evidence=prior_evidence,
-    )
-    adjusted_score = evidence_to_score(evidence=adjusted_evidence, beta=evidence_beta, clip_evidence=4.0)
+    # No group-level confidence shrink: use blended raw evidence directly.
+    confidence = 1.0
+    adjusted_evidence = raw_evidence
+    adjusted_score = raw_score
     evidence_source = "observed_evidence"
 
     is_valid_score = adjusted_score is not None

@@ -81,6 +81,13 @@ _SNAPSHOT_META_LIKE: frozenset[str] = frozenset(
         "group_b_no_mcap_peer_count",
         "group_b_no_mcap_peer_method",
         "group_b_no_mcap_peer_quality",
+        # Group B S&P500 benchmark snapshot (current build_group_b_snapshot path)
+        "group_b_benchmark_index",
+        "group_b_benchmark_tag",
+        "group_b_benchmark_membership_as_of_date",
+        "group_b_benchmark_member_count_total",
+        "group_b_benchmark_member_count_intersection",
+        "group_b_benchmark_method",
     }
 )
 

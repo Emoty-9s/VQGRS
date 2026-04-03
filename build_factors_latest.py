@@ -623,6 +623,10 @@ def get_ttm_financials_at(
         "netIncome",
         "revenue",
         "EBITDA",
+        "EBITDA_reported",
+        "EBITDA_operating",
+        "reconciledDepreciation",
+        "depreciationAndAmortization",
         "freeCashFlow",
         "operatingCashFlow",
         "dividendsPaid",
@@ -1863,13 +1867,14 @@ def build_financial_indicators(
     shares_out: float,
     price: float,
     row_prev_quarter: Optional[Dict] = None,
-) -> Dict[str, float]:
-    out: Dict[str, float] = {}
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
     if row_latest is None:
         for k in [
             "Income (Net)", "Sales (Rev)", "Book/sh", "Cash/sh", "Payout",
             "EPS (ttm)", "P/E", "P/S", "P/B", "P/C", "P/FCF",
-            "Market Cap", "Enterprise Value(EV)", "EV/EBITDA", "EV/Sales",
+            "Market Cap", "Enterprise Value(EV)", "EV/EBITDA", "EV/EBITDA (Reported)", "EV/EBITDA Source", "EV/Sales",
+            "EBITDA (Reported TTM)", "EBITDA (Operating TTM)", "Reconciled Depreciation (TTM)",
             "Quick Ratio", "Current Ratio", "Debt/Eq", "LT Debt/Eq",
             "ROA", "ROE", "ROIC",
             "Gross Margin", "Oper. Margin", "Profit Margin", "Shs Outstand",
@@ -1904,6 +1909,9 @@ def build_financial_indicators(
         oi_ttm = _float_or_nan(row_ttm.get("operatingIncome"))
         div_paid_ttm = _float_or_nan(row_ttm.get("dividendsPaid"))
         ebitda_ttm = _float_or_nan(row_ttm.get("EBITDA"))
+        ebitda_reported_ttm = _float_or_nan(row_ttm.get("EBITDA_reported"))
+        ebitda_operating_ttm = _float_or_nan(row_ttm.get("EBITDA_operating"))
+        reconciled_dep_ttm = _float_or_nan(row_ttm.get("reconciledDepreciation"))
         fcf_ttm = _float_or_nan(row_ttm.get("freeCashFlow"))
         # TTM diluted shares: mean(4q) from latest_financials_and_ttm (sum 금지 → P/E 4배 뻥튀기 방지)
         wad_ttm = _float_or_nan(row_ttm.get("weightedAverageSharesDiluted"))
@@ -1913,6 +1921,7 @@ def build_financial_indicators(
             wad_ttm = float(so_l)
     else:
         ni_ttm = rev_ttm = gp_ttm = oi_ttm = div_paid_ttm = ebitda_ttm = wad_ttm = fcf_ttm = np.nan
+        ebitda_reported_ttm = ebitda_operating_ttm = reconciled_dep_ttm = np.nan
 
     # Finviz: Income (Net), Sales (Rev) are TTM; fallback to latest quarter
     out["Income (Net)"] = ni_ttm if (row_ttm and ni_ttm is not None and not np.isnan(ni_ttm)) else ni_l
@@ -1945,7 +1954,23 @@ def build_financial_indicators(
     mc = out["Market Cap"]
     ev = mc + debt_l - cash_l if not np.isnan(mc) and debt_l is not None and cash_l is not None else np.nan
     out["Enterprise Value(EV)"] = ev
-    out["EV/EBITDA"] = safe_div(ev, ebitda_ttm) if row_ttm and ev is not None else np.nan
+    # EBITDA operating basis (strict): if missing, EV/EBITDA must remain NaN.
+    out["EBITDA (Reported TTM)"] = ebitda_reported_ttm
+    out["EBITDA (Operating TTM)"] = ebitda_operating_ttm
+    out["Reconciled Depreciation (TTM)"] = reconciled_dep_ttm
+
+    ev_ok = ev is not None and not (isinstance(ev, (int, float)) and np.isnan(ev))
+    ebitda_oper_ok = (
+        ebitda_operating_ttm is not None
+        and not (isinstance(ebitda_operating_ttm, (int, float)) and np.isnan(ebitda_operating_ttm))
+        and ebitda_operating_ttm != 0
+    )
+
+    out["EV/EBITDA Source"] = (
+        "operating" if (row_ttm and ev_ok and ebitda_oper_ok) else "missing_operating_ebitda"
+    )
+    out["EV/EBITDA"] = safe_div(ev, ebitda_operating_ttm) if row_ttm and ev is not None else np.nan
+    out["EV/EBITDA (Reported)"] = safe_div(ev, ebitda_reported_ttm) if row_ttm and ev is not None else np.nan
     out["EV/Sales"] = safe_div(ev, rev_ttm) if row_ttm and ev is not None else np.nan
 
     out["Quick Ratio"] = safe_div(cash_l + rec_l, cl_l) if cl_l else np.nan
@@ -2348,9 +2373,16 @@ OUTPUT_COLUMNS = [
     "Perf 3Y", "Perf 5Y", "Perf 10Y", "Perf YTD",
     "Beta",
     "Income (Net)", "Sales (Rev)", "Revenue YoY", "OCF YoY", "Book/sh", "Cash/sh",
-    "Dividend TTM", "Payout", "Employees", "IPO (Date)",
+    "Dividend TTM",
+    "EBITDA (Reported TTM)", "EBITDA (Operating TTM)", "Reconciled Depreciation (TTM)",
+    "Payout", "Employees", "IPO (Date)",
     "EPS (ttm)", "EPS YoY", "P/E", "P/S", "P/B", "P/C", "P/FCF",
-    "Market Cap", "Enterprise Value(EV)", "EV/EBITDA", "EV/Sales",
+    "Market Cap",
+    "Enterprise Value(EV)",
+    "EV/EBITDA",
+    "EV/EBITDA (Reported)",
+    "EV/EBITDA Source",
+    "EV/Sales",
     "Quick Ratio", "Current Ratio", "Debt/Eq", "LT Debt/Eq", "Interest Coverage",
     "ROA", "ROE", "ROIC",
     "Gross Margin", "Oper. Margin", "Profit Margin", "OCF/NI", "OPM volatility",
@@ -2927,6 +2959,7 @@ def main() -> None:
             "no_prior_trade_for_asof": 0,
         }
         processed_asof_dates: set[str] = set()
+        diag_row_logged = False
         def build_factor_row_for_symbol_at(
             sym: str,
             as_of_date: str,
@@ -3053,6 +3086,29 @@ def main() -> None:
                     gr5_pct = np.nan
 
             fin_inds = build_financial_indicators(row_latest, row_ttm, shares_out, price, row_prev_quarter=row_prev)
+
+            # Debug-only: print minimal factor row evidence around EV/EBITDA.
+            try:
+                do_diag = False
+                if sample_symbol and sym == sample_symbol:
+                    do_diag = True
+                elif output_diagnostics and not diag_row_logged:
+                    do_diag = True
+                    diag_row_logged = True
+                if do_diag:
+                    log.info(
+                        "[sample EV/EBITDA] symbol=%s asOfDate=%s EV=%s EBITDA_Reported_TTM=%s EBITDA_Operating_TTM=%s EV/EBITDA=%s EV/EBITDA (Reported)=%s EV/EBITDA Source=%s",
+                        sym,
+                        as_of_date,
+                        fin_inds.get("Enterprise Value(EV)", np.nan),
+                        fin_inds.get("EBITDA (Reported TTM)", np.nan),
+                        fin_inds.get("EBITDA (Operating TTM)", np.nan),
+                        fin_inds.get("EV/EBITDA", np.nan),
+                        fin_inds.get("EV/EBITDA (Reported)", np.nan),
+                        fin_inds.get("EV/EBITDA Source", np.nan),
+                    )
+            except Exception:
+                pass
             # Finviz-style: Employees, IPO (Date) from company_facts (asOfDate/effective <= as_of_date)
             employees_val = get_employees_at(sym, as_of, cf_lookup)
             ipo_date_val = get_ipo_date_at(sym, as_of, cf_lookup)

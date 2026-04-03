@@ -318,8 +318,8 @@ EXCLUDE_COLUMNS_A = EXCLUDE_COLUMNS | {
     "group_a_sector_count",
 }
 
-# Group B: exclude Group B tag/meta + peer-set reconstruction inputs from factor stats.
-# (peer selection reconstruction logic itself is implemented in build_group_b_snapshot.py)
+# Group B: exclude tag/meta, legacy peer-reconstruction inputs, and S&P500 benchmark meta from factor stats.
+# Legacy size-score peer helpers below coexist with build_group_b_sp500_benchmark_reps (snapshot uses the latter).
 EXCLUDE_COLUMNS_B = EXCLUDE_COLUMNS | {
     "group_b",
     "group_b_market_cap_valid",
@@ -350,6 +350,13 @@ EXCLUDE_COLUMNS_B = EXCLUDE_COLUMNS | {
     "total_assets",
     "sector",
     "industry",
+    # S&P500 benchmark (Group B) meta — not factor values.
+    "group_b_benchmark_index",
+    "group_b_benchmark_tag",
+    "group_b_benchmark_membership_as_of_date",
+    "group_b_benchmark_member_count_total",
+    "group_b_benchmark_member_count_intersection",
+    "group_b_benchmark_method",
 }
 
 # Group A sector-add: similarity factors and minimum peer count.
@@ -1049,7 +1056,203 @@ def build_group_a_representative_table(
 
 
 # ---------------------------------------------------------------------------
-# Group B: per-symbol size-score peer sets (not group_b groupby)
+# Group B: S&P500 full-universe benchmark representatives (current snapshot path; legacy peer helpers below)
+# ---------------------------------------------------------------------------
+
+
+def _normalize_index_symbol_for_sp500(s: Any) -> str:
+    """Normalize indexSymbol for comparison: SP500, S&P500, S&P 500 -> 'SP500'."""
+    t = str(s).strip().upper()
+    t = t.replace(" ", "").replace("&", "")
+    return t
+
+
+def _is_sp500_index_symbol(s: Any) -> bool:
+    return _normalize_index_symbol_for_sp500(s) == "SP500"
+
+
+def _load_index_membership_latest_work(
+    data_dir: str | Path,
+) -> tuple[pd.DataFrame, str, int, int]:
+    """
+    Internal: load membership, return (symbol_df, as_of_str, row_count_after_filters, unique_symbols).
+    ``row_count_after_filters`` is before deduplicating ``symbol``.
+    """
+    data_dir = Path(data_dir)
+    pq_path = data_dir / "index_membership.parquet"
+    csv_path = data_dir / "index_membership.csv"
+    if pq_path.exists():
+        raw = pd.read_parquet(pq_path)
+    elif csv_path.exists():
+        raw = pd.read_csv(csv_path, low_memory=False)
+    else:
+        raise FileNotFoundError(
+            f"index_membership not found: expected {pq_path} or {csv_path}"
+        )
+    required = ("indexSymbol", "asOfDate", "memberSymbol", "isMember")
+    missing = [c for c in required if c not in raw.columns]
+    if missing:
+        raise ValueError(f"index_membership missing required columns {missing}; have {list(raw.columns)}")
+    work = raw.copy()
+    work["asOfDate"] = pd.to_datetime(work["asOfDate"], errors="coerce")
+    if not work["asOfDate"].notna().any():
+        raise ValueError("index_membership: all asOfDate values are invalid (NaT)")
+    max_d = work["asOfDate"].max()
+    work = work.loc[work["asOfDate"] == max_d].copy()
+    as_of_str = pd.Timestamp(max_d).strftime("%Y-%m-%d")
+    work = work.loc[work["indexSymbol"].map(_is_sp500_index_symbol)].copy()
+    if work.empty:
+        raise ValueError(
+            "index_membership: no rows for S&P500 indexSymbol (accepted: SP500, S&P500, S&P 500) "
+            f"at asOfDate={as_of_str}"
+        )
+    im = work["isMember"]
+    if pd.api.types.is_bool_dtype(im):
+        mem_ok = im.fillna(False)
+    else:
+        num = pd.to_numeric(im, errors="coerce")
+        mem_ok = num.eq(1) | im.astype(str).str.strip().str.lower().isin(("true", "1", "yes", "t"))
+    work = work.loc[mem_ok].copy()
+    if work.empty:
+        raise ValueError(f"index_membership: no isMember=True rows for S&P500 at asOfDate={as_of_str}")
+    work["symbol"] = work["memberSymbol"].astype(str).str.strip().str.upper()
+    n_rows = len(work)
+    out = work[["symbol"]].drop_duplicates(subset=["symbol"], keep="first").reset_index(drop=True)
+    n_unique = len(out)
+    return out, as_of_str, n_rows, n_unique
+
+
+def load_index_membership_latest(data_dir: str | Path) -> tuple[pd.DataFrame, str]:
+    """
+    Load latest index membership slice for S&P500.
+
+    Reads ``data/index_membership.parquet`` or ``data/index_membership.csv``.
+    Keeps the single latest ``asOfDate``, rows where ``indexSymbol`` is SP500 / S&P500 / S&P 500,
+    and ``isMember`` is true. Returns symbols normalized to strip/upper as column ``symbol``.
+    """
+    df, as_of_str, _, _ = _load_index_membership_latest_work(data_dir)
+    return df, as_of_str
+
+
+def build_group_b_sp500_benchmark_reps(
+    base: pd.DataFrame,
+    factor_cols: list[str],
+    data_dir: str | Path | None = None,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """
+    Build one representative table (Group A format) over ``base`` rows whose ``symbol`` is in
+    the latest S&P500 membership (intersection universe). ``group_tag`` is ``B_SP500_BENCHMARK``.
+    """
+    if data_dir is None:
+        data_dir = DEFAULT_DATA_DIR
+    memb_df, m_asof, memb_n_rows, n_total_unique = _load_index_membership_latest_work(data_dir)
+    members = set(memb_df["symbol"].astype(str).str.strip().str.upper())
+    if "symbol" not in base.columns:
+        raise ValueError("build_group_b_sp500_benchmark_reps: base must contain column 'symbol'")
+    sym_u = base["symbol"].astype(str).str.strip().str.upper()
+    inter_mask = sym_u.isin(members)
+    peer_df = base.loc[inter_mask].copy()
+    if peer_df.empty:
+        raise ValueError(
+            "build_group_b_sp500_benchmark_reps: empty intersection of base symbols and S&P500 members"
+        )
+    n_intersection = int(peer_df["symbol"].astype(str).str.strip().str.upper().nunique())
+    reps = build_group_a_representative_table(peer_df, factor_cols, "B_SP500_BENCHMARK")
+    meta: dict[str, object] = {
+        "group_b_benchmark_index": "SP500",
+        "group_b_benchmark_tag": "B_SP500_BENCHMARK",
+        "group_b_benchmark_membership_as_of_date": m_asof,
+        "group_b_benchmark_member_count_total": n_total_unique,
+        "group_b_benchmark_member_count_intersection": n_intersection,
+        "group_b_benchmark_method": "SP500_ALL_MEMBERS",
+    }
+    print(
+        f"[Group B SP500 benchmark] membership_as_of={m_asof} membership_rows={memb_n_rows} "
+        f"unique_members={n_total_unique} intersection_count={n_intersection}"
+    )
+    return reps, meta
+
+
+def attach_representatives_and_deviations_b_benchmark(
+    base_df: pd.DataFrame,
+    reps_df: pd.DataFrame,
+    benchmark_meta: dict[str, object],
+    factor_cols: list[str],
+    group_tag_col: str = "group_b",
+) -> pd.DataFrame:
+    """
+    Apply the same S&P500 benchmark ``reps_df`` to every row of ``base_df`` (rep__/dev__ naming
+    matches ``attach_representatives_and_deviations``). Attaches ``benchmark_meta`` columns with identical
+    values on every row.
+    """
+    _ = group_tag_col
+    out = base_df.copy()
+    tag = "B_SP500_BENCHMARK"
+    if reps_df is None or reps_df.empty:
+        return out
+    rsub = reps_df.loc[reps_df["group_tag"].astype(str) == tag].copy() if "group_tag" in reps_df.columns else reps_df
+    if rsub.empty:
+        return out
+    reps_ix = rsub.set_index("factor_name")
+
+    for k, v in benchmark_meta.items():
+        out[k] = v
+
+    rep_dev_cols = [
+        col
+        for f in factor_cols
+        for col in (
+            f"{REP_PREFIX}{f}__median",
+            f"{REP_PREFIX}{f}__q25",
+            f"{REP_PREFIX}{f}__q75",
+            f"{REP_PREFIX}{f}__iqr",
+            f"{REP_PREFIX}{f}__n_valid",
+            f"{DEV_PREFIX}{f}__abs",
+            f"{DEV_PREFIX}{f}__pct",
+            f"{DEV_PREFIX}{f}__robust_z",
+        )
+    ]
+    if rep_dev_cols:
+        extra = pd.DataFrame(index=out.index, data={c: np.nan for c in rep_dev_cols})
+        out = pd.concat([out, extra], axis=1)
+
+    for f in factor_cols:
+        if f not in out.columns or f not in reps_ix.index:
+            continue
+        rrow = reps_ix.loc[f]
+        if isinstance(rrow, pd.DataFrame):
+            rrow = rrow.iloc[0]
+        med = float(pd.to_numeric(rrow["median"], errors="coerce"))
+        iqr_val = float(pd.to_numeric(rrow["iqr"], errors="coerce"))
+        q25 = pd.to_numeric(rrow.get("q25", np.nan), errors="coerce")
+        q75 = pd.to_numeric(rrow.get("q75", np.nan), errors="coerce")
+        n_valid = pd.to_numeric(rrow.get("n_valid", np.nan), errors="coerce")
+        if pd.isna(med):
+            continue
+        vals = pd.to_numeric(out[f], errors="coerce")
+        m = vals.notna()
+        if not m.any():
+            continue
+        out.loc[m, f"{REP_PREFIX}{f}__median"] = med
+        out.loc[m, f"{REP_PREFIX}{f}__q25"] = float(q25) if pd.notna(q25) else np.nan
+        out.loc[m, f"{REP_PREFIX}{f}__q75"] = float(q75) if pd.notna(q75) else np.nan
+        out.loc[m, f"{REP_PREFIX}{f}__iqr"] = iqr_val
+        out.loc[m, f"{REP_PREFIX}{f}__n_valid"] = float(n_valid) if pd.notna(n_valid) else np.nan
+        vm = vals[m]
+        out.loc[m, f"{DEV_PREFIX}{f}__abs"] = vm - med
+        out.loc[m, f"{DEV_PREFIX}{f}__pct"] = np.where(
+            np.abs(med) > 0, (vm - med) / np.abs(med), np.nan
+        )
+        if iqr_val > 0 and np.isfinite(iqr_val):
+            out.loc[m, f"{DEV_PREFIX}{f}__robust_z"] = (vm - med) / iqr_val
+        else:
+            out.loc[m, f"{DEV_PREFIX}{f}__robust_z"] = np.nan
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Group B (legacy): per-symbol size-score peer reconstruction (tags + universe masks; not group_b groupby).
+# Kept for loaders/tests; production B snapshots use the S&P500 benchmark block above.
 # ---------------------------------------------------------------------------
 
 

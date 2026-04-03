@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Build final VQGRS scores from category-level evidences.
+Build final VQGRS scores from category-level inputs.
 
 Input:
   - output/scoring/symbol_category_scores_latest.(parquet|csv)
@@ -8,13 +8,9 @@ Input:
 Output:
   - output/scoring/final_vqgrs_scores_latest.(parquet|csv)
 
-Per-track LTI: renormalized weighted average of ``final_evidence_V``…``final_evidence_S`` (same
-weight profiles as TRACK_WEIGHTS), then ``evidence_to_score`` — not a weighted average of category
-scores.
-
-Debug note:
-  - A high category score with low main_coverage_* can indicate lower-confidence results.
-    This pipeline is designed to be conservative when main indicators are missing.
+``final_score`` is the simple mean of ``score_V``…``score_S`` (missing categories skipped; all
+missing → 50.0). Track assignment from ``factors_latest`` is label-only and does not select a
+score profile.
 """
 from __future__ import annotations
 
@@ -29,13 +25,7 @@ from score_primitives import evidence_to_score
 
 
 CORE_CATS = ["V", "Q", "G", "R", "S"]
-
-TRACK_WEIGHTS: dict[str, dict[str, float]] = {
-    "equal": {"V": 0.20, "Q": 0.20, "G": 0.20, "R": 0.20, "S": 0.20},
-    "track_A": {"V": 0.40, "Q": 0.20, "G": 0.10, "R": 0.20, "S": 0.10},
-    "track_B": {"V": 0.25, "Q": 0.30, "G": 0.10, "R": 0.15, "S": 0.20},
-    "track_C": {"V": 0.20, "Q": 0.20, "G": 0.35, "R": 0.15, "S": 0.10},
-}
+FINAL_METHOD_LABEL = "simple_equal_category_scores"
 
 
 def _read_df(path: Path) -> pd.DataFrame:
@@ -140,7 +130,8 @@ def _load_track_inputs_from_factors_latest() -> pd.DataFrame:
         return pd.DataFrame(columns=["symbol", "as_of_date"])
 
     latest_dt = work["as_of_date"].max()
-    print(f"Track raw source: {path} | max(as_of_date)={latest_dt}")
+    src = pq_path if pq_path.exists() else csv_path
+    print(f"Track raw source: {src} | max(as_of_date)={latest_dt}")
     work = work.loc[work["as_of_date"] == latest_dt].copy()
 
     num_cols = [c for c in needed if c not in ("symbol", "as_of_date")]
@@ -217,23 +208,24 @@ def _save_df(df: pd.DataFrame, parquet_path: Path, csv_path: Path) -> None:
         print(f"WARNING: failed to save CSV: {csv_path} ({e})")
 
 
-def _weighted_evidence(df: pd.DataFrame, weights: dict[str, float]) -> pd.Series:
-    """
-    Renormalized weighted average of per-category ``final_evidence_*`` (same pattern as legacy
-    score weighting: NaN categories are excluded; weights over available categories renormalize).
-    """
-    num = pd.Series(0.0, index=df.index, dtype=float)
-    den = pd.Series(0.0, index=df.index, dtype=float)
-    for cat, w in weights.items():
-        col = f"final_evidence_{cat}"
-        if col not in df.columns:
-            continue
-        vals = pd.to_numeric(df[col], errors="coerce")
-        valid = vals.notna()
-        wf = float(w)
-        num = num + vals.fillna(0.0) * wf
-        den = den + np.where(valid, wf, 0.0)
-    return pd.Series(np.where(den > 0.0, num / den, np.nan), index=df.index, dtype=float)
+def _simple_mean_category_evidences(df: pd.DataFrame) -> pd.Series:
+    """Mean of ``final_evidence_V``…``final_evidence_S``; NaN if all five are missing."""
+    cols = [f"final_evidence_{c}" for c in CORE_CATS]
+    m = pd.concat([pd.to_numeric(df[c], errors="coerce") for c in cols], axis=1)
+    m.columns = cols
+    has_any = m.notna().any(axis=1)
+    mean_v = m.mean(axis=1, skipna=True)
+    return mean_v.where(has_any, np.nan).astype(float)
+
+
+def _simple_mean_category_scores(df: pd.DataFrame) -> pd.Series:
+    """Mean of ``score_V``…``score_S``; 50.0 if all five are missing."""
+    cols = [f"score_{c}" for c in CORE_CATS]
+    m = pd.concat([pd.to_numeric(df[c], errors="coerce") for c in cols], axis=1)
+    m.columns = cols
+    has_any = m.notna().any(axis=1)
+    mean_v = m.mean(axis=1, skipna=True)
+    return mean_v.where(has_any, 50.0).astype(float)
 
 
 def _evidence_series_to_score(ev: pd.Series) -> pd.Series:
@@ -334,17 +326,17 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         if ds in df_cat.columns:
             out[ds] = df_cat[ds].fillna("balanced").astype(object)
 
-    out["final_evidence_equal"] = _weighted_evidence(out, TRACK_WEIGHTS["equal"])
-    out["final_score_equal"] = _evidence_series_to_score(out["final_evidence_equal"])
+    ev_agg = _simple_mean_category_evidences(out)
+    out["final_evidence_equal"] = ev_agg
+    out["final_evidence_track_A"] = ev_agg
+    out["final_evidence_track_B"] = ev_agg
+    out["final_evidence_track_C"] = ev_agg
 
-    out["final_evidence_track_A"] = _weighted_evidence(out, TRACK_WEIGHTS["track_A"])
-    out["final_score_track_A"] = _evidence_series_to_score(out["final_evidence_track_A"])
-
-    out["final_evidence_track_B"] = _weighted_evidence(out, TRACK_WEIGHTS["track_B"])
-    out["final_score_track_B"] = _evidence_series_to_score(out["final_evidence_track_B"])
-
-    out["final_evidence_track_C"] = _weighted_evidence(out, TRACK_WEIGHTS["track_C"])
-    out["final_score_track_C"] = _evidence_series_to_score(out["final_evidence_track_C"])
+    score_agg = _simple_mean_category_scores(out)
+    out["final_score_equal"] = score_agg
+    out["final_score_track_A"] = score_agg
+    out["final_score_track_B"] = score_agg
+    out["final_score_track_C"] = score_agg
 
     # Track inputs from factors_latest raw-source join, injected in main().
     for c in (
@@ -405,40 +397,9 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
     )
     out["track_reason"] = _build_track_reason(out)
 
-    # Representative final score selection by assigned investment track.
-    out["final_score"] = np.select(
-        [
-            out["assigned_track"] == "A",
-            out["assigned_track"] == "B",
-            out["assigned_track"] == "C",
-            out["assigned_track"] == "N",
-        ],
-        [
-            pd.to_numeric(out["final_score_track_A"], errors="coerce"),
-            pd.to_numeric(out["final_score_track_B"], errors="coerce"),
-            pd.to_numeric(out["final_score_track_C"], errors="coerce"),
-            pd.to_numeric(out["final_score_equal"], errors="coerce"),
-        ],
-        default=pd.to_numeric(out["final_score_equal"], errors="coerce"),
-    )
-    out["final_score"] = pd.to_numeric(out["final_score"], errors="coerce").clip(lower=0.0, upper=100.0).astype(float)
-    # Method labels: profile names unchanged; aggregation is evidence-space then evidence_to_score.
-    out["final_score_method"] = np.select(
-        [
-            out["assigned_track"] == "A",
-            out["assigned_track"] == "B",
-            out["assigned_track"] == "C",
-            out["assigned_track"] == "N",
-        ],
-        [
-            "track_A_weighted",
-            "track_B_weighted",
-            "track_C_weighted",
-            "equal_weighted",
-        ],
-        default="equal_weighted",
-    )
-    out["selected_weight_profile"] = out["final_score_method"].astype(object)
+    out["final_score"] = pd.to_numeric(score_agg, errors="coerce").clip(lower=0.0, upper=100.0).astype(float)
+    out["final_score_method"] = FINAL_METHOD_LABEL
+    out["selected_weight_profile"] = FINAL_METHOD_LABEL
     # Placeholder columns for later hard-stop / penalty wiring.
     out["investment_warning"] = ""
     out["hard_stop_triggered"] = False
