@@ -6,6 +6,7 @@ Reads Parquet from data dir, outputs factors_latest.parquet and .csv.
 from __future__ import annotations
 
 import argparse
+import math
 import logging
 import sys
 from pathlib import Path
@@ -21,6 +22,13 @@ log = logging.getLogger(__name__)
 INDEX_SYMBOL = "SP500"
 DEFAULT_DATA_DIR = "data"
 DEFAULT_OUT = "factors_latest"
+
+# OCF YoY / OCF-NI guards: tiny bases and sign-change windows blow up ratios for dev-stage names.
+MIN_OCF_YOY_BASE_ABS = 5_000_000.0
+OCF_YOY_CLIP_LOW = -0.95
+OCF_YOY_CLIP_HIGH = 3.0
+OCF_NI_CLIP_LOW = 0.0
+OCF_NI_CLIP_HIGH = 5.0
 
 # -----------------------------------------------------------------------------
 # Load
@@ -712,6 +720,7 @@ def get_ocf_yoy_at(
     as_of_date: Any,
     financials: pd.DataFrame,
 ) -> float:
+    # pre-revenue / tiny-base / sign-change cases are excluded from normal OCF YoY interpretation
     elig = get_financial_rows_available_by_as_of(symbol=symbol, as_of_date=as_of_date, financials=financials)
     if len(elig) < 8 or "operatingCashFlow" not in elig.columns:
         return np.nan
@@ -722,12 +731,17 @@ def get_ocf_yoy_at(
         return np.nan
     ocf_latest_4 = latest_4.sum()
     ocf_prev_4 = prev_4.sum()
-    if pd.isna(ocf_prev_4) or ocf_prev_4 == 0:
+    if pd.isna(ocf_prev_4) or pd.isna(ocf_latest_4):
         return np.nan
-    if pd.isna(ocf_latest_4):
+    prev_f = float(ocf_prev_4)
+    latest_f = float(ocf_latest_4)
+    if prev_f <= 0 or latest_f <= 0:
+        return np.nan
+    if abs(prev_f) < MIN_OCF_YOY_BASE_ABS:
         return np.nan
     try:
-        return float(ocf_latest_4) / float(ocf_prev_4) - 1.0
+        ratio = latest_f / prev_f - 1.0
+        return float(np.clip(ratio, OCF_YOY_CLIP_LOW, OCF_YOY_CLIP_HIGH))
     except Exception:
         return np.nan
 
@@ -742,6 +756,39 @@ def get_eps_yoy_at(
     return get_eps_yoy_from_eps_ttm_series(eps_series, tolerance_days=180)
 
 
+def get_eps_yoy_legacy_ratio_from_eps_ttm_series(
+    eps_series: pd.DataFrame,
+    *,
+    tolerance_days: int = 180,
+) -> float:
+    """
+    Diagnostic only: raw EPS(TTM) YoY ratio without positive-earnings guard.
+    Loss / turnaround periods can invert or distort the ratio; do not use for scoring.
+    """
+    if eps_series is None or eps_series.empty or "fiscalDate" not in eps_series.columns or "eps_ttm" not in eps_series.columns:
+        return np.nan
+    eps_series = eps_series.sort_values("fiscalDate").reset_index(drop=True)
+    if eps_series.empty:
+        return np.nan
+
+    eps_latest = _float_or_nan(eps_series.iloc[-1]["eps_ttm"])
+    latest_fd_dt = pd.to_datetime(eps_series.iloc[-1]["fiscalDate"], errors="coerce")
+    if eps_latest is None or (isinstance(eps_latest, float) and np.isnan(eps_latest)) or pd.isna(latest_fd_dt):
+        return np.nan
+
+    target_1y = latest_fd_dt - pd.DateOffset(days=365)
+    eps_prev = pick_eps_ttm_at_or_near(eps_series, target_1y, tolerance_days=tolerance_days)
+    if eps_prev is None or (isinstance(eps_prev, float) and np.isnan(eps_prev)):
+        return np.nan
+    if float(eps_prev) == 0.0:
+        return np.nan
+
+    try:
+        return float(eps_latest) / float(eps_prev) - 1.0
+    except Exception:
+        return np.nan
+
+
 def get_eps_yoy_from_eps_ttm_series(
     eps_series: pd.DataFrame,
     *,
@@ -753,8 +800,10 @@ def get_eps_yoy_from_eps_ttm_series(
     PIT EPS YoY rule (single source of truth):
       - eps_series must already be constructed using eligible financial rows
         where effective_date <= as_of_date (no future leakage).
-      - EPS YoY = EPS(TTM)_latest / EPS(TTM)_(~1y earlier) - 1
-      - ~1y earlier is selected via nearest fiscalDate within tolerance_days.
+      - ~1y earlier EPS(TTM) is selected via nearest fiscalDate within tolerance_days.
+
+    EPS YoY is treated as a standard growth rate only in positive-to-positive EPS regimes;
+    negative/turnaround regimes are excluded from normal YoY interpretation (returns NaN).
     """
     if eps_series is None or eps_series.empty or "fiscalDate" not in eps_series.columns or "eps_ttm" not in eps_series.columns:
         return np.nan
@@ -764,16 +813,25 @@ def get_eps_yoy_from_eps_ttm_series(
 
     eps_latest = _float_or_nan(eps_series.iloc[-1]["eps_ttm"])
     latest_fd_dt = pd.to_datetime(eps_series.iloc[-1]["fiscalDate"], errors="coerce")
-    if eps_latest is None or eps_latest == 0 or pd.isna(latest_fd_dt):
+    if eps_latest is None or (isinstance(eps_latest, float) and np.isnan(eps_latest)) or pd.isna(latest_fd_dt):
         return np.nan
 
     target_1y = latest_fd_dt - pd.DateOffset(days=365)
     eps_prev = pick_eps_ttm_at_or_near(eps_series, target_1y, tolerance_days=tolerance_days)
-    if eps_prev is None or eps_prev == 0 or pd.isna(eps_prev):
+    if eps_prev is None or (isinstance(eps_prev, float) and np.isnan(eps_prev)):
+        return np.nan
+
+    latest_f = float(eps_latest)
+    prior_f = float(eps_prev)
+    if latest_f <= 0.0 or prior_f <= 0.0:
         return np.nan
 
     try:
-        return float(eps_latest) / float(eps_prev) - 1.0
+        yoy = latest_f / prior_f - 1.0
+        if not math.isfinite(yoy):
+            return np.nan
+        # Clip extreme YoY for stability (same band as OCF YoY caps).
+        return float(np.clip(yoy, -0.95, 3.0))
     except Exception:
         return np.nan
 
@@ -783,6 +841,7 @@ def get_ocf_ni_at(
     as_of_date: Any,
     financials: pd.DataFrame,
 ) -> float:
+    # OCF/NI is only meaningful for positive NI and positive OCF
     elig = get_financial_rows_available_by_as_of(symbol=symbol, as_of_date=as_of_date, financials=financials)
     if len(elig) < 4:
         return np.nan
@@ -795,12 +854,13 @@ def get_ocf_ni_at(
         return np.nan
     ocf_ttm = ocf_4.sum()
     ni_ttm = ni_4.sum()
-    if pd.isna(ni_ttm) or ni_ttm == 0:
+    if pd.isna(ni_ttm) or pd.isna(ocf_ttm):
         return np.nan
-    if pd.isna(ocf_ttm):
+    if float(ni_ttm) <= 0 or float(ocf_ttm) <= 0:
         return np.nan
     try:
-        return float(ocf_ttm) / float(ni_ttm)
+        ratio = float(ocf_ttm) / float(ni_ttm)
+        return float(np.clip(ratio, OCF_NI_CLIP_LOW, OCF_NI_CLIP_HIGH))
     except Exception:
         return np.nan
 
@@ -1156,6 +1216,45 @@ def pick_eps_ttm_at_or_near(series_df: pd.DataFrame, target_date: Any, tolerance
     if pd.isna(diffs.loc[idx]) or diffs.loc[idx] > tolerance_days:
         return np.nan
     return _float_or_nan(series_df.loc[idx, "eps_ttm"])
+
+
+def get_prior_fiscal_year_actual_eps_from_ttm_series(
+    series_eps: pd.DataFrame | None,
+    latest_fd_dt: pd.Timestamp | None,
+    tolerance_days: int = 180,
+) -> float | None:
+    """
+    For EPS This Y growth, prior actual EPS is approximated using EPS(TTM) near the prior fiscal year-end.
+    This is a derived growth input; FMP does not directly provide a finished 'EPS This Y %' metric in this pipeline.
+
+    Expects ``series_eps`` from ``get_eps_ttm_series_at()`` (fiscalDate, eps_ttm). ``latest_fd_dt`` is the
+    anchor fiscal period end (e.g. latest row in that series); prior year is approximated by stepping back
+    one calendar year and picking the nearest EPS(TTM) observation within ``tolerance_days``.
+    """
+    if series_eps is None or getattr(series_eps, "empty", True):
+        return None
+    if latest_fd_dt is None:
+        return None
+    try:
+        anchor = pd.Timestamp(latest_fd_dt)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(anchor):
+        return None
+    try:
+        target_prev_fy = anchor - pd.DateOffset(years=1)
+    except Exception:
+        return None
+    if pd.isna(target_prev_fy):
+        return None
+    picked = pick_eps_ttm_at_or_near(series_eps, target_prev_fy, tolerance_days=tolerance_days)
+    try:
+        fv = float(picked)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(fv):
+        return None
+    return fv
 
 
 # DEPRECATED: legacy latest-only helper, not used by PIT engine main path.
@@ -1861,6 +1960,69 @@ def safe_div(a: float, b: float) -> float:
         return np.nan
 
 
+def compute_operating_invested_capital(
+    debt: float | None,
+    equity: float | None,
+    cash: float | None,
+    total_assets: float | None,
+    revenue_ttm: float | None,
+) -> tuple[float | None, float | None, float | None, float | None]:
+    """
+    Operating invested capital for ROIC-style denominators.
+
+    ROIC should not subtract all cash for cash-heavy or pre-revenue firms: only excess cash
+    (above an operating liquidity buffer) is excluded. A denominator floor caps how small IC
+    can become vs assets/equity, reducing unstable ROIC blow-ups.
+
+    Returns:
+        (invested_capital, operating_cash_buffer, excess_cash, invested_cap_floor)
+    """
+    def _fin(x: Any) -> float | None:
+        if x is None:
+            return None
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return None
+        return v if math.isfinite(v) else None
+
+    ta = _fin(total_assets)
+    rev = _fin(revenue_ttm)
+    base_asset_buffer = 0.05 * ta if (ta is not None and ta > 0) else 0.0
+    base_revenue_buffer = 0.10 * rev if (rev is not None and rev > 0) else 0.0
+    operating_cash_buffer = max(base_asset_buffer, base_revenue_buffer)
+
+    cash_val = 0.0
+    if cash is not None:
+        c = _fin(cash)
+        if c is not None:
+            cash_val = c
+    excess_cash = max(cash_val - operating_cash_buffer, 0.0)
+
+    eq = _fin(equity)
+    floor_assets = 0.10 * ta if (ta is not None and ta > 0) else 0.0
+    floor_equity = 0.20 * eq if (eq is not None and eq > 0) else 0.0
+    invested_cap_floor = max(floor_assets, floor_equity, 1.0)
+
+    if debt is None or equity is None:
+        return (None, operating_cash_buffer, excess_cash, invested_cap_floor)
+
+    d = _fin(debt)
+    e = _fin(equity)
+    if d is None or e is None:
+        return (None, operating_cash_buffer, excess_cash, invested_cap_floor)
+
+    pre_floor_invested_capital = float(d) + float(e) - float(excess_cash)
+    if not math.isfinite(pre_floor_invested_capital):
+        return (None, operating_cash_buffer, excess_cash, invested_cap_floor)
+
+    invested_capital = max(pre_floor_invested_capital, invested_cap_floor)
+    if not math.isfinite(invested_capital):
+        return (None, operating_cash_buffer, excess_cash, invested_cap_floor)
+
+    return (invested_capital, operating_cash_buffer, excess_cash, invested_cap_floor)
+
+
 def build_financial_indicators(
     row_latest: Optional[Dict],
     row_ttm: Optional[Dict],
@@ -1877,9 +2039,12 @@ def build_financial_indicators(
             "EBITDA (Reported TTM)", "EBITDA (Operating TTM)", "Reconciled Depreciation (TTM)",
             "Quick Ratio", "Current Ratio", "Debt/Eq", "LT Debt/Eq",
             "ROA", "ROE", "ROIC",
+            "ROIC NOPAT TTM", "ROIC IC Latest", "ROIC IC Prev", "ROIC IC Avg",
+            "ROIC Cash Buffer Latest", "ROIC Cash Buffer Prev",
+            "ROIC Excess Cash Latest", "ROIC Excess Cash Prev", "ROIC Calc Source",
             "Gross Margin", "Oper. Margin", "Profit Margin", "Shs Outstand",
         ]:
-            out[k] = np.nan
+            out[k] = np.nan if k != "ROIC Calc Source" else ""
         return out
 
     rev_l = _float_or_nan(row_latest.get("revenue"))
@@ -1942,13 +2107,33 @@ def build_financial_indicators(
     ):
         out["EPS (ttm)"] = float(ni_ttm) / float(wad_ttm)
     eps_ttm = out["EPS (ttm)"]
+    # P/E: negative or zero EPS(TTM) => NaN (not meaningful as a "cheap" multiple).
     out["P/E"] = np.nan
-    if eps_ttm is not None and not np.isnan(eps_ttm) and eps_ttm != 0 and price is not None and not np.isnan(price):
+    if (
+        eps_ttm is not None
+        and not np.isnan(eps_ttm)
+        and float(eps_ttm) > 0
+        and price is not None
+        and not np.isnan(price)
+    ):
         out["P/E"] = float(price) / float(eps_ttm)
     out["P/S"] = safe_div(price, safe_div(rev_ttm, sh)) if row_ttm and sh and rev_ttm is not None else np.nan
     out["P/B"] = safe_div(price, safe_div(eq_l, sh)) if sh else np.nan
     out["P/C"] = safe_div(price, safe_div(cash_l, sh)) if sh else np.nan
-    out["P/FCF"] = safe_div(price, safe_div(fcf_ttm, sh)) if row_ttm and sh and fcf_ttm is not None else np.nan
+    # P/FCF: require positive TTM FCF and positive shares; negative FCF => NaN (not a valid multiple).
+    out["P/FCF"] = np.nan
+    if (
+        row_ttm
+        and sh is not None
+        and not np.isnan(sh)
+        and float(sh) > 0
+        and fcf_ttm is not None
+        and not np.isnan(fcf_ttm)
+        and float(fcf_ttm) > 0
+        and price is not None
+        and not np.isnan(price)
+    ):
+        out["P/FCF"] = safe_div(price, safe_div(fcf_ttm, sh))
 
     out["Market Cap"] = price * sh if sh and not np.isnan(sh) else np.nan
     mc = out["Market Cap"]
@@ -1959,18 +2144,32 @@ def build_financial_indicators(
     out["EBITDA (Operating TTM)"] = ebitda_operating_ttm
     out["Reconciled Depreciation (TTM)"] = reconciled_dep_ttm
 
-    ev_ok = ev is not None and not (isinstance(ev, (int, float)) and np.isnan(ev))
+    # EV multiples: require strictly positive EV and EBITDA bases; negative or non-positive bases are not meaningful, not "cheap".
+    try:
+        ev_f = float(ev) if ev is not None else float("nan")
+    except (TypeError, ValueError):
+        ev_f = float("nan")
+    ev_pos = not np.isnan(ev_f) and ev_f > 0
     ebitda_oper_ok = (
         ebitda_operating_ttm is not None
         and not (isinstance(ebitda_operating_ttm, (int, float)) and np.isnan(ebitda_operating_ttm))
-        and ebitda_operating_ttm != 0
+        and float(ebitda_operating_ttm) > 0
+    )
+    ebitda_rep_ok = (
+        ebitda_reported_ttm is not None
+        and not (isinstance(ebitda_reported_ttm, (int, float)) and np.isnan(ebitda_reported_ttm))
+        and float(ebitda_reported_ttm) > 0
     )
 
     out["EV/EBITDA Source"] = (
-        "operating" if (row_ttm and ev_ok and ebitda_oper_ok) else "missing_operating_ebitda"
+        "operating" if (row_ttm and ev_pos and ebitda_oper_ok) else "missing_operating_ebitda"
     )
-    out["EV/EBITDA"] = safe_div(ev, ebitda_operating_ttm) if row_ttm and ev is not None else np.nan
-    out["EV/EBITDA (Reported)"] = safe_div(ev, ebitda_reported_ttm) if row_ttm and ev is not None else np.nan
+    out["EV/EBITDA"] = (
+        float(ev) / float(ebitda_operating_ttm) if (row_ttm and ev_pos and ebitda_oper_ok) else np.nan
+    )
+    out["EV/EBITDA (Reported)"] = (
+        float(ev) / float(ebitda_reported_ttm) if (row_ttm and ev_pos and ebitda_rep_ok) else np.nan
+    )
     out["EV/Sales"] = safe_div(ev, rev_ttm) if row_ttm and ev is not None else np.nan
 
     out["Quick Ratio"] = safe_div(cash_l + rec_l, cl_l) if cl_l else np.nan
@@ -1981,9 +2180,28 @@ def build_financial_indicators(
     out["ROA"] = safe_div(ni_ttm, ta_l) if row_ttm and ta_l else np.nan
     out["ROE"] = safe_div(ni_ttm, eq_l) if row_ttm and eq_l else np.nan
 
-    # ROIC = NOPAT_TTM / InvestedCapital; IC = debt + equity - cash (현금 전액 차감 유지)
-    # IC 분모: latest와 직전 분기 평균; tax_rate 안정화(IBT 규모/부호 이상 시 0.21 또는 clamp)
+    # ROIC = NOPAT_TTM / average operating invested capital (excess cash only + denominator floor; see compute_operating_invested_capital).
+    # Denominator: mean(latest quarter IC, prior quarter IC) when both exist; else latest only. TTM revenue drives buffer for both.
     out["ROIC"] = np.nan
+    out["ROIC NOPAT TTM"] = np.nan
+    out["ROIC IC Latest"] = np.nan
+    out["ROIC IC Prev"] = np.nan
+    out["ROIC IC Avg"] = np.nan
+    out["ROIC Cash Buffer Latest"] = np.nan
+    out["ROIC Cash Buffer Prev"] = np.nan
+    out["ROIC Excess Cash Latest"] = np.nan
+    out["ROIC Excess Cash Prev"] = np.nan
+    out["ROIC Calc Source"] = ""
+
+    def _roic_finance_arg(x: Any) -> float | None:
+        if x is None:
+            return None
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return None
+        return v if math.isfinite(v) else None
+
     if row_ttm and row_latest:
         ebit_ttm = _float_or_nan(row_ttm.get("operatingIncome"))
         ibt_ttm = _float_or_nan(row_ttm.get("incomeBeforeTax"))
@@ -2000,27 +2218,63 @@ def build_financial_indicators(
         nopat_ttm = np.nan
         if ebit_ttm is not None and not np.isnan(ebit_ttm):
             nopat_ttm = float(ebit_ttm) * (1.0 - float(tax_rate))
-        cash_for_ic = 0.0 if (cash_l is None or np.isnan(cash_l)) else float(cash_l)
-        ic_latest = np.nan
-        if debt_l is not None and not np.isnan(debt_l) and eq_l is not None and not np.isnan(eq_l):
-            ic_latest = float(debt_l) + float(eq_l) - cash_for_ic
-        # 직전 분기 IC 있으면 평균, 없으면 latest만 사용
+        out["ROIC NOPAT TTM"] = nopat_ttm
+
+        ic_latest, buf_l, exc_l, _floor_l = compute_operating_invested_capital(
+            _roic_finance_arg(debt_l),
+            _roic_finance_arg(eq_l),
+            _roic_finance_arg(cash_l),
+            _roic_finance_arg(ta_l),
+            _roic_finance_arg(rev_ttm_roic),
+        )
+        out["ROIC IC Latest"] = float(ic_latest) if ic_latest is not None else np.nan
+        out["ROIC Cash Buffer Latest"] = float(buf_l) if buf_l is not None else np.nan
+        out["ROIC Excess Cash Latest"] = float(exc_l) if exc_l is not None else np.nan
+
+        ic_prev_val: float | None = None
+        buf_p: float | None = None
+        exc_p: float | None = None
         if row_prev_quarter is not None:
             debt_p = _float_or_nan(row_prev_quarter.get("totalDebt"))
             eq_p = _float_or_nan(row_prev_quarter.get("totalStockholdersEquity"))
             cash_p = _float_or_nan(row_prev_quarter.get("cashAndCashEquivalents"))
-            cash_p_val = 0.0 if (cash_p is None or np.isnan(cash_p)) else float(cash_p)
-            ic_prev = np.nan
-            if debt_p is not None and not np.isnan(debt_p) and eq_p is not None and not np.isnan(eq_p):
-                ic_prev = float(debt_p) + float(eq_p) - cash_p_val
-            if ic_latest is not None and not np.isnan(ic_latest) and ic_prev is not None and not np.isnan(ic_prev):
-                invested_cap = (float(ic_latest) + float(ic_prev)) / 2.0
-            else:
-                invested_cap = ic_latest
+            ta_p = _float_or_nan(row_prev_quarter.get("totalAssets"))
+            ic_prev_val, buf_p, exc_p, _floor_p = compute_operating_invested_capital(
+                _roic_finance_arg(debt_p),
+                _roic_finance_arg(eq_p),
+                _roic_finance_arg(cash_p),
+                _roic_finance_arg(ta_p),
+                _roic_finance_arg(rev_ttm_roic),
+            )
+            out["ROIC IC Prev"] = float(ic_prev_val) if ic_prev_val is not None else np.nan
+            out["ROIC Cash Buffer Prev"] = float(buf_p) if buf_p is not None else np.nan
+            out["ROIC Excess Cash Prev"] = float(exc_p) if exc_p is not None else np.nan
+
+        ic_avg: float | None = None
+        roic_src = ""
+        if ic_latest is not None and ic_prev_val is not None:
+            ic_avg = (float(ic_latest) + float(ic_prev_val)) / 2.0
+            roic_src = "operating_ic_avg"
+        elif ic_latest is not None:
+            ic_avg = float(ic_latest)
+            roic_src = "operating_ic_latest_only"
         else:
-            invested_cap = ic_latest
-        if invested_cap is not None and not np.isnan(invested_cap) and invested_cap != 0 and nopat_ttm is not None and not np.isnan(nopat_ttm):
-            out["ROIC"] = float(nopat_ttm) / float(invested_cap)
+            roic_src = "missing_ic"
+
+        out["ROIC IC Avg"] = float(ic_avg) if ic_avg is not None and math.isfinite(ic_avg) else np.nan
+
+        if nopat_ttm is None or (isinstance(nopat_ttm, float) and np.isnan(nopat_ttm)):
+            out["ROIC"] = np.nan
+            out["ROIC Calc Source"] = "missing_nopat"
+        elif ic_avg is None or (isinstance(ic_avg, float) and (not math.isfinite(ic_avg) or np.isnan(ic_avg))):
+            out["ROIC"] = np.nan
+            out["ROIC Calc Source"] = "missing_ic"
+        elif float(ic_avg) <= 0.0:
+            out["ROIC"] = np.nan
+            out["ROIC Calc Source"] = "nonpositive_ic"
+        else:
+            out["ROIC"] = float(nopat_ttm) / float(ic_avg)
+            out["ROIC Calc Source"] = roic_src
 
     # Finviz: margins from TTM (grossProfit_ttm/revenue_ttm etc.); fallback to latest quarter
     out["Gross Margin"] = safe_div(gp_ttm, rev_ttm) if row_ttm else (safe_div(gp_l, rev_l) if rev_l else np.nan)
@@ -2385,10 +2639,26 @@ OUTPUT_COLUMNS = [
     "EV/Sales",
     "Quick Ratio", "Current Ratio", "Debt/Eq", "LT Debt/Eq", "Interest Coverage",
     "ROA", "ROE", "ROIC",
+    "ROIC NOPAT TTM",
+    "ROIC IC Latest",
+    "ROIC IC Prev",
+    "ROIC IC Avg",
+    "ROIC Cash Buffer Latest",
+    "ROIC Cash Buffer Prev",
+    "ROIC Excess Cash Latest",
+    "ROIC Excess Cash Prev",
+    "ROIC Calc Source",
     "Gross Margin", "Oper. Margin", "Profit Margin", "OCF/NI", "OPM volatility",
     "Shs Outstand", "Share Dilution", "Shs Float",
     "Earnings (Date)", "Forward P/E", "PEG", "Dividend Est", "Dividend Gr. 3Y", "Dividend Gr. 5Y", "Dividend Ex-Date",
-    "EPS This Y", "EPS Next Y", "EPS Next Q", "EPS Next 5Y",
+    "EPS This Y",
+    "EPS This Y Est Level",
+    "EPS Next Y Est Level",
+    "EPS This Y Base Actual",
+    "EPS This Y Calc Source",
+    "EPS Next Y",
+    "EPS Next Q",
+    "EPS Next 5Y",
     "Insider Own/Trans", "Inst Own/Trans",
     "Short Float", "Short Interest", "Short Ratio", "Recom",
     "Target Price", "Index",
@@ -3153,9 +3423,11 @@ def main() -> None:
                 idx_val = idx_row.get("isMember", np.nan)
                 index_public_date = idx_row.get("effective_date", np.nan)
 
-            # --- Estimates (Finviz-style): 4 separate EPS columns ---
-            eps_this_y = np.nan
-            eps_next_y = np.nan
+            # EPS Next Y raw estimate level is preserved for valuation use, but growth scoring is disabled
+            # until a normalized definition is added (see EPS Next Y Est Level; Forward P/E uses eps_next_y_est).
+            # --- Estimates: annual EPS estimate levels (not growth %); growth derived below for EPS This Y ---
+            eps_this_y_est = np.nan
+            eps_next_y_est = np.nan
             eps_next_q = np.nan
             est_dates: list[str] = []
             ea_row = select_latest_row_from_symbol_effective_lookup(
@@ -3165,8 +3437,8 @@ def main() -> None:
                 effective_date_col="effective_date",
             )
             if ea_row is not None:
-                eps_this_y = _float_or_nan(ea_row.get("epsThisY"))
-                eps_next_y = _float_or_nan(ea_row.get("epsNextY"))
+                eps_this_y_est = _float_or_nan(ea_row.get("epsThisY"))
+                eps_next_y_est = _float_or_nan(ea_row.get("epsNextY"))
                 est_dates.append(ea_row.get("effective_date", np.nan))
             eq_row = select_latest_row_from_symbol_effective_lookup(
                 est_q_lookup,
@@ -3180,18 +3452,54 @@ def main() -> None:
             est_dates = [d for d in est_dates if d is not None and not (isinstance(d, float) and np.isnan(d))]
             estimates_public_date = max(est_dates) if est_dates else np.nan
 
-            # Forward 1Y growth g_fwd from estimates
+            # Single EPS(TTM) series for YoY, historical CAGR, and prior-FY base vs estimate level.
+            series_eps = get_eps_ttm_series_at(sym, as_of, fin_sym_df)
+            latest_fd_dt = pd.to_datetime(financials_date, errors="coerce") if financials_date is not None else pd.NaT
+            latest_fd_anchor = None if pd.isna(latest_fd_dt) else latest_fd_dt
+            prior_actual_eps = get_prior_fiscal_year_actual_eps_from_ttm_series(
+                series_eps, latest_fd_anchor, tolerance_days=180
+            )
+
+            # Forward 1Y growth g_fwd from analyst estimate levels: next-year / this-year - 1 (not EPS This Y factor).
             g_fwd = np.nan
             if (
-                eps_this_y is not None and not np.isnan(eps_this_y) and eps_this_y > 0
-                and eps_next_y is not None and not np.isnan(eps_next_y) and eps_next_y > 0
+                eps_this_y_est is not None
+                and not np.isnan(eps_this_y_est)
+                and float(eps_this_y_est) > 0
+                and eps_next_y_est is not None
+                and not np.isnan(eps_next_y_est)
+                and float(eps_next_y_est) > 0
             ):
-                g_fwd = (float(eps_next_y) / float(eps_this_y)) - 1.0
+                g_fwd = (float(eps_next_y_est) / float(eps_this_y_est)) - 1.0
+
+            # EPS This Y (factor) = implied growth vs prior fiscal year actual (TTM near prior FY-end).
+            eps_this_y_calc_source = "missing_estimate"
+            eps_this_y_growth = np.nan
+            has_est = eps_this_y_est is not None and not (isinstance(eps_this_y_est, float) and np.isnan(eps_this_y_est))
+            if not has_est:
+                eps_this_y_calc_source = "missing_estimate"
+            elif prior_actual_eps is None:
+                eps_this_y_calc_source = "missing_prior_actual"
+            elif float(prior_actual_eps) <= 0:
+                eps_this_y_calc_source = "invalid_nonpositive_base"
+            elif float(eps_this_y_est) <= 0:
+                eps_this_y_calc_source = "invalid_nonpositive_base"
+            else:
+                try:
+                    _g_ty = float(eps_this_y_est) / float(prior_actual_eps) - 1.0
+                    if not math.isfinite(_g_ty):
+                        eps_this_y_growth = np.nan
+                        eps_this_y_calc_source = "missing_prior_actual"
+                    else:
+                        # Clip extreme implied YoY for stability (same spirit as OCF YoY caps).
+                        eps_this_y_growth = float(np.clip(_g_ty, -0.95, 3.0))
+                        eps_this_y_calc_source = "derived_from_estimate_and_prior_actual"
+                except (TypeError, ValueError, ZeroDivisionError):
+                    eps_this_y_growth = np.nan
+                    eps_this_y_calc_source = "missing_prior_actual"
 
             # Historical EPS CAGR (5Y with 3Y fallback) from EPS(TTM) time series
             g_hist = np.nan
-            series_eps = get_eps_ttm_series_at(sym, as_of, fin_sym_df)
-            latest_fd_dt = pd.to_datetime(financials_date, errors="coerce") if financials_date is not None else pd.NaT
             if series_eps is not None and not series_eps.empty and not pd.isna(latest_fd_dt):
                 # PIT EPS YoY (single source of truth): computed from eligible EPS(TTM) series only.
                 eps_yoy_val = get_eps_yoy_from_eps_ttm_series(series_eps, tolerance_days=180)
@@ -3242,9 +3550,16 @@ def main() -> None:
                 if eps_next_5y_pct > 100.0:
                     eps_next_5y_pct = 100.0
 
+            # Forward P/E: uses next-year analyst EPS estimate level (not EPS This Y growth).
             forward_pe = np.nan
-            if eps_next_y is not None and not np.isnan(eps_next_y) and eps_next_y != 0:
-                forward_pe = price / eps_next_y
+            if (
+                eps_next_y_est is not None
+                and not np.isnan(eps_next_y_est)
+                and float(eps_next_y_est) > 0
+                and price is not None
+                and not np.isnan(price)
+            ):
+                forward_pe = price / eps_next_y_est
 
             pe = fin_inds.get("P/E", np.nan)
             peg = np.nan
@@ -3262,8 +3577,9 @@ def main() -> None:
                 debug_eps_samples.append(
                     {
                         "symbol": sym,
-                        "epsThisY": eps_this_y,
-                        "epsNextY": eps_next_y,
+                        "epsThisY_est": eps_this_y_est,
+                        "epsNextY_est": eps_next_y_est,
+                        "epsThisY_growth": eps_this_y_growth,
                         "g_fwd": g_fwd,
                         "g_hist": g_hist,
                         "epsNext5Y_pct": eps_next_5y_pct,
@@ -3343,8 +3659,21 @@ def main() -> None:
                 "Dividend Gr. 3Y": gr3_pct,
                 "Dividend Gr. 5Y": gr5_pct,
                 "Dividend Ex-Date": div_ex_date,
-                "EPS This Y": eps_this_y if (eps_this_y is not None and not np.isnan(eps_this_y)) else np.nan,
-                "EPS Next Y": eps_next_y if (eps_next_y is not None and not np.isnan(eps_next_y)) else np.nan,
+                "EPS This Y": eps_this_y_growth
+                if (eps_this_y_growth is not None and not (isinstance(eps_this_y_growth, float) and np.isnan(eps_this_y_growth)))
+                else np.nan,
+                "EPS This Y Est Level": eps_this_y_est
+                if (eps_this_y_est is not None and not (isinstance(eps_this_y_est, float) and np.isnan(eps_this_y_est)))
+                else np.nan,
+                "EPS Next Y Est Level": eps_next_y_est
+                if (eps_next_y_est is not None and not (isinstance(eps_next_y_est, float) and np.isnan(eps_next_y_est)))
+                else np.nan,
+                "EPS This Y Base Actual": float(prior_actual_eps)
+                if prior_actual_eps is not None
+                else np.nan,
+                "EPS This Y Calc Source": eps_this_y_calc_source,
+                # Legacy column left blank: canonical next-year estimate level is EPS Next Y Est Level (G factor disabled).
+                "EPS Next Y": np.nan,
                 "EPS Next Q": eps_next_q if (eps_next_q is not None and not np.isnan(eps_next_q)) else np.nan,
                 "EPS Next 5Y": eps_next_5y_pct,
                 "Insider Own/Trans": insider_own_trans_str,
@@ -3510,7 +3839,15 @@ def main() -> None:
     log.info("Share Dilution non-null: %s / %s", out_df["Share Dilution"].notna().sum(), len(out_df))
     log.info("Interest Coverage non-null: %s / %s", out_df["Interest Coverage"].notna().sum(), len(out_df))
     log.info("OPM volatility non-null: %s / %s", out_df["OPM volatility"].notna().sum(), len(out_df))
-    eps_cols = ["EPS This Y", "EPS Next Y", "EPS Next Q", "EPS Next 5Y"]
+    eps_cols = [
+        "EPS This Y",
+        "EPS This Y Est Level",
+        "EPS Next Y Est Level",
+        "EPS This Y Base Actual",
+        "EPS Next Y",
+        "EPS Next Q",
+        "EPS Next 5Y",
+    ]
     log.info(
         "EPS columns (float): %s",
         [c for c in eps_cols if c in out_df.columns and np.issubdtype(out_df[c].dtype, np.floating)],
@@ -3526,10 +3863,11 @@ def main() -> None:
         log.info("PEG non-null: %s / %s", _nn(peg_list), total)
         for sample in debug_eps_samples[:5]:
             log.debug(
-                "EPS5Y sample %s: epsThisY=%s epsNextY=%s g_fwd=%s g_hist=%s epsNext5Y_pct=%s pe=%s peg=%s",
+                "EPS5Y sample %s: epsThisY_est=%s epsNextY_est=%s epsThisY_growth=%s g_fwd=%s g_hist=%s epsNext5Y_pct=%s pe=%s peg=%s",
                 sample.get("symbol"),
-                sample.get("epsThisY"),
-                sample.get("epsNextY"),
+                sample.get("epsThisY_est"),
+                sample.get("epsNextY_est"),
+                sample.get("epsThisY_growth"),
                 sample.get("g_fwd"),
                 sample.get("g_hist"),
                 sample.get("epsNext5Y_pct"),

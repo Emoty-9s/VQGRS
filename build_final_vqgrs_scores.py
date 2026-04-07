@@ -8,9 +8,8 @@ Input:
 Output:
   - output/scoring/final_vqgrs_scores_latest.(parquet|csv)
 
-``final_score`` is the simple mean of ``score_V``…``score_S`` (missing categories skipped; all
-missing → 50.0). Track assignment from ``factors_latest`` is label-only and does not select a
-score profile.
+``final_score`` is selected from track-weighted LTI profiles (A/B/C/N), with missing-aware
+weight renormalization and placeholder penalty/hard-stop stage.
 """
 from __future__ import annotations
 
@@ -25,7 +24,7 @@ from score_primitives import evidence_to_score
 
 
 CORE_CATS = ["V", "Q", "G", "R", "S"]
-FINAL_METHOD_LABEL = "simple_equal_category_scores"
+FINAL_METHOD_LABEL = "track_weighted_lti_v1"
 
 
 def _read_df(path: Path) -> pd.DataFrame:
@@ -38,7 +37,7 @@ def _read_df(path: Path) -> pd.DataFrame:
 
 def _load_track_inputs_from_factors_latest() -> pd.DataFrame:
     """
-    Track raw input source with safe fallback:
+    Track raw inputs with safe fallback:
       - data/factors_latest.parquet
       - if missing: data/factors_latest.csv
       - if both missing/empty: return empty DataFrame with required columns
@@ -61,6 +60,8 @@ def _load_track_inputs_from_factors_latest() -> pd.DataFrame:
                 "track_input_oper_margin",
                 "track_input_ocf_ni",
                 "track_input_revenue_yoy",
+                "track_input_eps_yoy",
+                "track_input_ocf_yoy",
                 "track_input_debt_to_equity",
                 "track_input_current_ratio",
                 "track_input_interest_coverage",
@@ -68,9 +69,7 @@ def _load_track_inputs_from_factors_latest() -> pd.DataFrame:
                 "track_input_pe",
                 "track_input_ps",
                 "track_input_ev_ebitda",
-                "track_input_rule_of_40_calc",
-                "track_A_valuation_valid_count",
-                "track_input_v_market_proxy",
+                "track_input_share_dilution",
             ]
         )
     if fac.empty:
@@ -82,6 +81,8 @@ def _load_track_inputs_from_factors_latest() -> pd.DataFrame:
                 "track_input_oper_margin",
                 "track_input_ocf_ni",
                 "track_input_revenue_yoy",
+                "track_input_eps_yoy",
+                "track_input_ocf_yoy",
                 "track_input_debt_to_equity",
                 "track_input_current_ratio",
                 "track_input_interest_coverage",
@@ -89,9 +90,7 @@ def _load_track_inputs_from_factors_latest() -> pd.DataFrame:
                 "track_input_pe",
                 "track_input_ps",
                 "track_input_ev_ebitda",
-                "track_input_rule_of_40_calc",
-                "track_A_valuation_valid_count",
-                "track_input_v_market_proxy",
+                "track_input_share_dilution",
             ]
         )
 
@@ -100,9 +99,47 @@ def _load_track_inputs_from_factors_latest() -> pd.DataFrame:
             fac = fac.copy()
             fac["as_of_date"] = fac["asOfDate"]
         else:
-            raise ValueError("factors_latest.parquet must contain as_of_date (or asOfDate).")
+            return pd.DataFrame(
+                columns=[
+                    "symbol",
+                    "as_of_date",
+                    "track_input_roic",
+                    "track_input_oper_margin",
+                    "track_input_ocf_ni",
+                    "track_input_revenue_yoy",
+                    "track_input_eps_yoy",
+                    "track_input_ocf_yoy",
+                    "track_input_debt_to_equity",
+                    "track_input_current_ratio",
+                    "track_input_interest_coverage",
+                    "track_input_beta",
+                    "track_input_pe",
+                    "track_input_ps",
+                    "track_input_ev_ebitda",
+                    "track_input_share_dilution",
+                ]
+            )
     if "symbol" not in fac.columns:
-        raise ValueError("factors_latest.parquet must contain symbol.")
+        return pd.DataFrame(
+            columns=[
+                "symbol",
+                "as_of_date",
+                "track_input_roic",
+                "track_input_oper_margin",
+                "track_input_ocf_ni",
+                "track_input_revenue_yoy",
+                "track_input_eps_yoy",
+                "track_input_ocf_yoy",
+                "track_input_debt_to_equity",
+                "track_input_current_ratio",
+                "track_input_interest_coverage",
+                "track_input_beta",
+                "track_input_pe",
+                "track_input_ps",
+                "track_input_ev_ebitda",
+                "track_input_share_dilution",
+            ]
+        )
 
     needed = [
         "symbol",
@@ -111,6 +148,8 @@ def _load_track_inputs_from_factors_latest() -> pd.DataFrame:
         "Oper. Margin",
         "OCF/NI",
         "Revenue YoY",
+        "EPS YoY",
+        "OCF YoY",
         "Debt/Eq",
         "Current Ratio",
         "Interest Coverage",
@@ -118,6 +157,7 @@ def _load_track_inputs_from_factors_latest() -> pd.DataFrame:
         "P/E",
         "P/S",
         "EV/EBITDA",
+        "Share Dilution",
     ]
     for c in needed:
         if c not in fac.columns:
@@ -150,6 +190,8 @@ def _load_track_inputs_from_factors_latest() -> pd.DataFrame:
             "Oper. Margin": "track_input_oper_margin",
             "OCF/NI": "track_input_ocf_ni",
             "Revenue YoY": "track_input_revenue_yoy",
+            "EPS YoY": "track_input_eps_yoy",
+            "OCF YoY": "track_input_ocf_yoy",
             "Debt/Eq": "track_input_debt_to_equity",
             "Current Ratio": "track_input_current_ratio",
             "Interest Coverage": "track_input_interest_coverage",
@@ -157,41 +199,85 @@ def _load_track_inputs_from_factors_latest() -> pd.DataFrame:
             "P/E": "track_input_pe",
             "P/S": "track_input_ps",
             "EV/EBITDA": "track_input_ev_ebitda",
+            "Share Dilution": "track_input_share_dilution",
         }
     )
-
-    work["track_input_rule_of_40_calc"] = np.where(
-        pd.to_numeric(work["track_input_revenue_yoy"], errors="coerce").notna()
-        & pd.to_numeric(work["track_input_oper_margin"], errors="coerce").notna(),
-        pd.to_numeric(work["track_input_revenue_yoy"], errors="coerce")
-        + pd.to_numeric(work["track_input_oper_margin"], errors="coerce"),
-        np.nan,
-    )
-
-    def _lower_better_score(series: pd.Series) -> pd.Series:
-        x = pd.to_numeric(series, errors="coerce")
-        med = float(x.median(skipna=True))
-        q25 = float(x.quantile(0.25))
-        q75 = float(x.quantile(0.75))
-        iqr = q75 - q25
-        if not np.isfinite(iqr) or iqr <= 0:
-            return pd.Series(np.nan, index=x.index, dtype=float)
-        z = (x - med) / iqr
-        return pd.Series(np.clip(50.0 - 20.0 * z, 0.0, 100.0), index=x.index, dtype=float)
-
-    pe_s = _lower_better_score(work["track_input_pe"])
-    ps_s = _lower_better_score(work["track_input_ps"])
-    ev_s = _lower_better_score(work["track_input_ev_ebitda"])
-    valid_pe = pe_s.notna()
-    valid_ps = ps_s.notna()
-    valid_ev = ev_s.notna()
-    val_count = valid_pe.astype(int) + valid_ps.astype(int) + valid_ev.astype(int)
-    work["track_A_valuation_valid_count"] = val_count.astype(float)
-
-    den = valid_pe.astype(float) * 0.4 + valid_ps.astype(float) * 0.3 + valid_ev.astype(float) * 0.3
-    num = pe_s.fillna(0.0) * 0.4 + ps_s.fillna(0.0) * 0.3 + ev_s.fillna(0.0) * 0.3
-    work["track_input_v_market_proxy"] = np.where((val_count >= 2) & (den > 0), num / den, np.nan)
     return work
+
+
+def _load_track_a_inputs_from_group_a_snapshot() -> pd.DataFrame:
+    """
+    Prepare raw/peer valuation inputs for upcoming Track A rule refresh.
+    """
+    pq_path = Path("output") / "group_a" / "group_a_snapshot_latest.parquet"
+    csv_path = Path("output") / "group_a" / "group_a_snapshot_latest.csv"
+
+    out_cols = [
+        "symbol",
+        "as_of_date",
+        "track_a_raw_pe",
+        "track_a_raw_ps",
+        "track_a_raw_ev_ebitda",
+        "track_a_peer_pe_median",
+        "track_a_peer_ps_median",
+        "track_a_peer_ev_ebitda_median",
+        "track_a_peer_pe_n_valid",
+        "track_a_peer_ps_n_valid",
+        "track_a_peer_ev_ebitda_n_valid",
+    ]
+
+    snap = _read_df(pq_path)
+    src = pq_path
+    if snap.empty:
+        snap = _read_df(csv_path)
+        src = csv_path
+    if snap.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    if "symbol" not in snap.columns:
+        return pd.DataFrame(columns=out_cols)
+    if "as_of_date" not in snap.columns:
+        if "asOfDate" in snap.columns:
+            snap = snap.copy()
+            snap["as_of_date"] = snap["asOfDate"]
+        else:
+            return pd.DataFrame(columns=out_cols)
+
+    use_map = {
+        "P/E": "track_a_raw_pe",
+        "P/S": "track_a_raw_ps",
+        "EV/EBITDA": "track_a_raw_ev_ebitda",
+        "rep__P/E__median": "track_a_peer_pe_median",
+        "rep__P/S__median": "track_a_peer_ps_median",
+        "rep__EV/EBITDA__median": "track_a_peer_ev_ebitda_median",
+        "rep__P/E__n_valid": "track_a_peer_pe_n_valid",
+        "rep__P/S__n_valid": "track_a_peer_ps_n_valid",
+        "rep__EV/EBITDA__n_valid": "track_a_peer_ev_ebitda_n_valid",
+    }
+
+    base_cols = ["symbol", "as_of_date"]
+    present = [c for c in use_map.keys() if c in snap.columns]
+    work = snap[base_cols + present].copy()
+    work["symbol"] = work["symbol"].astype(str).str.strip().str.upper()
+    work["as_of_date"] = pd.to_datetime(work["as_of_date"], errors="coerce")
+    work = work.dropna(subset=["as_of_date"])
+    if work.empty:
+        return pd.DataFrame(columns=out_cols)
+    work["as_of_date"] = work["as_of_date"].dt.strftime("%Y-%m-%d")
+
+    for src_col in present:
+        work[src_col] = pd.to_numeric(work[src_col], errors="coerce")
+
+    work = work.rename(columns=use_map)
+    work = (
+        work.groupby(["symbol", "as_of_date"], as_index=False, dropna=False)
+        .agg({c: "median" for c in work.columns if c not in ("symbol", "as_of_date")})
+    )
+    for c in out_cols:
+        if c not in work.columns:
+            work[c] = np.nan
+    print(f"Track A raw source: {src} | rows={len(work)}")
+    return work[out_cols].copy()
 
 
 def _save_df(df: pd.DataFrame, parquet_path: Path, csv_path: Path) -> None:
@@ -228,6 +314,35 @@ def _simple_mean_category_scores(df: pd.DataFrame) -> pd.Series:
     return mean_v.where(has_any, 50.0).astype(float)
 
 
+def _compute_weighted_lti_for_profile(df: pd.DataFrame, weights: dict[str, float]) -> pd.Series:
+    """
+    Weighted LTI on score_V..score_S with missing-aware renormalization.
+    If all category scores are missing, return 50.0.
+    """
+    score_cols = {c: f"score_{c}" for c in CORE_CATS}
+    s = pd.DataFrame({c: pd.to_numeric(df[col], errors="coerce") for c, col in score_cols.items()})
+    w = pd.Series({c: float(weights.get(c, 0.0)) for c in CORE_CATS}, dtype=float)
+    valid = s.notna().astype(float)
+    denom = valid.mul(w, axis=1).sum(axis=1)
+    num = s.fillna(0.0).mul(w, axis=1).sum(axis=1)
+    out = num / denom.replace(0.0, np.nan)
+    return out.where(denom > 0.0, 50.0).astype(float)
+
+
+def _apply_penalties_and_hard_stop(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Placeholder penalty/hard-stop stage.
+    Keep this isolated so later penalty wiring only touches this helper.
+    """
+    out = df.copy()
+    out["penalty_total"] = 0.0
+    out["hard_stop_triggered"] = False
+    out["investment_warning"] = ""
+    # Current phase: no penalty applied yet.
+    out["final_score"] = pd.to_numeric(out["lti_pre_penalty"], errors="coerce").clip(lower=0.0, upper=100.0).astype(float)
+    return out
+
+
 def _evidence_series_to_score(ev: pd.Series) -> pd.Series:
     def _one(x: Any) -> float:
         try:
@@ -241,42 +356,143 @@ def _evidence_series_to_score(ev: pd.Series) -> pd.Series:
     return ev.map(_one).astype(float)
 
 
-def _build_track_reason(df: pd.DataFrame) -> pd.Series:
-    reasons: list[str] = []
-    for _, r in df.iterrows():
-        if bool(r.get("is_track_B_candidate", False)):
-            reasons.append("B: raw quality/risk/stability pass")
-            continue
-        if bool(r.get("is_track_C_candidate", False)):
-            reasons.append("C: Revenue YoY>=20 and rule_of_40_calc>=30")
-            continue
-        if bool(r.get("is_track_A_candidate", False)):
-            reasons.append("A: v_market_proxy>=70")
-            continue
+def _assign_track_from_raw_inputs(out: pd.DataFrame) -> pd.DataFrame:
+    def _series_or_nan(df: pd.DataFrame, col: str) -> pd.Series:
+        if col in df.columns:
+            return pd.to_numeric(df[col], errors="coerce")
+        return pd.Series(np.nan, index=df.index, dtype=float)
 
-        missing: list[str] = []
-        for c in (
-            "track_input_roic",
-            "track_input_oper_margin",
-            "track_input_ocf_ni",
-            "track_input_revenue_yoy",
-            "track_input_debt_to_equity",
-            "track_input_current_ratio",
-            "track_input_interest_coverage",
-            "track_input_beta",
-            "track_input_pe",
-            "track_input_ps",
-            "track_input_ev_ebitda",
-            "track_input_rule_of_40_calc",
-            "track_input_v_market_proxy",
-        ):
-            if pd.isna(pd.to_numeric(r.get(c), errors="coerce")):
-                missing.append(c.replace("track_input_", ""))
-        if missing:
-            reasons.append("N: missing_inputs=" + ",".join(missing))
-        else:
-            reasons.append("N: no raw-track condition met")
-    return pd.Series(reasons, index=df.index, dtype=object)
+    # ----------------------
+    # Track A (value)
+    # ----------------------
+    raw_pe = _series_or_nan(out, "track_a_raw_pe")
+    raw_ps = _series_or_nan(out, "track_a_raw_ps")
+    raw_ev = _series_or_nan(out, "track_a_raw_ev_ebitda")
+    med_pe = _series_or_nan(out, "track_a_peer_pe_median")
+    med_ps = _series_or_nan(out, "track_a_peer_ps_median")
+    med_ev = _series_or_nan(out, "track_a_peer_ev_ebitda_median")
+    n_pe = _series_or_nan(out, "track_a_peer_pe_n_valid")
+    n_ps = _series_or_nan(out, "track_a_peer_ps_n_valid")
+    n_ev = _series_or_nan(out, "track_a_peer_ev_ebitda_n_valid")
+    roic = _series_or_nan(out, "track_input_roic")
+    icov = _series_or_nan(out, "track_input_interest_coverage")
+
+    valid_pe = (raw_pe > 0) & (med_pe > 0) & (n_pe >= 5)
+    valid_ps = (raw_ps > 0) & (med_ps > 0) & (n_ps >= 5)
+    valid_ev = (raw_ev > 0) & (med_ev > 0) & (n_ev >= 5)
+
+    disc_pe = pd.Series(np.nan, index=out.index, dtype=float)
+    disc_ps = pd.Series(np.nan, index=out.index, dtype=float)
+    disc_ev = pd.Series(np.nan, index=out.index, dtype=float)
+    disc_pe.loc[valid_pe] = 1.0 - (raw_pe.loc[valid_pe] / med_pe.loc[valid_pe])
+    disc_ps.loc[valid_ps] = 1.0 - (raw_ps.loc[valid_ps] / med_ps.loc[valid_ps])
+    disc_ev.loc[valid_ev] = 1.0 - (raw_ev.loc[valid_ev] / med_ev.loc[valid_ev])
+
+    cheap_pe = valid_pe & (disc_pe >= 0.15)
+    cheap_ps = valid_ps & (disc_ps >= 0.15)
+    cheap_ev = valid_ev & (disc_ev >= 0.15)
+
+    out["track_A_discount_pe"] = disc_pe.astype(float)
+    out["track_A_discount_ps"] = disc_ps.astype(float)
+    out["track_A_discount_ev_ebitda"] = disc_ev.astype(float)
+    out["track_A_valuation_valid_count"] = (valid_pe.astype(int) + valid_ps.astype(int) + valid_ev.astype(int)).astype(float)
+    out["track_A_cheap_count"] = (cheap_pe.astype(int) + cheap_ps.astype(int) + cheap_ev.astype(int)).astype(float)
+    out["track_A_quality_guard_count"] = ((roic >= 0.08).astype(int) + (icov >= 2.0).astype(int)).astype(float)
+    out["is_track_A_candidate"] = (
+        (out["track_A_valuation_valid_count"] >= 2.0)
+        & (out["track_A_cheap_count"] >= 2.0)
+        & (out["track_A_quality_guard_count"] >= 1.0)
+    ).astype(bool)
+
+    # ----------------------
+    # Track B (quality)
+    # ----------------------
+    opm = _series_or_nan(out, "track_input_oper_margin")
+    ocf_ni = _series_or_nan(out, "track_input_ocf_ni")
+    debt = _series_or_nan(out, "track_input_debt_to_equity")
+    current = _series_or_nan(out, "track_input_current_ratio")
+    beta = _series_or_nan(out, "track_input_beta")
+
+    b_quality_count = (roic >= 0.15).astype(int) + (opm >= 0.10).astype(int) + (ocf_ni >= 0.80).astype(int)
+    b_risk_count = (debt <= 1.00).astype(int) + (current >= 1.50).astype(int) + (icov >= 3.0).astype(int)
+    b_stability_count = (beta <= 1.20).astype(int)
+
+    out["track_B_quality_count"] = b_quality_count.astype(float)
+    out["track_B_risk_count"] = b_risk_count.astype(float)
+    out["track_B_stability_count"] = b_stability_count.astype(float)
+    out["is_track_B_candidate"] = (
+        (roic >= 0.15)
+        & (out["track_B_quality_count"] >= 2.0)
+        & (out["track_B_risk_count"] >= 2.0)
+        & (out["track_B_stability_count"] >= 1.0)
+    ).astype(bool)
+
+    # ----------------------
+    # Track C (growth)
+    # ----------------------
+    rev = _series_or_nan(out, "track_input_revenue_yoy")
+    eps_yoy = _series_or_nan(out, "track_input_eps_yoy")
+    ocf_yoy = _series_or_nan(out, "track_input_ocf_yoy")
+    dilution = _series_or_nan(out, "track_input_share_dilution")
+
+    c_growth_count = (eps_yoy > 0).astype(int) + (ocf_yoy > 0).astype(int)
+    c_quality_count = (ocf_ni >= 0.60).astype(int) + (opm >= 0.00).astype(int)
+    c_dilution_soft_fail = (dilution >= 0.05).fillna(False)
+
+    out["track_C_growth_count"] = c_growth_count.astype(float)
+    out["track_C_quality_guard_count"] = c_quality_count.astype(float)
+    out["track_C_dilution_soft_fail"] = c_dilution_soft_fail.astype(bool)
+    out["is_track_C_candidate"] = (
+        (rev >= 0.20)
+        & (out["track_C_growth_count"] >= 1.0)
+        & (out["track_C_quality_guard_count"] >= 1.0)
+    ).astype(bool)
+
+    out["track_conflict_count"] = (
+        out["is_track_A_candidate"].astype(int)
+        + out["is_track_B_candidate"].astype(int)
+        + out["is_track_C_candidate"].astype(int)
+    ).astype(float)
+
+    # Priority: B > C > A > N
+    out["assigned_track"] = np.select(
+        [
+            out["is_track_B_candidate"],
+            out["is_track_C_candidate"],
+            out["is_track_A_candidate"],
+        ],
+        ["B", "C", "A"],
+        default="N",
+    )
+
+    reasons = np.full(len(out), "N: no track threshold met", dtype=object)
+    b_mask = out["assigned_track"] == "B"
+    c_mask = out["assigned_track"] == "C"
+    a_mask = out["assigned_track"] == "A"
+    reasons[b_mask] = (
+        "B: quality="
+        + out.loc[b_mask, "track_B_quality_count"].astype(int).astype(str)
+        + " risk="
+        + out.loc[b_mask, "track_B_risk_count"].astype(int).astype(str)
+        + " stability="
+        + out.loc[b_mask, "track_B_stability_count"].astype(int).astype(str)
+    )
+    reasons[c_mask] = (
+        "C: revenue gate pass, growth="
+        + out.loc[c_mask, "track_C_growth_count"].astype(int).astype(str)
+        + " quality="
+        + out.loc[c_mask, "track_C_quality_guard_count"].astype(int).astype(str)
+    )
+    reasons[a_mask] = (
+        "A: valid="
+        + out.loc[a_mask, "track_A_valuation_valid_count"].astype(int).astype(str)
+        + " cheap="
+        + out.loc[a_mask, "track_A_cheap_count"].astype(int).astype(str)
+        + " quality_guard="
+        + out.loc[a_mask, "track_A_quality_guard_count"].astype(int).astype(str)
+    )
+    out["track_reason"] = pd.Series(reasons, index=out.index, dtype=object)
+    return out
 
 
 def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
@@ -303,9 +519,9 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         "track_input_pe",
         "track_input_ps",
         "track_input_ev_ebitda",
-        "track_input_rule_of_40_calc",
-        "track_A_valuation_valid_count",
-        "track_input_v_market_proxy",
+        "track_input_eps_yoy",
+        "track_input_ocf_yoy",
+        "track_input_share_dilution",
     ):
         if c in df_cat.columns:
             out[c] = pd.to_numeric(df_cat[c], errors="coerce")
@@ -326,18 +542,6 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         if ds in df_cat.columns:
             out[ds] = df_cat[ds].fillna("balanced").astype(object)
 
-    ev_agg = _simple_mean_category_evidences(out)
-    out["final_evidence_equal"] = ev_agg
-    out["final_evidence_track_A"] = ev_agg
-    out["final_evidence_track_B"] = ev_agg
-    out["final_evidence_track_C"] = ev_agg
-
-    score_agg = _simple_mean_category_scores(out)
-    out["final_score_equal"] = score_agg
-    out["final_score_track_A"] = score_agg
-    out["final_score_track_B"] = score_agg
-    out["final_score_track_C"] = score_agg
-
     # Track inputs from factors_latest raw-source join, injected in main().
     for c in (
         "track_input_roic",
@@ -351,58 +555,73 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         "track_input_pe",
         "track_input_ps",
         "track_input_ev_ebitda",
-        "track_input_rule_of_40_calc",
-        "track_A_valuation_valid_count",
-        "track_input_v_market_proxy",
+        "track_input_eps_yoy",
+        "track_input_ocf_yoy",
+        "track_input_share_dilution",
     ):
         if c not in out.columns:
             out[c] = np.nan
+    for c in (
+        "track_a_raw_pe",
+        "track_a_raw_ps",
+        "track_a_raw_ev_ebitda",
+        "track_a_peer_pe_median",
+        "track_a_peer_ps_median",
+        "track_a_peer_ev_ebitda_median",
+        "track_a_peer_pe_n_valid",
+        "track_a_peer_ps_n_valid",
+        "track_a_peer_ev_ebitda_n_valid",
+    ):
+        if c in df_cat.columns:
+            out[c] = pd.to_numeric(df_cat[c], errors="coerce")
+        else:
+            out[c] = np.nan
 
-    roic = pd.to_numeric(out["track_input_roic"], errors="coerce")
-    opm = pd.to_numeric(out["track_input_oper_margin"], errors="coerce")
-    ocf_ni = pd.to_numeric(out["track_input_ocf_ni"], errors="coerce")
-    rev = pd.to_numeric(out["track_input_revenue_yoy"], errors="coerce")
-    debt = pd.to_numeric(out["track_input_debt_to_equity"], errors="coerce")
-    current = pd.to_numeric(out["track_input_current_ratio"], errors="coerce")
-    icov = pd.to_numeric(out["track_input_interest_coverage"], errors="coerce")
-    beta = pd.to_numeric(out["track_input_beta"], errors="coerce")
-    rule40 = pd.to_numeric(out["track_input_rule_of_40_calc"], errors="coerce")
-    v_proxy = pd.to_numeric(out["track_input_v_market_proxy"], errors="coerce")
-    val_count = pd.to_numeric(out["track_A_valuation_valid_count"], errors="coerce").fillna(0.0)
+    # 1) Track candidate assignment
+    out = _assign_track_from_raw_inputs(out)
 
-    quality_count = (roic >= 15.0).astype(int) + (opm >= 10.0).astype(int) + (ocf_ni >= 0.8).astype(int)
-    risk_count = (debt <= 1.0).astype(int) + (current >= 1.5).astype(int) + (icov >= 3.0).astype(int)
-    stability_pass = (beta <= 1.2)
-    out["track_B_quality_pass"] = (quality_count >= 2).astype(bool)
-    out["track_B_risk_pass"] = (risk_count >= 2).astype(bool)
-    out["track_B_stability_pass"] = stability_pass.astype(bool)
+    # 2) Track-weighted LTI
+    ev_agg = _simple_mean_category_evidences(out)
+    out["final_evidence_equal"] = ev_agg
+    out["final_evidence_track_A"] = ev_agg
+    out["final_evidence_track_B"] = ev_agg
+    out["final_evidence_track_C"] = ev_agg
 
-    out["is_track_B_candidate"] = (
-        out["track_B_quality_pass"]
-        & out["track_B_risk_pass"]
-        & out["track_B_stability_pass"]
-        & (roic >= 15.0)
-    ).astype(bool)
-    out["is_track_C_candidate"] = ((rev >= 20.0) & (rule40 >= 30.0)).astype(bool)
-    out["is_track_A_candidate"] = ((v_proxy >= 70.0) & (val_count >= 2.0)).astype(bool)
-
-    out["assigned_track"] = np.select(
-        [
-            out["is_track_B_candidate"],
-            out["is_track_C_candidate"],
-            out["is_track_A_candidate"],
-        ],
-        ["B", "C", "A"],
-        default="N",
+    score_agg = _simple_mean_category_scores(out)
+    out["final_score_equal"] = score_agg
+    out["final_score_track_A"] = _compute_weighted_lti_for_profile(
+        out, {"V": 0.40, "Q": 0.20, "G": 0.10, "R": 0.20, "S": 0.10}
     )
-    out["track_reason"] = _build_track_reason(out)
+    out["final_score_track_B"] = _compute_weighted_lti_for_profile(
+        out, {"V": 0.25, "Q": 0.30, "G": 0.10, "R": 0.15, "S": 0.20}
+    )
+    out["final_score_track_C"] = _compute_weighted_lti_for_profile(
+        out, {"V": 0.20, "Q": 0.20, "G": 0.35, "R": 0.15, "S": 0.10}
+    )
+    out["final_score_track_N"] = _compute_weighted_lti_for_profile(
+        out, {"V": 0.20, "Q": 0.20, "G": 0.20, "R": 0.20, "S": 0.20}
+    )
 
-    out["final_score"] = pd.to_numeric(score_agg, errors="coerce").clip(lower=0.0, upper=100.0).astype(float)
+    selected_profile = out["assigned_track"].where(out["assigned_track"].isin(["A", "B", "C"]), "N")
+    out["selected_weight_profile"] = selected_profile.astype(str)
+    out["lti_pre_penalty"] = np.select(
+        [
+            selected_profile == "A",
+            selected_profile == "B",
+            selected_profile == "C",
+        ],
+        [
+            pd.to_numeric(out["final_score_track_A"], errors="coerce"),
+            pd.to_numeric(out["final_score_track_B"], errors="coerce"),
+            pd.to_numeric(out["final_score_track_C"], errors="coerce"),
+        ],
+        default=pd.to_numeric(out["final_score_track_N"], errors="coerce"),
+    )
+    out["lti_pre_penalty"] = pd.to_numeric(out["lti_pre_penalty"], errors="coerce").clip(lower=0.0, upper=100.0).astype(float)
+
+    # 3) Penalty / hard-stop placeholder application
+    out = _apply_penalties_and_hard_stop(out)
     out["final_score_method"] = FINAL_METHOD_LABEL
-    out["selected_weight_profile"] = FINAL_METHOD_LABEL
-    # Placeholder columns for later hard-stop / penalty wiring.
-    out["investment_warning"] = ""
-    out["hard_stop_triggered"] = False
 
     out_cols = [
         "symbol",
@@ -419,6 +638,7 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         "final_score_track_B",
         "final_evidence_track_C",
         "final_score_track_C",
+        "final_score_track_N",
         "score_V",
         "score_Q",
         "score_G",
@@ -430,10 +650,22 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         "final_evidence_R",
         "final_evidence_S",
         "track_reason",
-        "track_B_quality_pass",
-        "track_B_risk_pass",
-        "track_B_stability_pass",
+        "lti_pre_penalty",
+        "penalty_total",
+        "selected_weight_profile",
+        "track_B_quality_count",
+        "track_B_risk_count",
+        "track_B_stability_count",
+        "track_A_discount_pe",
+        "track_A_discount_ps",
+        "track_A_discount_ev_ebitda",
         "track_A_valuation_valid_count",
+        "track_A_cheap_count",
+        "track_A_quality_guard_count",
+        "track_C_growth_count",
+        "track_C_quality_guard_count",
+        "track_C_dilution_soft_fail",
+        "track_conflict_count",
         "is_track_A_candidate",
         "is_track_B_candidate",
         "is_track_C_candidate",
@@ -448,8 +680,18 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         "track_input_pe",
         "track_input_ps",
         "track_input_ev_ebitda",
-        "track_input_rule_of_40_calc",
-        "track_input_v_market_proxy",
+        "track_input_eps_yoy",
+        "track_input_ocf_yoy",
+        "track_input_share_dilution",
+        "track_a_raw_pe",
+        "track_a_raw_ps",
+        "track_a_raw_ev_ebitda",
+        "track_a_peer_pe_median",
+        "track_a_peer_ps_median",
+        "track_a_peer_ev_ebitda_median",
+        "track_a_peer_pe_n_valid",
+        "track_a_peer_ps_n_valid",
+        "track_a_peer_ev_ebitda_n_valid",
         "investment_warning",
         "hard_stop_triggered",
         "main_coverage_V",
@@ -464,6 +706,7 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         "dominant_signal_S",
     ]
     out_cols = [c for c in out_cols if c in out.columns]
+    out_cols = list(dict.fromkeys(out_cols))
     return out[out_cols].copy()
 
 
@@ -481,71 +724,169 @@ def main(input_dir: str | Path = "output", output_dir: str | Path = "output/scor
         print("No symbol_category_scores_latest input found.")
         return
 
+    def _normalize_key_columns(x: pd.DataFrame) -> pd.DataFrame:
+        if x is None or x.empty:
+            return pd.DataFrame(columns=["symbol", "as_of_date"])
+        y = x.copy()
+        if "symbol" not in y.columns:
+            y["symbol"] = ""
+        y["symbol"] = y["symbol"].astype(str).str.strip().str.upper()
+        if "as_of_date" not in y.columns:
+            if "asOfDate" in y.columns:
+                y["as_of_date"] = y["asOfDate"]
+            else:
+                y["as_of_date"] = np.nan
+        y["as_of_date"] = pd.to_datetime(y["as_of_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        return y
+
+    def _dedupe_source_latest_by_symbol(src: pd.DataFrame, value_cols: list[str]) -> pd.DataFrame:
+        if src is None or src.empty:
+            return pd.DataFrame(columns=["symbol", "as_of_date", *value_cols])
+        keep_cols = ["symbol", "as_of_date"] + [c for c in value_cols if c in src.columns]
+        w = src[keep_cols].copy()
+        w["symbol"] = w["symbol"].astype(str).str.strip().str.upper()
+        w["as_of_date"] = pd.to_datetime(w["as_of_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        w = w.dropna(subset=["symbol", "as_of_date"])
+        if w.empty:
+            return pd.DataFrame(columns=["symbol", "as_of_date", *value_cols])
+        w = (
+            w.groupby(["symbol", "as_of_date"], as_index=False, dropna=False)
+            .agg({c: "median" for c in keep_cols if c not in ("symbol", "as_of_date")})
+        )
+        w = w.sort_values(["symbol", "as_of_date"], ascending=[True, True]).groupby("symbol", as_index=False).last()
+        for c in value_cols:
+            if c not in w.columns:
+                w[c] = np.nan
+        return w[["symbol", "as_of_date", *value_cols]].copy()
+
+    def _merge_exact_then_symbol_fallback(
+        base: pd.DataFrame,
+        src: pd.DataFrame,
+        value_cols: list[str],
+        tag: str,
+    ) -> tuple[pd.DataFrame, int, int]:
+        if base.empty:
+            return base, 0, 0
+        out_df = base.copy()
+        for c in value_cols:
+            if c not in out_df.columns:
+                out_df[c] = np.nan
+
+        if src is None or src.empty:
+            out_df[f"_{tag}_exact_hit"] = False
+            out_df[f"_{tag}_fallback_hit"] = False
+            return out_df, 0, 0
+
+        src_norm = _normalize_key_columns(src)
+        src_cols = ["symbol", "as_of_date"] + [c for c in value_cols if c in src_norm.columns]
+        src_exact = src_norm[src_cols].copy()
+        src_exact = (
+            src_exact.groupby(["symbol", "as_of_date"], as_index=False, dropna=False)
+            .agg({c: "median" for c in src_cols if c not in ("symbol", "as_of_date")})
+        )
+        src_exact[f"_{tag}_has_exact"] = True
+
+        merged = out_df.merge(src_exact, on=["symbol", "as_of_date"], how="left", suffixes=("", "__exact"))
+
+        exact_any = pd.Series(False, index=merged.index, dtype=bool)
+        for c in value_cols:
+            c_ex = f"{c}__exact"
+            if c_ex in merged.columns:
+                take_exact = merged[c].isna() & merged[c_ex].notna()
+                if take_exact.any():
+                    merged.loc[take_exact, c] = merged.loc[take_exact, c_ex]
+                exact_any = exact_any | merged[c_ex].notna()
+                merged = merged.drop(columns=[c_ex])
+        merged[f"_{tag}_exact_hit"] = exact_any
+        if f"_{tag}_has_exact" in merged.columns:
+            merged = merged.drop(columns=[f"_{tag}_has_exact"])
+
+        src_latest = _dedupe_source_latest_by_symbol(src_norm, value_cols=value_cols).set_index("symbol", drop=True)
+        fallback_any = pd.Series(False, index=merged.index, dtype=bool)
+        if not src_latest.empty:
+            for c in value_cols:
+                if c not in src_latest.columns:
+                    continue
+                fill_mask = merged[c].isna()
+                if fill_mask.any():
+                    mapped = merged.loc[fill_mask, "symbol"].map(src_latest[c].to_dict())
+                    hit_mask = mapped.notna()
+                    if hit_mask.any():
+                        idx = mapped.index[hit_mask]
+                        merged.loc[idx, c] = mapped.loc[idx]
+                        fallback_any.loc[idx] = True
+        merged[f"_{tag}_fallback_hit"] = fallback_any
+        return merged, int(exact_any.sum()), int(fallback_any.sum())
+
     df = finalize_scoring_wide_input_df(df, label="build_final_vqgrs_scores")
     track_inputs = _load_track_inputs_from_factors_latest()
-    print(f"Track input rows from factors_latest.parquet: {len(track_inputs)}")
-    df = df.copy()
-    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
-    df["as_of_date"] = pd.to_datetime(df["as_of_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    track_a_inputs = _load_track_a_inputs_from_group_a_snapshot()
+    print(f"Input category rows (base): {len(df)}")
+    print(f"Track input rows from factors_latest: {len(track_inputs)}")
+    print(f"Track A raw input rows from group_a snapshot: {len(track_a_inputs)}")
 
-    # 1) Exact match merge (symbol + as_of_date) first; keep legacy behavior.
-    df = df.merge(track_inputs, on=["symbol", "as_of_date"], how="left")
+    df = _normalize_key_columns(df)
 
-    # 2~6) If exact-merged track inputs are mostly missing, fall back to symbol-only latest-row merge.
-    track_cols_to_fill = [c for c in df.columns if c.startswith("track_input_")]
-    if "track_A_valuation_valid_count" in df.columns:
-        track_cols_to_fill.append("track_A_valuation_valid_count")
+    track_cols = [c for c in track_inputs.columns if c.startswith("track_input_")] if not track_inputs.empty else []
+    track_a_cols = [c for c in track_a_inputs.columns if c.startswith("track_a_")] if not track_a_inputs.empty else []
 
-    if "track_input_roic" in df.columns:
-        roic_na_ratio = float(df["track_input_roic"].isna().mean()) if len(df) > 0 else 0.0
-    else:
-        roic_na_ratio = 1.0
+    df, exact_track_cnt, fallback_track_cnt = _merge_exact_then_symbol_fallback(
+        df, track_inputs, track_cols, tag="track"
+    )
+    df, exact_a_cnt, fallback_a_cnt = _merge_exact_then_symbol_fallback(
+        df, track_a_inputs, track_a_cols, tag="track_a"
+    )
 
-    FALLBACK_NA_RATIO_THRESHOLD = 0.30
-    if len(df) > 0 and roic_na_ratio >= FALLBACK_NA_RATIO_THRESHOLD and track_inputs is not None and not track_inputs.empty:
-        # Only fill rows where track_input_roic is still missing.
-        need_mask = df["track_input_roic"].isna()
+    exact_total = int(
+        (df.get("_track_exact_hit", False).astype(bool) | df.get("_track_a_exact_hit", False).astype(bool)).sum()
+    )
+    fallback_total = int(
+        (df.get("_track_fallback_hit", False).astype(bool) | df.get("_track_a_fallback_hit", False).astype(bool)).sum()
+    )
 
-        # Build per-symbol latest table from track_inputs.
-        aux = track_inputs.copy()
-        if "as_of_date" not in aux.columns:
-            if "asOfDate" in aux.columns:
-                aux["as_of_date"] = aux["asOfDate"]
-        aux["as_of_date"] = pd.to_datetime(aux["as_of_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-        aux["symbol"] = aux["symbol"].astype(str).str.strip().str.upper()
-        # Keep latest as_of_date per symbol.
-        aux = aux.sort_values(["symbol", "as_of_date"], ascending=[True, True]).groupby("symbol", as_index=False).last()
+    print(
+        "Merge diagnostics: "
+        f"track_exact={exact_track_cnt}, track_fallback={fallback_track_cnt}, "
+        f"track_a_exact={exact_a_cnt}, track_a_fallback={fallback_a_cnt}, "
+        f"exact_any={exact_total}, fallback_any={fallback_total}"
+    )
+    track_a_ready = 0
+    if "track_a_raw_pe" in df.columns:
+        track_a_ready = int(df["track_a_raw_pe"].notna().sum())
+    print(f"Group A snapshot usable rows (track_a_raw_pe non-null): {track_a_ready}")
 
-        if need_mask.any() and track_cols_to_fill:
-            aux_latest = aux.copy()
-            # Use latest as_of_date per symbol as the symbol-only fallback.
-            aux_latest = aux_latest.sort_values(["symbol", "as_of_date"], ascending=[True, True]).groupby(
-                "symbol", as_index=False
-            ).last()
-            aux_latest = aux_latest.set_index("symbol", drop=True)
+    # Guarantee one row per symbol before scoring:
+    # priority = exact-hit rows > fallback-hit rows > latest as_of_date.
+    dedupe_before = len(df)
+    df["_merge_exact_any"] = (
+        df.get("_track_exact_hit", False).astype(bool) | df.get("_track_a_exact_hit", False).astype(bool)
+    ).astype(int)
+    df["_merge_fallback_any"] = (
+        df.get("_track_fallback_hit", False).astype(bool) | df.get("_track_a_fallback_hit", False).astype(bool)
+    ).astype(int)
+    df = df.sort_values(
+        ["symbol", "_merge_exact_any", "_merge_fallback_any", "as_of_date"],
+        ascending=[True, False, False, False],
+    ).drop_duplicates(subset=["symbol"], keep="first").reset_index(drop=True)
+    dedupe_after = len(df)
+    if dedupe_after != dedupe_before:
+        print(f"Dedupe applied: rows {dedupe_before} -> {dedupe_after} (1 symbol 1 row)")
 
-            # Fill only rows whose exact-match track inputs were missing.
-            for c in track_cols_to_fill:
-                if c not in aux_latest.columns or c not in df.columns:
-                    continue
-                fill_mask = need_mask & df[c].isna()
-                if fill_mask.any():
-                    df.loc[fill_mask, c] = df.loc[fill_mask, "symbol"].map(aux_latest[c].to_dict())
+    for c in ["_track_exact_hit", "_track_fallback_hit", "_track_a_exact_hit", "_track_a_fallback_hit", "_merge_exact_any", "_merge_fallback_any"]:
+        if c in df.columns:
+            df = df.drop(columns=[c])
 
-            filled_cnt = int((need_mask & df["track_input_roic"].notna()).sum()) if "track_input_roic" in df.columns else 0
-            print(
-                f"Fallback merge applied (roic missing ratio {roic_na_ratio:.1%} >= {FALLBACK_NA_RATIO_THRESHOLD:.0%}). "
-                f"Filled roic rows={filled_cnt}. Exact-match rows preserved."
-            )
-    else:
-        if len(df) > 0:
-            print(
-                f"Exact merge only (roic missing ratio {roic_na_ratio:.1%} < {FALLBACK_NA_RATIO_THRESHOLD:.0%})."
-            )
-
-    print(f"Input category rows: {len(df)}")
     out = build_final_vqgrs_scores_df(df)
     print(f"Output final-score rows: {len(out)}")
+    cat_cols = [f"score_{c}" for c in CORE_CATS if f"score_{c}" in out.columns]
+    if cat_cols:
+        all_missing_cat_rows = int(out[cat_cols].isna().all(axis=1).sum())
+        print(f"Sanity: category score all-missing rows={all_missing_cat_rows}")
+    final_missing_rows = int(pd.to_numeric(out.get("final_score"), errors="coerce").isna().sum())
+    print(f"Sanity: final_score missing rows={final_missing_rows}")
+    if "assigned_track" in out.columns:
+        dist = out["assigned_track"].astype(str).value_counts(dropna=False).to_dict()
+        print(f"Sanity: A/B/C/N distribution={dist}")
 
     parquet_out = output_dir / "final_vqgrs_scores_latest.parquet"
     csv_out = output_dir / "final_vqgrs_scores_latest.csv"

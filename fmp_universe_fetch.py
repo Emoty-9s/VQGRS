@@ -1844,16 +1844,25 @@ def _estimates_rows_after(rows: List[Dict[str, Any]], as_of: str) -> List[Dict[s
 
 
 def build_estimates_snapshot_annual(rows: List[Dict[str, Any]], symbol: str, as_of: str) -> pd.DataFrame:
-    """Finviz-style annual: date>as_of 중 가장 가까운 1개 epsAvg->epsThisY, 2번째->epsNextY; 5번째로 epsNext5Y(CAGR)."""
+    """
+    Annual analyst-estimate snapshot from FMP (epsAvg by fiscal period end date).
+
+    epsThisY / epsNextY are stored as raw annual EPS *estimate levels* (currency per share),
+    not percentage growth. Closest future annual row -> epsThisY, second -> epsNextY.
+    Percentage growth vs prior actuals is derived later in build_factors_latest (e.g. EPS YoY),
+    not in this snapshot. epsNext5Y remains a CAGR-style rate implied from the 1st vs 5th future
+    annual *level* estimates (see below), not a field from FMP as “growth %”.
+    """
     sym = symbol.strip().upper()
     filtered = _estimates_rows_after(rows, as_of)
-    eps_this = None
-    eps_next = None
+    # Do not interpret stored epsThisY/epsNextY here as growth percentages; they are estimate levels.
+    eps_this_est_level = None
+    eps_next_est_level = None
     eps_next_5y = pd.NA
     if len(filtered) >= 1:
-        eps_this = _estimates_eps_from_row(filtered[0])
+        eps_this_est_level = _estimates_eps_from_row(filtered[0])
     if len(filtered) >= 2:
-        eps_next = _estimates_eps_from_row(filtered[1])
+        eps_next_est_level = _estimates_eps_from_row(filtered[1])
     if len(filtered) >= 5:
         eps_t0 = _estimates_eps_from_row(filtered[0])
         eps_t5 = _estimates_eps_from_row(filtered[4])
@@ -1870,9 +1879,9 @@ def build_estimates_snapshot_annual(rows: List[Dict[str, Any]], symbol: str, as_
     df = pd.DataFrame([{
         "symbol": sym,
         "asOfDate": as_of,
-        "epsNextY": eps_next,
+        "epsNextY": eps_next_est_level,
         "epsNextQ": pd.NA,
-        "epsThisY": eps_this,
+        "epsThisY": eps_this_est_level,
         "epsNext5Y": eps_next_5y,
     }])
     return df.reindex(columns=ESTIMATES_SNAPSHOT_COLUMNS)

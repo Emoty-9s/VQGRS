@@ -26,7 +26,7 @@ class FactorSpec:
     # missing_policy: structural_skip | donor_shrink | neutral_shrink | drop
     missing_policy: str = "donor_shrink"
     missing_prior_group: str | None = None  # e.g. same_category | same_factor | same_sector_size
-    structural_missing_rule: str | None = None  # e.g. pe_nonpositive_eps | peg_invalid_growth
+    structural_missing_rule: str | None = None  # e.g. pe_nonpositive_eps | forward_pe_nonpositive_estimate | ...
     min_donor_count: int = 5
     max_donor_count: int = 20
     missing_penalty_floor: float | None = None
@@ -331,6 +331,12 @@ for n in _V_FACTORS:
         _mp, _smr = "structural_skip", "pe_nonpositive_eps"
     elif n == "PEG":
         _mp, _smr = "structural_skip", "peg_invalid_growth"
+    elif n == "Forward P/E":
+        _mp, _smr = "structural_skip", "forward_pe_nonpositive_estimate"
+    elif n == "P/FCF":
+        _mp, _smr = "structural_skip", "pfcf_nonpositive_or_invalid"
+    elif n == "EV/EBITDA":
+        _mp, _smr = "structural_skip", "ev_ebitda_nonpositive_or_invalid"
     else:
         _mp, _smr = "donor_shrink", None
     FACTOR_SPECS[n] = _spec(
@@ -365,6 +371,23 @@ for n in _Q_FACTORS:
             missing_policy=_mp,
             missing_prior_group=_mpg,
         )
+    elif n == "ROIC":
+        FACTOR_SPECS[n] = _spec(
+            name=n,
+            category="Q",
+            direction="higher_better",
+            tier="core",
+            weight=_CORE_W,
+            enabled=True,
+            use_log_scale=False,
+            neutral_on_missing=True,
+            notes=(
+                "ROIC is scored only when operating invested capital is available and positive; "
+                "cash-heavy denominator distortions are excluded at factor build and re-checked here."
+            ),
+            missing_policy="structural_skip",
+            structural_missing_rule="roic_invalid_invested_capital",
+        )
     else:
         FACTOR_SPECS[n] = _spec(
             name=n,
@@ -380,17 +403,51 @@ for n in _Q_FACTORS:
 
 # G: all higher_better, core
 for n in _G_FACTORS:
-    FACTOR_SPECS[n] = _spec(
-        name=n,
-        category="G",
-        direction="higher_better",
-        tier="core",
-        weight=_CORE_W,
-        enabled=True,
-        use_log_scale=False,
-        neutral_on_missing=True,
-        notes=None,
-    )
+    if n == "EPS Next Y":
+        FACTOR_SPECS[n] = _spec(
+            name=n,
+            category="G",
+            direction="higher_better",
+            tier="core",
+            weight=_CORE_W,
+            enabled=False,
+            use_log_scale=False,
+            neutral_on_missing=True,
+            notes=(
+                "Currently raw next-year analyst EPS estimate level, not a normalized growth metric; "
+                "temporarily disabled until next-year growth definition is finalized."
+            ),
+            missing_policy="drop",
+        )
+    elif n == "EPS YoY":
+        FACTOR_SPECS[n] = _spec(
+            name=n,
+            category="G",
+            direction="higher_better",
+            tier="core",
+            weight=_CORE_W,
+            enabled=True,
+            use_log_scale=False,
+            neutral_on_missing=True,
+            notes=(
+                "Valid only when current and prior EPS TTM are both positive; "
+                "turnaround / loss regimes are excluded from standard YoY growth scoring."
+            ),
+            missing_policy="structural_skip",
+            structural_missing_rule="eps_yoy_nonpositive_regime",
+        )
+    else:
+        FACTOR_SPECS[n] = _spec(
+            name=n,
+            category="G",
+            direction="higher_better",
+            tier="core",
+            weight=_CORE_W,
+            enabled=True,
+            use_log_scale=False,
+            neutral_on_missing=True,
+            notes=None,
+        )
 
 # R: mixed directions, aux for Cash/sh + Shs Outstand
 for n in _R_FACTORS:
@@ -406,6 +463,8 @@ for n in _R_FACTORS:
             neutral_on_missing=True,
         )
     elif n in {"Quick Ratio", "Current Ratio", "Interest Coverage"}:
+        # Liquidity / coverage ratios are highly skewed; log-scale relative scoring compresses extremes.
+        # This reduces outsized advantage from cash-heavy pre-revenue names vs typical operating balance sheets.
         FACTOR_SPECS[n] = _spec(
             name=n,
             category="R",
@@ -413,7 +472,7 @@ for n in _R_FACTORS:
             tier="core",
             weight=_CORE_W,
             enabled=True,
-            use_log_scale=False,
+            use_log_scale=True,
             neutral_on_missing=True,
         )
     elif n == "Cash/sh":

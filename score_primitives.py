@@ -35,6 +35,60 @@ def safe_to_float(value: Any) -> float | None:
     return x
 
 
+def _signed_log1p(value: float | None) -> float | None:
+    """
+    sign(x) * log1p(|x|); x==0 -> 0. Returns None only for invalid inputs.
+    sign-preserving log1p is used so negative values do not break scoring.
+    """
+    if value is None:
+        return None
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(x) or math.isinf(x):
+        return None
+    ax = abs(x)
+    try:
+        lg = math.log1p(ax)
+    except (ValueError, OverflowError):
+        return None
+    if x == 0.0:
+        return 0.0
+    return float(math.copysign(lg, x))
+
+
+def _prepare_relative_inputs_for_scoring(
+    raw_value: float | None,
+    median_value: float | None,
+    q25_value: float | None,
+    q75_value: float | None,
+    iqr_value: float | None,
+    use_log_scale: bool,
+) -> tuple[float | None, float | None, float | None, float | None, float | None]:
+    """
+    Prepare inputs for compute_signed_evidence / relative robust z.
+
+    log scale is applied only to relative scoring inputs, not to the stored raw output fields.
+    When use_log_scale and both quartiles exist, IQR in transformed space is (T(q75)-T(q25));
+    otherwise the peer IQR column is used unchanged as denominator fallback.
+    """
+    if not use_log_scale:
+        return (raw_value, median_value, iqr_value, q25_value, q75_value)
+
+    raw_s = _signed_log1p(raw_value)
+    med_s = _signed_log1p(median_value)
+    q25_s = _signed_log1p(q25_value)
+    q75_s = _signed_log1p(q75_value)
+
+    if q25_s is not None and q75_s is not None:
+        iqr_s = q75_s - q25_s
+    else:
+        iqr_s = iqr_value
+
+    return (raw_s, med_s, iqr_s, q25_s, q75_s)
+
+
 def clip_value(x: float, lo: float, hi: float) -> float:
     """Clip x into [lo, hi]."""
     if x < lo:
@@ -308,6 +362,18 @@ def _row_get(row: Mapping[str, Any] | Any, key: str) -> Any:
         return None
 
 
+def _row_has_key(row: Mapping[str, Any] | Any, key: str) -> bool:
+    """True if row exposes key (backward compat when diagnostic columns are absent)."""
+    if row is None:
+        return False
+    if isinstance(row, Mapping):
+        return key in row
+    try:
+        return key in row.index  # type: ignore[attr-defined]
+    except Exception:
+        return False
+
+
 def _structural_missing_from_row(row: Mapping[str, Any] | Any, factor_spec: Any) -> bool:
     """
     Structural missing: value is not meaningfully defined; do not impute or score.
@@ -329,6 +395,62 @@ def _structural_missing_from_row(row: Mapping[str, Any] | Any, factor_spec: Any)
             return False
         g5 = safe_to_float(_row_get(row, "EPS Next 5Y"))
         return g5 is None or g5 <= 0.0
+
+    if rule == "forward_pe_nonpositive_estimate":
+        if fn != "Forward P/E":
+            return False
+        eps_ny = safe_to_float(_row_get(row, "EPS Next Y"))
+        if eps_ny is None:
+            eps_ny = safe_to_float(_row_get(row, "EPS Next Y Est Level"))
+        fpe = safe_to_float(_row_get(row, "Forward P/E"))
+        return (eps_ny is None or eps_ny <= 0.0) or (fpe is None or fpe <= 0.0)
+
+    if rule == "pfcf_nonpositive_or_invalid":
+        if fn != "P/FCF":
+            return False
+        pfcf = safe_to_float(_row_get(row, "P/FCF"))
+        return pfcf is None or pfcf <= 0.0
+
+    if rule == "ev_ebitda_nonpositive_or_invalid":
+        if fn != "EV/EBITDA":
+            return False
+        ev_e = safe_to_float(_row_get(row, "EV/EBITDA"))
+        return ev_e is None or ev_e <= 0.0
+
+    if rule == "roic_invalid_invested_capital":
+        if fn != "ROIC":
+            return False
+        if not _row_has_key(row, "ROIC IC Avg"):
+            return False
+        src = _row_get(row, "ROIC Calc Source")
+        if src is not None:
+            s = str(src).strip()
+            if s in {"missing_ic", "nonpositive_ic"}:
+                return True
+        ic_avg = safe_to_float(_row_get(row, "ROIC IC Avg"))
+        if ic_avg is None:
+            return True
+        if ic_avg <= 0.0:
+            return True
+        return False
+
+    if rule == "eps_yoy_nonpositive_regime":
+        if fn != "EPS YoY":
+            return False
+        if not _row_has_key(row, "EPS YoY Current TTM") and not _row_has_key(row, "EPS YoY Prior TTM"):
+            return False
+        cur = safe_to_float(_row_get(row, "EPS YoY Current TTM"))
+        pri = safe_to_float(_row_get(row, "EPS YoY Prior TTM"))
+        if cur is None or pri is None:
+            return True
+        if cur <= 0.0 or pri <= 0.0:
+            return True
+        src = _row_get(row, "EPS YoY Calc Source")
+        if src is not None:
+            s = str(src).strip()
+            if s and s.lower() != "nan" and s != "positive_to_positive":
+                return True
+        return False
 
     if rule == "dividend_not_applicable":
         if fn not in {"Dividend Gr. 3Y", "Dividend Gr. 5Y"}:
@@ -554,10 +676,19 @@ def score_one_factor_one_group(
             absolute_enabled=absolute_enabled_flag,
         )
 
+    use_log_scale = bool(getattr(factor_spec, "use_log_scale", False))
+    raw_rel, median_rel, iqr_rel, _q25_rel, _q75_rel = _prepare_relative_inputs_for_scoring(
+        raw_value,
+        median_value,
+        q25_value,
+        q75_value,
+        iqr_value,
+        use_log_scale,
+    )
     relative_evidence = compute_signed_evidence(
-        raw_value=raw_value,
-        median_value=median_value,
-        iqr_value=iqr_value,
+        raw_value=raw_rel,
+        median_value=median_rel,
+        iqr_value=iqr_rel,
         direction=direction,
     )
     absolute_evidence: float | None = None
