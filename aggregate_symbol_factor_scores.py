@@ -21,6 +21,7 @@ from score_factor_config import GROUP_BASE_WEIGHTS, FACTOR_SPECS
 from score_primitives import evidence_to_score
 
 GROUP_TYPES = ["A", "B", "C", "D", "E"]
+AGGREGATION_MODEL_VERSION = "factor_agg_conf_weight_v1"
 
 # From group_factor_scores (score_one_factor_one_group); carried through aggregation when present.
 HYBRID_TRANSPARENCY_COLS: tuple[str, ...] = (
@@ -97,6 +98,9 @@ def _aggregate_symbol_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
     if "adjusted_score" in df.columns:
         df["adjusted_score"] = pd.to_numeric(df["adjusted_score"], errors="coerce")
     df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce")
+    df["prior_evidence_factor"] = df["factor_name"].map(
+        lambda x: float(getattr(FACTOR_SPECS.get(str(x)), "evidence_prior", 0.0)) if FACTOR_SPECS.get(str(x)) else 0.0
+    )
 
     valid_mask = df.apply(_row_is_valid_for_aggregate, axis=1)
 
@@ -105,17 +109,25 @@ def _aggregate_symbol_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
 
     for g in GROUP_TYPES:
         col_evd = f"group_evidence_{g}"
-        col_w = f"weight_{g}"
+        col_w = f"weight_{g}"  # backward-compatible alias to effective weight
+        col_w_base = f"base_weight_{g}"
+        col_w_eff = f"effective_weight_{g}"
+        col_conf = f"group_confidence_{g}"
         w_base = float(GROUP_BASE_WEIGHTS.get(g, 1.0))
         is_g = df["group_type"].astype(str).str.strip().str.upper() == g
         df[col_evd] = df["adjusted_evidence"].where(valid_mask & is_g, other=pd.NA)
-        df[col_w] = np.where(valid_mask & is_g, w_base, 0.0).astype(float)
+        conf_g = pd.to_numeric(df["confidence"], errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0)
+        df[col_conf] = np.where(valid_mask & is_g, conf_g, 0.0).astype(float)
+        df[col_w_base] = np.where(valid_mask & is_g, w_base, 0.0).astype(float)
+        df[col_w_eff] = (df[col_w_base] * df[col_conf]).astype(float)
+        df[col_w] = df[col_w_eff].astype(float)
 
     key_cols = ["symbol", "as_of_date", "factor_name"]
 
     agg_spec: dict[str, Any] = {
         "category_valid": "first",
         "confidence_valid": "mean",
+        "prior_evidence_factor": "first",
     }
     for c in HYBRID_TRANSPARENCY_COLS:
         if c not in df.columns:
@@ -127,6 +139,9 @@ def _aggregate_symbol_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
     for g in GROUP_TYPES:
         agg_spec[f"group_evidence_{g}"] = "first"
         agg_spec[f"weight_{g}"] = "sum"
+        agg_spec[f"base_weight_{g}"] = "sum"
+        agg_spec[f"effective_weight_{g}"] = "sum"
+        agg_spec[f"group_confidence_{g}"] = "mean"
 
     grouped = df.groupby(key_cols, dropna=False, as_index=False).agg(agg_spec)
 
@@ -135,6 +150,11 @@ def _aggregate_symbol_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
         wcol = f"weight_{g}"
         weight_sum = grouped[wcol].astype(float) if weight_sum is None else weight_sum + grouped[wcol].astype(float)
     grouped["total_effective_weight"] = weight_sum
+    base_weight_sum = None
+    for g in GROUP_TYPES:
+        wb = f"base_weight_{g}"
+        base_weight_sum = grouped[wb].astype(float) if base_weight_sum is None else base_weight_sum + grouped[wb].astype(float)
+    grouped["total_base_weight"] = base_weight_sum
 
     w_gt0 = None
     for g in GROUP_TYPES:
@@ -157,11 +177,28 @@ def _aggregate_symbol_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
     safe_tw = tw.where(has_weight, np.nan)
     grouped["raw_observed_factor_evidence"] = (num.astype(float) / safe_tw).where(has_weight, np.nan)
 
+    tw_base = pd.to_numeric(grouped["total_base_weight"], errors="coerce").fillna(0.0)
+    grouped["factor_confidence"] = np.where(tw_base > 0.0, tw / tw_base, 0.0).astype(float)
+    grouped["factor_confidence"] = grouped["factor_confidence"].clip(lower=0.0, upper=1.0)
+    grouped["confidence_weighted_availability"] = grouped["factor_confidence"].astype(float)
+
+    conf_frame = pd.DataFrame(index=grouped.index)
+    for g in GROUP_TYPES:
+        ccol = f"group_confidence_{g}"
+        ecol = f"effective_weight_{g}"
+        cvals = pd.to_numeric(grouped.get(ccol), errors="coerce")
+        evals = pd.to_numeric(grouped.get(ecol), errors="coerce").fillna(0.0)
+        conf_frame[g] = cvals.where(evals > 0.0, np.nan)
+    grouped["confidence_mean"] = conf_frame.mean(axis=1, skipna=True).fillna(0.0).astype(float)
+    grouped["confidence_max"] = conf_frame.max(axis=1, skipna=True).fillna(0.0).astype(float)
+    grouped["confidence_min"] = conf_frame.min(axis=1, skipna=True).fillna(0.0).astype(float)
+
+    grouped["prior_evidence"] = pd.to_numeric(grouped["prior_evidence_factor"], errors="coerce").fillna(0.0).astype(float)
     grouped["final_factor_evidence"] = np.where(
         has_weight,
         grouped["raw_observed_factor_evidence"].astype(float),
         0.0,
-    )
+    ).astype(float)
     grouped["final_factor_score"] = grouped["final_factor_evidence"].map(
         lambda x: evidence_to_score(float(x)) if pd.notna(x) else 50.0
     )
@@ -172,8 +209,10 @@ def _aggregate_symbol_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
     grouped = grouped.drop(columns=["category_valid"], errors="ignore")
 
     nan_diag = np.nan
-    for c in ("prior_evidence", "donor_evidence", "donor_count", "donor_confidence", "shrink_lambda"):
+    for c in ("donor_evidence", "donor_count", "donor_confidence"):
         grouped[c] = nan_diag
+    grouped["shrink_lambda"] = (1.0 - grouped["factor_confidence"]).astype(float)
+    grouped["aggregation_model_version"] = AGGREGATION_MODEL_VERSION
 
     out_cols = [
         "symbol",
@@ -196,12 +235,25 @@ def _aggregate_symbol_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
         "final_factor_score",
         "valid_group_count",
         "total_effective_weight",
+        "total_base_weight",
         "availability",
+        "factor_confidence",
+        "confidence_weighted_availability",
         "mean_confidence",
+        "confidence_mean",
+        "confidence_max",
+        "confidence_min",
+        "aggregation_model_version",
     ]
     grouped = grouped.rename(columns={"confidence_valid": "mean_confidence"})
     for g in GROUP_TYPES:
         out_cols.append(f"group_evidence_{g}")
+    for g in GROUP_TYPES:
+        out_cols.append(f"base_weight_{g}")
+    for g in GROUP_TYPES:
+        out_cols.append(f"effective_weight_{g}")
+    for g in GROUP_TYPES:
+        out_cols.append(f"group_confidence_{g}")
     for g in GROUP_TYPES:
         out_cols.append(f"weight_{g}")
 

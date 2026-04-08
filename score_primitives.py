@@ -4,6 +4,8 @@ from __future__ import annotations
 import math
 from typing import Any, Mapping
 
+FACTOR_CONFIDENCE_MODEL_VERSION = "factor_conf_v1"
+
 
 def get_rep_columns(factor_name: str) -> dict[str, str]:
     """
@@ -339,6 +341,107 @@ def compute_group_confidence(
     return float(clip_value(conf_total, 0.0, 1.0))
 
 
+def _saturating_count_confidence(
+    n_valid: float | int | None,
+    *,
+    n0: float,
+) -> float:
+    """Smooth confidence from count: c = 1 - exp(-n / n0)."""
+    n = safe_to_float(n_valid)
+    if n is None or n <= 0.0:
+        return 0.0
+    n0_eff = max(float(n0), 1e-6)
+    c = 1.0 - math.exp(-float(n) / n0_eff)
+    return float(clip_value(c, 0.0, 1.0))
+
+
+def _map_evidence_source_confidence(evidence_source: str | None) -> float:
+    """
+    Source-level confidence (extensible for donor/prior paths).
+    Keep observed evidence as the full-confidence baseline.
+    """
+    s = str(evidence_source).strip().lower() if evidence_source is not None else ""
+    mapping = {
+        "observed_evidence": 1.0,
+        "observed_evidence_shrunk": 1.0,
+        "observed": 1.0,
+        "donor": 0.80,
+        "donor_evidence": 0.80,
+        "prior": 0.60,
+        "prior_only": 0.60,
+    }
+    return float(clip_value(mapping.get(s, 0.70), 0.0, 1.0))
+
+
+def _agreement_confidence(
+    relative_evidence: float | None,
+    absolute_evidence: float | None,
+    *,
+    scale: float = 2.0,
+    floor: float = 0.35,
+) -> float:
+    """
+    Agreement confidence when both relative/absolute are available.
+    Larger disagreement reduces confidence but never to 0.
+    """
+    if relative_evidence is None or absolute_evidence is None:
+        return 1.0
+    d = abs(float(relative_evidence) - float(absolute_evidence))
+    s = max(float(scale), 1e-6)
+    raw = math.exp(-d / s)
+    c = max(float(floor), raw)
+    return float(clip_value(c, 0.0, 1.0))
+
+
+def _stability_confidence(iqr_value: float | None, *, eps: float = 1e-9) -> float:
+    """
+    Stability confidence from denominator quality.
+    Missing/degenerate IQR gets discounted but not zeroed.
+    """
+    if iqr_value is None:
+        return 0.75
+    iv = abs(float(iqr_value))
+    if iv <= float(eps):
+        return 0.80
+    return 1.0
+
+
+def compute_factor_confidence(
+    *,
+    n_valid: float | int | None,
+    peer_quality: str | None,
+    evidence_source: str | None,
+    relative_evidence: float | None,
+    absolute_evidence: float | None,
+    iqr_value: float | None,
+    main_factor: bool = False,
+    importance_tier: str | None = None,
+    n0_main: float = 16.0,
+    n0_aux: float = 10.0,
+) -> dict[str, float | str]:
+    """
+    Multiplicative factor confidence model.
+    confidence = clip(c_n * c_peer * c_source * c_agreement * c_stability, 0, 1)
+    """
+    tier = (importance_tier or "").strip().lower()
+    is_main = bool(main_factor) or tier == "main"
+    c_n = _saturating_count_confidence(n_valid=n_valid, n0=(n0_main if is_main else n0_aux))
+    c_peer = map_peer_quality_to_multiplier(peer_quality)
+    c_source = _map_evidence_source_confidence(evidence_source)
+    c_agreement = _agreement_confidence(relative_evidence, absolute_evidence)
+    c_stability = _stability_confidence(iqr_value)
+    c_total = clip_value(c_n * c_peer * c_source * c_agreement * c_stability, 0.0, 1.0)
+    return {
+        "confidence": float(c_total),
+        "confidence_n": float(c_n),
+        "confidence_peer": float(c_peer),
+        "confidence_source": float(c_source),
+        "confidence_agreement": float(c_agreement),
+        "confidence_stability": float(c_stability),
+        "confidence_model_version": FACTOR_CONFIDENCE_MODEL_VERSION,
+    }
+
+
 def shrink_score_to_neutral(
     raw_score: float | None,
     confidence: float | None,
@@ -491,6 +594,12 @@ def _base_score_dict(
     absolute_weight: float | None = None,
     blend_method: str | None = None,
     absolute_enabled: bool | None = None,
+    confidence_n: float | None = None,
+    confidence_peer: float | None = None,
+    confidence_source: float | None = None,
+    confidence_agreement: float | None = None,
+    confidence_stability: float | None = None,
+    confidence_model_version: str | None = None,
 ) -> dict[str, Any]:
     return {
         "factor_name": factor_name,
@@ -518,6 +627,12 @@ def _base_score_dict(
         "absolute_weight": absolute_weight,
         "blend_method": blend_method,
         "absolute_enabled": absolute_enabled,
+        "confidence_n": confidence_n,
+        "confidence_peer": confidence_peer,
+        "confidence_source": confidence_source,
+        "confidence_agreement": confidence_agreement,
+        "confidence_stability": confidence_stability,
+        "confidence_model_version": confidence_model_version,
     }
 
 
@@ -745,6 +860,7 @@ def score_one_factor_one_group(
             absolute_enabled=absolute_enabled_flag,
         )
 
+    # raw_score is retained as a diagnostic/reporting view of raw_evidence.
     raw_score = evidence_to_score(evidence=raw_evidence, beta=evidence_beta, clip_evidence=4.0)
     if raw_score is None:
         return _base_score_dict(
@@ -775,11 +891,26 @@ def score_one_factor_one_group(
             absolute_enabled=absolute_enabled_flag,
         )
 
-    # No group-level confidence shrink: use blended raw evidence directly.
-    confidence = 1.0
-    adjusted_evidence = raw_evidence
-    adjusted_score = raw_score
+    # Factor-level uncertainty is reflected as prior shrink (not penalty).
     evidence_source = "observed_evidence"
+    conf_diag = compute_factor_confidence(
+        n_valid=n_valid,
+        peer_quality=peer_quality,
+        evidence_source=evidence_source,
+        relative_evidence=relative_evidence,
+        absolute_evidence=absolute_evidence,
+        iqr_value=iqr_value,
+        main_factor=bool(getattr(factor_spec, "main_factor", False)),
+        importance_tier=getattr(factor_spec, "importance_tier", None),
+    )
+    confidence = float(conf_diag["confidence"])
+    adjusted_evidence = shrink_evidence_to_prior(
+        evidence=raw_evidence,
+        confidence=confidence,
+        prior_evidence=prior_evidence,
+    )
+    # adjusted_score is also diagnostic/reporting; downstream decision flow should use adjusted_evidence.
+    adjusted_score = evidence_to_score(evidence=adjusted_evidence, beta=evidence_beta, clip_evidence=4.0)
 
     is_valid_score = adjusted_score is not None
     if is_valid_score and iqr_value is None:
@@ -813,6 +944,12 @@ def score_one_factor_one_group(
         absolute_weight=absolute_weight_eff,
         blend_method=blend_method,
         absolute_enabled=absolute_enabled_flag,
+        confidence_n=safe_to_float(conf_diag.get("confidence_n")),
+        confidence_peer=safe_to_float(conf_diag.get("confidence_peer")),
+        confidence_source=safe_to_float(conf_diag.get("confidence_source")),
+        confidence_agreement=safe_to_float(conf_diag.get("confidence_agreement")),
+        confidence_stability=safe_to_float(conf_diag.get("confidence_stability")),
+        confidence_model_version=str(conf_diag.get("confidence_model_version", FACTOR_CONFIDENCE_MODEL_VERSION)),
     )
 
 

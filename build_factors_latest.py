@@ -36,20 +36,73 @@ OCF_NI_CLIP_HIGH = 5.0
 
 
 def load_prices(data_dir: Path) -> pd.DataFrame:
-    """prices_eod.parquet. Finviz 근사: adjClose 있으면 close 대신 사용(Perf/Beta 등 조정종가 기준). Parquet만 읽음."""
-    cols = ["symbol", "date", "open", "high", "low", "close", "volume"]
+    """
+    prices_eod.parquet only.
+
+    Raw OHLCV stays in open/high/low/close/volume. Adjusted, ratio-consistent OHLC for
+    indicators lives in open_px/high_px/low_px/close_px with price_adjustment_factor
+    (adjClose/close when both valid and close>0, then per-symbol ffill/bfill on finite >0).
+    price-based indicators are computed from normalized price columns (*_px) to keep
+    adjusted price handling consistent.
+    """
+    base_cols = ["symbol", "date", "open", "high", "low", "close", "volume"]
+    extra_cols = [
+        "adjClose",
+        "price_adjustment_factor",
+        "open_px",
+        "high_px",
+        "low_px",
+        "close_px",
+    ]
+    out_cols = base_cols + extra_cols
     path = data_dir / "prices_eod.parquet"
-    # FIX: 파일 없으면 빈 DF 반환; main에서 path 존재 여부로 에러 로그 후 종료 처리
     if not path.exists():
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=out_cols)
     df = pd.read_parquet(path)
-    use_cols = [c for c in cols + ["adjClose"] if c in df.columns]
-    df = df[use_cols]
+    use_cols = [c for c in base_cols + ["adjClose"] if c in df.columns]
+    df = df[use_cols].copy()
+    if "symbol" not in df.columns:
+        df["symbol"] = ""
+    df["symbol"] = df["symbol"].astype(str).str.strip()
+    for c in ("open", "high", "low", "close", "volume"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        else:
+            df[c] = np.nan
+    if "adjClose" in df.columns:
+        df["adjClose"] = pd.to_numeric(df["adjClose"], errors="coerce")
+    else:
+        df["adjClose"] = np.nan
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
     df = df.dropna(subset=["date"])
-    if "adjClose" in df.columns:
-        df["close"] = pd.to_numeric(df["adjClose"], errors="coerce").fillna(pd.to_numeric(df["close"], errors="coerce"))
-    return df
+    df = df.sort_values(["symbol", "date"], ascending=[True, True]).reset_index(drop=True)
+
+    rc = df["close"]
+    ac = df["adjClose"]
+    raw_factor = pd.Series(np.nan, index=df.index, dtype=float)
+    ok_ratio = ac.notna() & rc.notna() & (rc > 0) & np.isfinite(ac.astype(float)) & np.isfinite(rc.astype(float))
+    raw_factor.loc[ok_ratio] = (ac / rc).loc[ok_ratio]
+    raw_factor = raw_factor.where(np.isfinite(raw_factor) & (raw_factor > 0), np.nan)
+    df["price_adjustment_factor"] = raw_factor.groupby(df["symbol"]).transform(lambda s: s.ffill().bfill())
+
+    f = df["price_adjustment_factor"]
+    f_ok = f.notna() & np.isfinite(f) & (f > 0)
+
+    close_px = ac.where(ac.notna() & np.isfinite(ac), np.nan)
+    need_scaled = close_px.isna() & f_ok & rc.notna()
+    close_px = close_px.where(~need_scaled, rc * f)
+    close_px = close_px.where(close_px.notna(), rc)
+    df["close_px"] = close_px
+
+    ro, rh, rl = df["open"], df["high"], df["low"]
+    df["open_px"] = (ro * f).where(f_ok & ro.notna(), ro)
+    df["high_px"] = (rh * f).where(f_ok & rh.notna(), rh)
+    df["low_px"] = (rl * f).where(f_ok & rl.notna(), rl)
+
+    for c in out_cols:
+        if c not in df.columns:
+            df[c] = np.nan
+    return df[out_cols].copy()
 
 
 def _parse_bool_arg(v: Any, default: bool = False) -> bool:
@@ -1686,6 +1739,221 @@ def format_insider_own_trans(own_pct: Optional[float], trans_pct: Optional[float
 # Price-based indicators (one symbol)
 # -----------------------------------------------------------------------------
 
+# guard against unresolved split-like discontinuities in vendor price series
+EXTREME_DAILY_RETURN_THRESHOLD = 0.80
+
+# Dedupe discontinuity warnings per (symbol, price_date, indicator) within a process.
+_discontinuity_warn_keys: set[tuple[str, str, str]] = set()
+
+
+def _has_extreme_price_discontinuity(
+    close_series: pd.Series,
+    threshold: float = EXTREME_DAILY_RETURN_THRESHOLD,
+) -> bool:
+    """
+    True if any adjacent daily return on normalized close satisfies |ret| >= threshold.
+    Uses ret = close / close.shift(1) - 1 (NaN/invalid pairs excluded from the check).
+    """
+    if close_series is None or len(close_series) < 2:
+        return False
+    s = pd.to_numeric(close_series, errors="coerce").astype(float)
+    prev = s.shift(1)
+    ret = s / prev - 1.0
+    valid = prev.notna() & s.notna() & (prev != 0) & np.isfinite(prev) & np.isfinite(s)
+    ret = ret.where(valid)
+    hit = (ret.abs() >= float(threshold)) & ret.notna()
+    return bool(hit.any())
+
+
+def _close_window_has_discontinuity(
+    close: pd.Series,
+    ilo: int,
+    ihi: int,
+    *,
+    threshold: float = EXTREME_DAILY_RETURN_THRESHOLD,
+) -> bool:
+    """Inclusive index window on ``close``; False if fewer than 2 rows."""
+    n = len(close)
+    if ilo < 0 or ihi >= n or ilo > ihi:
+        return False
+    return _has_extreme_price_discontinuity(close.iloc[ilo : ihi + 1], threshold)
+
+
+def _log_price_discontinuity_nan(
+    symbol: str | None,
+    price_date: str,
+    indicator_name: str,
+    *,
+    reason: str = "extreme_daily_return",
+) -> None:
+    sym = (symbol or "?").strip().upper() or "?"
+    key = (sym, str(price_date)[:10], indicator_name)
+    if key in _discontinuity_warn_keys:
+        return
+    _discontinuity_warn_keys.add(key)
+    log.warning(
+        "price discontinuity guard: symbol=%s price_date=%s indicator=%s reason=%s",
+        sym,
+        str(price_date)[:10],
+        indicator_name,
+        reason,
+    )
+
+
+# Global sanity: flag symbols whose worst close_px daily move is huge (vendor / adjustment issues).
+PRICE_QUALITY_ABS_RET_SYMBOL_WARN = 0.95
+
+
+def summarize_price_series_quality(
+    prices: pd.DataFrame,
+    symbols: Optional[list[str]] = None,
+) -> pd.DataFrame:
+    """
+    Lightweight per-symbol metrics on the loaded price panel (logging-only consumers).
+
+    Uses normalized ``close_px`` for returns and discontinuity flags; raw ``close`` / ``adjClose``
+    for latest-level cross-checks.
+    """
+    if prices is None or prices.empty or "symbol" not in prices.columns:
+        return pd.DataFrame()
+    if "close_px" not in prices.columns:
+        log.warning("summarize_price_series_quality: close_px column missing; returning empty summary.")
+        return pd.DataFrame()
+    w = prices.copy()
+    w["symbol"] = w["symbol"].astype(str).str.strip().str.upper()
+    if symbols:
+        keep = {str(s).strip().upper() for s in symbols}
+        w = w[w["symbol"].isin(keep)]
+    if w.empty:
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+    for sym, g in w.groupby("symbol", sort=False):
+        g = g.sort_values("date")
+        n = len(g)
+        if n < 1:
+            continue
+        cp = pd.to_numeric(g["close_px"], errors="coerce").reset_index(drop=True)
+        prev = cp.shift(1)
+        ret = cp / prev - 1.0
+        valid = prev.notna() & cp.notna() & (prev != 0) & np.isfinite(prev) & np.isfinite(cp)
+        ret = ret.where(valid)
+        max_abs = float(ret.abs().max()) if n > 1 and ret.notna().any() else float("nan")
+        if not np.isfinite(max_abs):
+            max_abs = float("nan")
+
+        if "price_adjustment_factor" in g.columns:
+            fac = pd.to_numeric(g["price_adjustment_factor"], errors="coerce")
+            valid_f = fac.notna() & np.isfinite(fac) & (fac > 0)
+            valid_adj_factor_ratio = float(valid_f.sum()) / float(len(fac)) if len(fac) else float("nan")
+        else:
+            valid_adj_factor_ratio = float("nan")
+
+        last = g.iloc[-1]
+        latest_raw = pd.to_numeric(last["close"], errors="coerce") if "close" in g.columns else float("nan")
+        latest_adj = pd.to_numeric(last["adjClose"], errors="coerce") if "adjClose" in g.columns else float("nan")
+        latest_cpx = float(cp.iloc[-1]) if pd.notna(cp.iloc[-1]) else float("nan")
+
+        has_ex = _has_extreme_price_discontinuity(cp, EXTREME_DAILY_RETURN_THRESHOLD)
+
+        rows.append(
+            {
+                "symbol": sym,
+                "first_date": str(g["date"].iloc[0])[:10],
+                "last_date": str(g["date"].iloc[-1])[:10],
+                "valid_adj_factor_ratio": valid_adj_factor_ratio,
+                "max_abs_daily_return_close_px": max_abs,
+                "latest_close_px": latest_cpx,
+                "latest_close_raw": float(latest_raw) if pd.notna(latest_raw) else float("nan"),
+                "latest_adjClose": float(latest_adj) if pd.notna(latest_adj) else float("nan"),
+                "has_extreme_discontinuity": bool(has_ex),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def log_price_series_quality_diagnostics(
+    prices: pd.DataFrame,
+    *,
+    mode: str,
+    sample_as_of_date: Optional[str] = None,
+    top_n: int = 15,
+) -> None:
+    """
+    Logging-only diagnostics for adjusted-price consistency (e.g. BKNG-style cases).
+    Runs when mode is ``latest`` or ``sample_as_of_date`` is set.
+    """
+    m = str(mode).strip().lower()
+    sa = (sample_as_of_date or "").strip()
+    if m != "latest" and not sa:
+        return
+    if prices is None or prices.empty:
+        log.info("Price quality diagnostics: skipped (empty prices).")
+        return
+
+    summ = summarize_price_series_quality(prices)
+    if summ.empty:
+        log.info("Price quality diagnostics: empty per-symbol summary.")
+        return
+
+    col = "max_abs_daily_return_close_px"
+    n_ge_095 = int((summ[col] >= PRICE_QUALITY_ABS_RET_SYMBOL_WARN).sum()) if col in summ.columns else 0
+    log.info(
+        "Price quality self-check: symbol count with max|daily_ret|>=%.2f on close_px: %s",
+        PRICE_QUALITY_ABS_RET_SYMBOL_WARN,
+        n_ge_095,
+    )
+
+    n_all_na_fac = 0
+    if "price_adjustment_factor" in prices.columns:
+        for _, grp in prices.groupby(prices["symbol"].astype(str).str.strip().str.upper(), sort=False):
+            fac = pd.to_numeric(grp["price_adjustment_factor"], errors="coerce")
+            if len(fac) and fac.isna().all():
+                n_all_na_fac += 1
+    log.info("Price quality self-check: symbols with all-NaN price_adjustment_factor: %s", n_all_na_fac)
+
+    if "high_px" in prices.columns and "low_px" in prices.columns:
+        hp = pd.to_numeric(prices["high_px"], errors="coerce")
+        lp = pd.to_numeric(prices["low_px"], errors="coerce")
+        bad_rows = int((hp.notna() & lp.notna() & (hp < lp)).sum())
+    else:
+        bad_rows = 0
+    log.info("Price quality self-check: row count with high_px < low_px: %s", bad_rows)
+
+    top = summ.sort_values(col, ascending=False, na_position="last").head(int(top_n))
+    log.info("Price quality: top %s symbols by max_abs_daily_return_close_px (suspicious)", len(top))
+    for _, r in top.iterrows():
+        log.info(
+            "Price quality suspicious: symbol=%s last_date=%s max_abs_ret=%.6f valid_factor_ratio=%.4f discontinuity=%s latest_px=%s raw=%s",
+            r["symbol"],
+            r["last_date"],
+            float(r[col]) if pd.notna(r[col]) else float("nan"),
+            float(r["valid_adj_factor_ratio"]) if pd.notna(r["valid_adj_factor_ratio"]) else float("nan"),
+            r["has_extreme_discontinuity"],
+            r["latest_close_px"],
+            r["latest_close_raw"],
+        )
+
+    bk = summ.loc[summ["symbol"].astype(str).str.upper() == "BKNG"]
+    if not bk.empty:
+        r = bk.iloc[0]
+        log.info(
+            "Price quality BKNG: symbol=%s last_date=%s latest_close_px=%s max_abs_daily_return_close_px=%s has_extreme_discontinuity=%s",
+            r["symbol"],
+            r["last_date"],
+            r["latest_close_px"],
+            r[col],
+            r["has_extreme_discontinuity"],
+        )
+
+
+def _series_px_or_raw(series: pd.DataFrame, px_col: str, raw_col: str) -> pd.Series:
+    """Normalized OHLC (*_px) when column exists, else raw OHLC; always float Series aligned to ``series``."""
+    name = px_col if px_col in series.columns else raw_col
+    if name not in series.columns:
+        return pd.Series(np.nan, index=series.index, dtype=float)
+    return pd.to_numeric(series[name], errors="coerce").astype(float)
+
 
 def _compute_beta_from_returns(stock_ret: pd.Series, mkt_ret: pd.Series) -> float:
     """beta = cov(stock, mkt) / var(mkt). 둘 다 같은 인덱스로 정렬돼 있어야 함."""
@@ -1804,20 +2072,31 @@ def _float_or_nan(x: Any) -> float:
 def compute_price_indicators(
     series: pd.DataFrame,
     price_date: str,
+    *,
+    symbol: str | None = None,
 ) -> Dict[str, float]:
-    """series: sorted by date ascending, columns date, open, high, low, close, volume."""
+    """
+    One-symbol price panel: sorted by date ascending.
+
+    All level/return/ATR style metrics use normalized columns open_px, high_px, low_px, close_px
+    when present (from load_prices); otherwise raw open, high, low, close. Volume is unchanged.
+    """
     out: Dict[str, float] = {}
-    if series.empty or "date" not in series.columns or "close" not in series.columns:
+    if series.empty or "date" not in series.columns:
+        return out
+    if "close_px" not in series.columns and "close" not in series.columns:
         return out
     series = series.sort_values("date").reset_index(drop=True)
     idx = series["date"] == price_date
     if not idx.any():
         return out
     loc = int(series.index[idx][0])
-    close = series["close"].astype(float, errors="ignore")
-    high = series["high"].astype(float, errors="ignore")
-    low = series["low"].astype(float, errors="ignore")
-    volume = series["volume"].astype(float, errors="ignore")
+    # Open: same px/raw rule as H/L/C (reserved for future bar logic; not used in formulas below).
+    open_px_series = _series_px_or_raw(series, "open_px", "open")  # noqa: F841
+    high = _series_px_or_raw(series, "high_px", "high")
+    low = _series_px_or_raw(series, "low_px", "low")
+    close = _series_px_or_raw(series, "close_px", "close")
+    volume = pd.to_numeric(series["volume"], errors="coerce").astype(float) if "volume" in series.columns else pd.Series(np.nan, index=series.index)
 
     price = _float_or_nan(close.iloc[loc])
     out["Price"] = price
@@ -1835,7 +2114,6 @@ def compute_price_indicators(
         out["Prev Close"] = np.nan
         out["Change"] = np.nan
 
-    n = len(series)
     # Avg Volume 63
     if loc >= 62:
         out["Avg Volume"] = float(volume.iloc[loc - 62 : loc + 1].mean())
@@ -1865,23 +2143,31 @@ def compute_price_indicators(
 
     # Volatility (63 daily returns, std)
     if loc >= 63:
-        c = close.iloc[loc - 63 : loc + 1].astype(float)
-        ret = c / c.shift(1) - 1
-        ret = ret.dropna()
-        if len(ret) >= 63:
-            out["Volatility"] = float(ret.std())
-        else:
+        if _close_window_has_discontinuity(close, loc - 63, loc):
             out["Volatility"] = np.nan
+            _log_price_discontinuity_nan(symbol, price_date, "Volatility")
+        else:
+            c = close.iloc[loc - 63 : loc + 1].astype(float)
+            ret = c / c.shift(1) - 1
+            ret = ret.dropna()
+            if len(ret) >= 63:
+                out["Volatility"] = float(ret.std())
+            else:
+                out["Volatility"] = np.nan
     else:
         out["Volatility"] = np.nan
 
     # ATR(14): need 15 rows
     if loc >= 14:
-        h = high.iloc[loc - 14 : loc + 1]
-        l_ = low.iloc[loc - 14 : loc + 1]
-        c = close.iloc[loc - 14 : loc + 1]
-        tr = np.maximum(h.values - l_.values, np.maximum(np.abs(h.values - c.shift(1).fillna(c.iloc[0]).values), np.abs(l_.values - c.shift(1).fillna(c.iloc[0]).values)))
-        out["ATR(14)"] = float(np.mean(tr))
+        if _close_window_has_discontinuity(close, loc - 14, loc):
+            out["ATR(14)"] = np.nan
+            _log_price_discontinuity_nan(symbol, price_date, "ATR(14)")
+        else:
+            h = high.iloc[loc - 14 : loc + 1]
+            l_ = low.iloc[loc - 14 : loc + 1]
+            c = close.iloc[loc - 14 : loc + 1]
+            tr = np.maximum(h.values - l_.values, np.maximum(np.abs(h.values - c.shift(1).fillna(c.iloc[0]).values), np.abs(l_.values - c.shift(1).fillna(c.iloc[0]).values)))
+            out["ATR(14)"] = float(np.mean(tr))
     else:
         out["ATR(14)"] = np.nan
 
@@ -1906,7 +2192,7 @@ def compute_price_indicators(
     else:
         out["RSI(14)"] = np.nan
 
-    # Perf
+    # Perf (guard long-horizon windows + week/month for consistency)
     for days, name in [
         (5, "Perf Week"),
         (21, "Perf Month"),
@@ -1918,11 +2204,15 @@ def compute_price_indicators(
         (252 * 10, "Perf 10Y"),
     ]:
         if loc >= days:
-            past_close = _float_or_nan(close.iloc[loc - days])
-            if past_close and past_close != 0:
-                out[name] = price / past_close - 1
-            else:
+            if _close_window_has_discontinuity(close, loc - days, loc):
                 out[name] = np.nan
+                _log_price_discontinuity_nan(symbol, price_date, name)
+            else:
+                past_close = _float_or_nan(close.iloc[loc - days])
+                if past_close and past_close != 0:
+                    out[name] = price / past_close - 1
+                else:
+                    out[name] = np.nan
         else:
             out[name] = np.nan
 
@@ -1932,11 +2222,17 @@ def compute_price_indicators(
         year_start = f"{year}-01-01"
         same_year = series.loc[series["date"] >= year_start].loc[series["date"] <= price_date]
         if not same_year.empty:
-            first_close = _float_or_nan(same_year.sort_values("date").iloc[0]["close"])
-            if first_close and first_close != 0:
-                out["Perf YTD"] = price / first_close - 1
-            else:
+            sy = same_year.sort_values("date").reset_index(drop=True)
+            sy_close = _series_px_or_raw(sy, "close_px", "close")
+            if _has_extreme_price_discontinuity(sy_close):
                 out["Perf YTD"] = np.nan
+                _log_price_discontinuity_nan(symbol, price_date, "Perf YTD")
+            else:
+                first_close = _float_or_nan(sy_close.iloc[0])
+                if first_close and first_close != 0:
+                    out["Perf YTD"] = price / first_close - 1
+                else:
+                    out["Perf YTD"] = np.nan
         else:
             out["Perf YTD"] = np.nan
     except Exception:
@@ -2920,6 +3216,8 @@ def run_operational_self_checks(
     latest_df: pd.DataFrame,
     fallback_stats: Dict[str, Any],
     mode: str,
+    prices: Optional[pd.DataFrame] = None,
+    sample_as_of_date: Optional[str] = None,
 ) -> None:
     """
     Lightweight runtime checks for operational semantics.
@@ -2960,6 +3258,12 @@ def run_operational_self_checks(
         fallback_stats.get("total_rows", 0),
         float(fallback_stats.get("fallback_ratio", 0.0)),
         fallback_stats.get("fallback_symbols", 0),
+    )
+
+    log_price_series_quality_diagnostics(
+        prices if prices is not None else pd.DataFrame(),
+        mode=mode,
+        sample_as_of_date=sample_as_of_date,
     )
 
 
@@ -3252,12 +3556,15 @@ def main() -> None:
 
             as_of = as_of_date
             processed_asof_dates.add(as_of)
-            price_inds = compute_price_indicators(series, price_date)
+            price_inds = compute_price_indicators(series, price_date, symbol=sym)
             # Beta: sp500_prices(^GSPC 또는 대체 심볼) 시장 수익률로 Finviz 근사 (5Y 월간 → 252일 일간 fallback)
             beta_val = np.nan
             try:
                 if sp500_df is not None and not sp500_df.empty:
-                    stock_for_beta = series[["date", "close"]].copy()
+                    if "close_px" in series.columns:
+                        stock_for_beta = series[["date", "close_px"]].rename(columns={"close_px": "close"})
+                    else:
+                        stock_for_beta = series[["date", "close"]].copy()
                     mkt_for_beta = sp500_df[["date", "close"]].copy()
                     beta_val = beta_finviz_style(stock_for_beta, mkt_for_beta, price_date)
             except Exception as e:
@@ -3957,6 +4264,8 @@ def main() -> None:
         latest_df=latest_df,
         fallback_stats=fallback_stats if "fallback_stats" in locals() else {},
         mode=mode,
+        prices=prices,
+        sample_as_of_date=sample_as_of_date,
     )
 
     if output_diagnostics:

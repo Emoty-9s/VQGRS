@@ -254,9 +254,13 @@ _STI_FACTORS: list[str] = [
 # ---------------------------------------------------------------------------
 # Main/Aux factor importance tiers
 # ---------------------------------------------------------------------------
-# Category score calculation is planned to use main-factor coverage separately.
-# When main factors are missing frequently, category evidence will be shrunk more conservatively.
-# Aggregation is planned to be a split aggregation (main/aux), not a simple average.
+# Philosophy: **main** factors are the minimal core that directly represent the category
+# thesis; **aux** factors add explanatory power but are noisier or more supplementary.
+# Category score machinery uses main vs aux for coverage and weighting (main_weight /
+# aux_weight below); missing mains shrink evidence more conservatively.
+# **S (risk / swing):** mains are Beta and Volatility—direct measures of how much the
+# stock moves vs the market and in absolute terms. Long-horizon return (e.g. Perf 3Y)
+# and operating-margin volatility stay aux as reinforcement, not the core S thesis.
 #
 # weight policy:
 # - main factor weight = 1.5
@@ -267,13 +271,13 @@ MAIN_AUX_WEIGHT_POLICY = {
     "aux_weight": 0.75,
 }
 
-# Canonical "true main 3" per category (V/Q/G/R/S).
+# Canonical mains per category; all other factors in CATEGORY_TO_FACTORS for that category are aux.
 MAIN_FACTORS_BY_CATEGORY: dict[str, list[str]] = {
-    "V": ["P/E", "P/S", "EV/EBITDA"],
-    "Q": ["ROIC", "Oper. Margin", "OCF/NI"],
-    "G": ["Revenue YoY", "EPS YoY", "OCF YoY"],
+    "V": ["P/E", "EV/EBITDA", "P/S"],
+    "Q": ["ROIC", "Oper. Margin", "ROE"],
+    "G": ["Revenue YoY", "EPS YoY", "EPS This Y"],
     "R": ["Debt/Eq", "Current Ratio", "Interest Coverage"],
-    "S": ["Beta", "Volatility", "OPM volatility"],
+    "S": ["Beta", "Volatility"],
     "STI": [],
 }
 
@@ -646,6 +650,50 @@ for cat, names in CATEGORY_TO_FACTORS.items():
     AUX_FACTORS_BY_CATEGORY[cat] = aux_names
 
 
+def summarize_main_aux_layout() -> dict[str, dict[str, list[str]]]:
+    """Per category: main / aux / drop factor names from resolved FactorSpec.importance_tier."""
+    out: dict[str, dict[str, list[str]]] = {}
+    for cat, names in CATEGORY_TO_FACTORS.items():
+        main: list[str] = []
+        aux: list[str] = []
+        drop: list[str] = []
+        for n in names:
+            spec = FACTOR_SPECS[n]
+            if spec.importance_tier == "main":
+                main.append(n)
+            elif spec.importance_tier == "aux":
+                aux.append(n)
+            else:
+                drop.append(n)
+        main_order = MAIN_FACTORS_BY_CATEGORY.get(cat, [])
+        main_set = set(main)
+        main_sorted = [m for m in main_order if m in main_set]
+        for m in sorted(main_set - set(main_sorted)):
+            main_sorted.append(m)
+        out[cat] = {
+            "main": main_sorted,
+            "aux": sorted(aux),
+            "drop": sorted(drop),
+        }
+    return out
+
+
+def validate_main_aux_layout() -> None:
+    """Sanity checks for MAIN_FACTORS_BY_CATEGORY vs resolved specs (run from __main__ only)."""
+    layout = summarize_main_aux_layout()
+    s_main = set(layout["S"]["main"])
+    assert "Beta" in s_main
+    assert "Volatility" in s_main
+    assert "Perf 3Y" not in s_main
+    assert "OPM volatility" not in s_main
+    q_main = set(layout["Q"]["main"])
+    assert "ROE" in q_main
+    assert "OCF/NI" not in q_main
+    g_main = set(layout["G"]["main"])
+    assert "EPS This Y" in g_main
+    assert "OCF YoY" not in g_main
+
+
 # Weight semantics:
 # - FactorSpec.weight: aggregation weight inside each category (factor-level evidence aggregation).
 # - GROUP_BASE_WEIGHTS: aggregation weights for group A/B/C/D/E contributions.
@@ -671,4 +719,18 @@ CATEGORY_BASE_WEIGHTS: dict[str, float] = {
     "S": 1.0,
     "STI": 1.0,
 }
+
+
+if __name__ == "__main__":
+    validate_main_aux_layout()
+    _layout = summarize_main_aux_layout()
+    _order = ("V", "Q", "G", "R", "S", "STI")
+    for _cat in _order:
+        if _cat not in _layout:
+            continue
+        _buckets = _layout[_cat]
+        print(f"[{_cat}] main ({len(_buckets['main'])}): {_buckets['main']}")
+        print(f"     aux ({len(_buckets['aux'])}): {_buckets['aux']}")
+        print(f"     drop ({len(_buckets['drop'])}): {_buckets['drop']}")
+        print()
 

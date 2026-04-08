@@ -8,6 +8,13 @@ Input:
 Output:
   - output/scoring/final_vqgrs_scores_latest.(parquet|csv)
 
+Evidence-first final scoring:
+  factor adjusted_evidence -> category final_evidence_{V/Q/G/R/S} -> track-weighted final evidence
+  -> one-shot evidence_to_score() at final stage.
+
+Category score columns (score_V..score_S) are retained for reporting/diagnostics and backward
+compatibility, but final decision uses category evidence, not category scores.
+
 ``final_score`` is selected from track-weighted LTI profiles (A/B/C/N), with missing-aware
 weight renormalization and placeholder penalty/hard-stop stage.
 """
@@ -314,19 +321,39 @@ def _simple_mean_category_scores(df: pd.DataFrame) -> pd.Series:
     return mean_v.where(has_any, 50.0).astype(float)
 
 
-def _compute_weighted_lti_for_profile(df: pd.DataFrame, weights: dict[str, float]) -> pd.Series:
+def _compute_track_weighted_evidence(df: pd.DataFrame, weights: dict[str, float]) -> pd.Series:
     """
-    Weighted LTI on score_V..score_S with missing-aware renormalization.
-    If all category scores are missing, return 50.0.
+    Track-weighted final category evidence with missing-aware renormalization.
+    If all core category evidences are missing, return 0.0 (neutral evidence).
     """
-    score_cols = {c: f"score_{c}" for c in CORE_CATS}
-    s = pd.DataFrame({c: pd.to_numeric(df[col], errors="coerce") for c, col in score_cols.items()})
+    ev_cols = {c: f"final_evidence_{c}" for c in CORE_CATS}
+    s = pd.DataFrame({c: pd.to_numeric(df[col], errors="coerce") for c, col in ev_cols.items()})
     w = pd.Series({c: float(weights.get(c, 0.0)) for c in CORE_CATS}, dtype=float)
     valid = s.notna().astype(float)
     denom = valid.mul(w, axis=1).sum(axis=1)
     num = s.fillna(0.0).mul(w, axis=1).sum(axis=1)
     out = num / denom.replace(0.0, np.nan)
-    return out.where(denom > 0.0, 50.0).astype(float)
+    return out.where(denom > 0.0, 0.0).astype(float)
+
+
+def _compute_weighted_confidence_for_profile(
+    df: pd.DataFrame, weights: dict[str, float], *, conf_col_prefix: str = "final_conf_"
+) -> pd.Series:
+    """Weighted mean of category confidence with missing-aware renormalization."""
+    conf_cols = {c: f"{conf_col_prefix}{c}" for c in CORE_CATS}
+    m = pd.DataFrame()
+    for c, col in conf_cols.items():
+        if col in df.columns:
+            m[c] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            # Backward-compatible fallback for older category files.
+            m[c] = pd.to_numeric(df.get(f"final_conf_{c}"), errors="coerce")
+    w = pd.Series({c: float(weights.get(c, 0.0)) for c in CORE_CATS}, dtype=float)
+    valid = m.notna().astype(float)
+    denom = valid.mul(w, axis=1).sum(axis=1)
+    num = m.fillna(0.0).mul(w, axis=1).sum(axis=1)
+    out = num / denom.replace(0.0, np.nan)
+    return out.where(denom > 0.0, 0.0).clip(lower=0.0, upper=1.0).astype(float)
 
 
 def _apply_penalties_and_hard_stop(df: pd.DataFrame) -> pd.DataFrame:
@@ -541,6 +568,16 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
             out[mc] = pd.to_numeric(df_cat[mc], errors="coerce").fillna(0.0).astype(float)
         if ds in df_cat.columns:
             out[ds] = df_cat[ds].fillna("balanced").astype(object)
+        fc = f"final_conf_{c}"
+        if fc in df_cat.columns:
+            out[fc] = pd.to_numeric(df_cat[fc], errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0).astype(float)
+        else:
+            out[fc] = pd.to_numeric(df_cat.get(f"category_confidence_{c}"), errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0).astype(float)
+        cc = f"category_confidence_{c}"
+        if cc in df_cat.columns:
+            out[cc] = pd.to_numeric(df_cat[cc], errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0).astype(float)
+        else:
+            out[cc] = pd.to_numeric(df_cat.get(f"conf_{c}"), errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0).astype(float)
 
     # Track inputs from factors_latest raw-source join, injected in main().
     for c in (
@@ -580,27 +617,34 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
     # 1) Track candidate assignment
     out = _assign_track_from_raw_inputs(out)
 
-    # 2) Track-weighted LTI
+    # 2) Track-weighted LTI (evidence-first decision path)
+    # category scores are retained for reporting; final decision uses category evidence.
     ev_agg = _simple_mean_category_evidences(out)
     out["final_evidence_equal"] = ev_agg
-    out["final_evidence_track_A"] = ev_agg
-    out["final_evidence_track_B"] = ev_agg
-    out["final_evidence_track_C"] = ev_agg
+    out["final_evidence_track_A"] = _compute_track_weighted_evidence(out, {"V": 0.40, "Q": 0.20, "G": 0.10, "R": 0.20, "S": 0.10})
+    out["final_evidence_track_B"] = _compute_track_weighted_evidence(out, {"V": 0.25, "Q": 0.30, "G": 0.10, "R": 0.15, "S": 0.20})
+    out["final_evidence_track_C"] = _compute_track_weighted_evidence(out, {"V": 0.20, "Q": 0.20, "G": 0.35, "R": 0.15, "S": 0.10})
+    out["final_evidence_track_N"] = _compute_track_weighted_evidence(out, {"V": 0.20, "Q": 0.20, "G": 0.20, "R": 0.20, "S": 0.20})
+    out["final_evidence_track_method"] = "track_weighted_category_evidence_v1"
 
+    # Reporting-only aggregate from category scores (kept for backward compatibility / dashboards).
+    # Not used in final decision path.
     score_agg = _simple_mean_category_scores(out)
     out["final_score_equal"] = score_agg
-    out["final_score_track_A"] = _compute_weighted_lti_for_profile(
-        out, {"V": 0.40, "Q": 0.20, "G": 0.10, "R": 0.20, "S": 0.10}
-    )
-    out["final_score_track_B"] = _compute_weighted_lti_for_profile(
-        out, {"V": 0.25, "Q": 0.30, "G": 0.10, "R": 0.15, "S": 0.20}
-    )
-    out["final_score_track_C"] = _compute_weighted_lti_for_profile(
-        out, {"V": 0.20, "Q": 0.20, "G": 0.35, "R": 0.15, "S": 0.10}
-    )
-    out["final_score_track_N"] = _compute_weighted_lti_for_profile(
-        out, {"V": 0.20, "Q": 0.20, "G": 0.20, "R": 0.20, "S": 0.20}
-    )
+    w_a = {"V": 0.40, "Q": 0.20, "G": 0.10, "R": 0.20, "S": 0.10}
+    w_b = {"V": 0.25, "Q": 0.30, "G": 0.10, "R": 0.15, "S": 0.20}
+    w_c = {"V": 0.20, "Q": 0.20, "G": 0.35, "R": 0.15, "S": 0.10}
+    w_n = {"V": 0.20, "Q": 0.20, "G": 0.20, "R": 0.20, "S": 0.20}
+    # One-shot transform at final stage only: track evidence -> track score.
+    out["final_score_track_A"] = _evidence_series_to_score(out["final_evidence_track_A"]).fillna(50.0).astype(float)
+    out["final_score_track_B"] = _evidence_series_to_score(out["final_evidence_track_B"]).fillna(50.0).astype(float)
+    out["final_score_track_C"] = _evidence_series_to_score(out["final_evidence_track_C"]).fillna(50.0).astype(float)
+    out["final_score_track_N"] = _evidence_series_to_score(out["final_evidence_track_N"]).fillna(50.0).astype(float)
+    out["final_score_transform_stage"] = "one_shot_final_only"
+    out["lti_confidence_track_A"] = _compute_weighted_confidence_for_profile(out, w_a, conf_col_prefix="final_conf_")
+    out["lti_confidence_track_B"] = _compute_weighted_confidence_for_profile(out, w_b, conf_col_prefix="final_conf_")
+    out["lti_confidence_track_C"] = _compute_weighted_confidence_for_profile(out, w_c, conf_col_prefix="final_conf_")
+    out["lti_confidence_track_N"] = _compute_weighted_confidence_for_profile(out, w_n, conf_col_prefix="final_conf_")
 
     selected_profile = out["assigned_track"].where(out["assigned_track"].isin(["A", "B", "C"]), "N")
     out["selected_weight_profile"] = selected_profile.astype(str)
@@ -618,6 +662,38 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         default=pd.to_numeric(out["final_score_track_N"], errors="coerce"),
     )
     out["lti_pre_penalty"] = pd.to_numeric(out["lti_pre_penalty"], errors="coerce").clip(lower=0.0, upper=100.0).astype(float)
+    out["lti_confidence"] = np.select(
+        [
+            selected_profile == "A",
+            selected_profile == "B",
+            selected_profile == "C",
+        ],
+        [
+            pd.to_numeric(out["lti_confidence_track_A"], errors="coerce"),
+            pd.to_numeric(out["lti_confidence_track_B"], errors="coerce"),
+            pd.to_numeric(out["lti_confidence_track_C"], errors="coerce"),
+        ],
+        default=pd.to_numeric(out["lti_confidence_track_N"], errors="coerce"),
+    )
+    out["lti_confidence"] = pd.to_numeric(out["lti_confidence"], errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0).astype(float)
+    out["lti_confidence_bucket"] = np.select(
+        [out["lti_confidence"] >= 0.75, out["lti_confidence"] >= 0.45],
+        ["HIGH", "MEDIUM"],
+        default="LOW",
+    ).astype(object)
+    missing_core = pd.DataFrame({c: pd.to_numeric(out[f"final_evidence_{c}"], errors="coerce") for c in CORE_CATS}).isna().sum(axis=1)
+    low_main_cov = pd.DataFrame(
+        {c: pd.to_numeric(out.get(f"main_coverage_{c}"), errors="coerce") for c in CORE_CATS}
+    ).fillna(1.0).min(axis=1) < 0.67
+    low_factor_conf = out["lti_confidence"] < 0.45
+    donor_heavy = pd.Series(False, index=out.index, dtype=bool)  # reserved for future donor-aware expansion
+    reasons = np.full(len(out), "", dtype=object)
+    reasons = np.where(missing_core > 0, "missing_core_categories", reasons)
+    reasons = np.where(low_main_cov, np.where(reasons == "", "low_main_coverage", reasons + "|low_main_coverage"), reasons)
+    reasons = np.where(low_factor_conf, np.where(reasons == "", "low_factor_confidence", reasons + "|low_factor_confidence"), reasons)
+    reasons = np.where(donor_heavy, np.where(reasons == "", "donor_heavy", reasons + "|donor_heavy"), reasons)
+    out["lti_uncertainty_reason"] = pd.Series(reasons, index=out.index).replace("", "none").astype(object)
+    out["lti_confidence_model_version"] = "lti_conf_weighted_final_conf_v1"
 
     # 3) Penalty / hard-stop placeholder application
     out = _apply_penalties_and_hard_stop(out)
@@ -638,7 +714,18 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         "final_score_track_B",
         "final_evidence_track_C",
         "final_score_track_C",
+        "final_evidence_track_N",
         "final_score_track_N",
+        "final_evidence_track_method",
+        "final_score_transform_stage",
+        "lti_confidence_track_A",
+        "lti_confidence_track_B",
+        "lti_confidence_track_C",
+        "lti_confidence_track_N",
+        "lti_confidence",
+        "lti_confidence_bucket",
+        "lti_uncertainty_reason",
+        "lti_confidence_model_version",
         "score_V",
         "score_Q",
         "score_G",
