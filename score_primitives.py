@@ -477,10 +477,49 @@ def _row_has_key(row: Mapping[str, Any] | Any, key: str) -> bool:
         return False
 
 
+def _structural_from_binary_valid_base(
+    row: Mapping[str, Any] | Any, key: str
+) -> bool | None:
+    """
+    Prefer build-time * Valid Base diagnostics when the column exists.
+    Returns True (structural invalid / 0), False (valid / 1), or None (no key or undecided NaN).
+    """
+    if not _row_has_key(row, key):
+        return None
+    vb = safe_to_float(_row_get(row, key))
+    if vb is None:
+        return None
+    if vb >= 1.0 - 1e-9:
+        return False
+    if vb <= 0.0 + 1e-9:
+        return True
+    return None
+
+
+def _structural_pb_from_valid_base(row: Mapping[str, Any] | Any) -> bool | None:
+    """
+    P/B Valid Base: 1 -> not structural; <=0.5 -> structural; (0.5,1) -> undecided (fallback Book/sh).
+    """
+    if not _row_has_key(row, "P/B Valid Base"):
+        return None
+    vb = safe_to_float(_row_get(row, "P/B Valid Base"))
+    if vb is None:
+        return None
+    if vb >= 1.0 - 1e-9:
+        return False
+    if vb <= 0.5 + 1e-9:
+        return True
+    return None
+
+
 def _structural_missing_from_row(row: Mapping[str, Any] | Any, factor_spec: Any) -> bool:
     """
     Structural missing: value is not meaningfully defined; do not impute or score.
     Uses factor_spec.structural_missing_rule when set; dividend growth uses a conservative fallback.
+
+    When * Valid Base / diagnostic columns from build_factors_latest exist, they take priority; otherwise
+    legacy raw columns (Book/sh, Sales (Rev), Equity Latest, etc.) provide backward-compatible inference.
+    Never treat a negative *ratio value alone* as structural—only broken bases (e.g. equity <= 0, NI <= 0).
     """
     rule = getattr(factor_spec, "structural_missing_rule", None)
     if isinstance(rule, str):
@@ -520,6 +559,45 @@ def _structural_missing_from_row(row: Mapping[str, Any] | Any, factor_spec: Any)
         ev_e = safe_to_float(_row_get(row, "EV/EBITDA"))
         return ev_e is None or ev_e <= 0.0
 
+    if rule == "pb_nonpositive_book_value":
+        if fn != "P/B":
+            return False
+        tri = _structural_pb_from_valid_base(row)
+        if tri is True:
+            return True
+        if tri is False:
+            return False
+        book = safe_to_float(_row_get(row, "Book/sh"))
+        if book is not None:
+            return book <= 0.0
+        return False
+
+    if rule == "ps_nonpositive_sales":
+        if fn != "P/S":
+            return False
+        tri = _structural_from_binary_valid_base(row, "P/S Valid Base")
+        if tri is True:
+            return True
+        if tri is False:
+            return False
+        rev = safe_to_float(_row_get(row, "Sales (Rev)"))
+        if rev is not None:
+            return rev <= 0.0
+        return False
+
+    if rule == "ev_sales_nonpositive_sales":
+        if fn != "EV/Sales":
+            return False
+        tri = _structural_from_binary_valid_base(row, "EV/Sales Valid Base")
+        if tri is True:
+            return True
+        if tri is False:
+            return False
+        rev = safe_to_float(_row_get(row, "Sales (Rev)"))
+        if rev is not None:
+            return rev <= 0.0
+        return False
+
     if rule == "roic_invalid_invested_capital":
         if fn != "ROIC":
             return False
@@ -535,6 +613,91 @@ def _structural_missing_from_row(row: Mapping[str, Any] | Any, factor_spec: Any)
             return True
         if ic_avg <= 0.0:
             return True
+        return False
+
+    # ROE: negative ROE with positive equity is observed performance, not structural; only nonpositive equity breaks the ratio.
+    if rule == "roe_nonpositive_equity":
+        if fn != "ROE":
+            return False
+        tri = _structural_from_binary_valid_base(row, "ROE Valid Base")
+        if tri is True:
+            return True
+        if tri is False:
+            return False
+        eq = safe_to_float(_row_get(row, "Equity Latest"))
+        if eq is not None:
+            return eq <= 0.0
+        return False
+
+    if rule == "de_ratio_nonpositive_equity":
+        if fn != "Debt/Eq":
+            return False
+        tri = _structural_from_binary_valid_base(row, "Debt/Eq Valid Base")
+        if tri is True:
+            return True
+        if tri is False:
+            return False
+        eq = safe_to_float(_row_get(row, "Equity Latest"))
+        if eq is not None:
+            return eq <= 0.0
+        return False
+
+    if rule == "lt_de_ratio_nonpositive_equity":
+        if fn != "LT Debt/Eq":
+            return False
+        tri = _structural_from_binary_valid_base(row, "LT Debt/Eq Valid Base")
+        if tri is True:
+            return True
+        if tri is False:
+            return False
+        eq = safe_to_float(_row_get(row, "Equity Latest"))
+        if eq is not None:
+            return eq <= 0.0
+        return False
+
+    if rule == "interest_coverage_nonpositive_interest_expense":
+        if fn != "Interest Coverage":
+            return False
+        tri = _structural_from_binary_valid_base(row, "Interest Coverage Valid Base")
+        if tri is True:
+            return True
+        if tri is False:
+            return False
+        ref = safe_to_float(_row_get(row, "Interest Expense Ref"))
+        if ref is not None:
+            return ref <= 0.0
+        return False
+
+    # OCF/NI: negative ratio with positive NI is valid (weak cash conversion); structural only when denominator NI <= 0.
+    if rule == "ocfni_nonpositive_net_income":
+        if fn != "OCF/NI":
+            return False
+        if _row_has_key(row, "OCF/NI Valid Base"):
+            tri = _structural_from_binary_valid_base(row, "OCF/NI Valid Base")
+            if tri is True:
+                return True
+            if tri is False:
+                return False
+        ni_d = safe_to_float(_row_get(row, "OCF/NI Denominator NI"))
+        if ni_d is not None:
+            return ni_d <= 0.0
+        inc = safe_to_float(_row_get(row, "Income (Net)"))
+        if inc is not None:
+            return inc <= 0.0
+        return False
+
+    # EPS This Y: negative growth can be observed; structural only when base actual EPS is nonpositive (no growth scale).
+    if rule == "eps_this_y_nonpositive_base_actual":
+        if fn != "EPS This Y":
+            return False
+        tri = _structural_from_binary_valid_base(row, "EPS This Y Valid Base")
+        if tri is True:
+            return True
+        if tri is False:
+            return False
+        base = safe_to_float(_row_get(row, "EPS This Y Base Actual"))
+        if base is not None:
+            return base <= 0.0
         return False
 
     if rule == "eps_yoy_nonpositive_regime":
@@ -600,6 +763,10 @@ def _base_score_dict(
     confidence_agreement: float | None = None,
     confidence_stability: float | None = None,
     confidence_model_version: str | None = None,
+    factor_source: str | None = None,
+    missing_class: str | None = None,
+    structural_missing_flag: bool = False,
+    incidental_missing_flag: bool = False,
 ) -> dict[str, Any]:
     return {
         "factor_name": factor_name,
@@ -633,6 +800,10 @@ def _base_score_dict(
         "confidence_agreement": confidence_agreement,
         "confidence_stability": confidence_stability,
         "confidence_model_version": confidence_model_version,
+        "factor_source": factor_source,
+        "missing_class": missing_class,
+        "structural_missing_flag": structural_missing_flag,
+        "incidental_missing_flag": incidental_missing_flag,
     }
 
 
@@ -724,13 +895,17 @@ def score_one_factor_one_group(
             raw_evidence=None,
             prior_evidence=prior_evidence,
             adjusted_evidence=None,
-            evidence_source="structural_missing",
+            evidence_source="structural_skip",
             evidence_beta=evidence_beta,
             relative_evidence=None,
             absolute_evidence=None,
             absolute_weight=absolute_weight_eff,
             blend_method=None,
             absolute_enabled=absolute_enabled_flag,
+            factor_source="missing",
+            missing_class="structural",
+            structural_missing_flag=True,
+            incidental_missing_flag=False,
         )
 
     if not enabled:
@@ -760,6 +935,10 @@ def score_one_factor_one_group(
             absolute_weight=absolute_weight_eff,
             blend_method=None,
             absolute_enabled=absolute_enabled_flag,
+            factor_source="missing",
+            missing_class="incidental",
+            structural_missing_flag=False,
+            incidental_missing_flag=True,
         )
 
     if direction not in ("higher_better", "lower_better"):
@@ -789,6 +968,10 @@ def score_one_factor_one_group(
             absolute_weight=absolute_weight_eff,
             blend_method=None,
             absolute_enabled=absolute_enabled_flag,
+            factor_source="missing",
+            missing_class="incidental",
+            structural_missing_flag=False,
+            incidental_missing_flag=True,
         )
 
     use_log_scale = bool(getattr(factor_spec, "use_log_scale", False))
@@ -858,6 +1041,10 @@ def score_one_factor_one_group(
             absolute_weight=absolute_weight_eff,
             blend_method=blend_method,
             absolute_enabled=absolute_enabled_flag,
+            factor_source="missing",
+            missing_class="incidental",
+            structural_missing_flag=False,
+            incidental_missing_flag=True,
         )
 
     # raw_score is retained as a diagnostic/reporting view of raw_evidence.
@@ -889,6 +1076,10 @@ def score_one_factor_one_group(
             absolute_weight=absolute_weight_eff,
             blend_method=blend_method,
             absolute_enabled=absolute_enabled_flag,
+            factor_source="missing",
+            missing_class="incidental",
+            structural_missing_flag=False,
+            incidental_missing_flag=True,
         )
 
     # Factor-level uncertainty is reflected as prior shrink (not penalty).
@@ -950,7 +1141,126 @@ def score_one_factor_one_group(
         confidence_agreement=safe_to_float(conf_diag.get("confidence_agreement")),
         confidence_stability=safe_to_float(conf_diag.get("confidence_stability")),
         confidence_model_version=str(conf_diag.get("confidence_model_version", FACTOR_CONFIDENCE_MODEL_VERSION)),
+        factor_source="observed",
+        missing_class="observed",
+        structural_missing_flag=False,
+        incidental_missing_flag=False,
     )
+
+
+# Rules mirrored in score_factor_config (structural_skip); used for build-time / batch diagnostics only.
+STRUCTURAL_SKIP_DIAGNOSTIC_RULES: tuple[str, ...] = (
+    "pb_nonpositive_book_value",
+    "ps_nonpositive_sales",
+    "ev_sales_nonpositive_sales",
+    "roe_nonpositive_equity",
+    "de_ratio_nonpositive_equity",
+    "lt_de_ratio_nonpositive_equity",
+    "interest_coverage_nonpositive_interest_expense",
+    "ocfni_nonpositive_net_income",
+    "eps_this_y_nonpositive_base_actual",
+)
+
+
+def log_structural_missing_build_diagnostics(df: Any, *, log: Any | None = None) -> None:
+    """
+    Log per-rule structural_skip counts over factor rows (same predicates as _structural_missing_from_row).
+
+    Also logs sanity counts: negative ROE with positive equity and negative OCF/NI with positive NI denominator
+    are expected to appear in normal universes (observed bad / cash conversion), not structural skips.
+    """
+    import logging
+
+    lg = log if log is not None else logging.getLogger(__name__)
+    try:
+        import numpy as np
+        import pandas as pd
+    except ImportError:
+        lg.info("[structural_skip] skipped (numpy/pandas not available)")
+        return
+
+    if df is None:
+        lg.info("[structural_skip] skipped (no dataframe)")
+        return
+    if not isinstance(df, pd.DataFrame):
+        lg.info("[structural_skip] skipped (expected pandas DataFrame)")
+        return
+    if df.empty:
+        lg.info("[structural_skip] skipped (empty dataframe)")
+        return
+
+    from score_factor_config import FACTOR_SPECS
+
+    def col(name: str) -> Any:
+        if name not in df.columns:
+            return pd.Series(np.nan, index=df.index, dtype=float)
+        return pd.to_numeric(df[name], errors="coerce")
+
+    specs_by_rule: dict[str, Any] = {}
+    for spec in FACTOR_SPECS.values():
+        r = getattr(spec, "structural_missing_rule", None)
+        if isinstance(r, str):
+            rs = r.strip()
+            if rs in STRUCTURAL_SKIP_DIAGNOSTIC_RULES and rs not in specs_by_rule:
+                specs_by_rule[rs] = spec
+
+    records = df.to_dict("records")
+    counts = {r: 0 for r in STRUCTURAL_SKIP_DIAGNOSTIC_RULES}
+    for rd in records:
+        for rule in STRUCTURAL_SKIP_DIAGNOSTIC_RULES:
+            sp = specs_by_rule.get(rule)
+            if sp is None:
+                continue
+            if _structural_missing_from_row(rd, sp):
+                counts[rule] += 1
+
+    for rule in STRUCTURAL_SKIP_DIAGNOSTIC_RULES:
+        lg.info("[structural_skip] rule=%s row_count=%s", rule, counts[rule])
+
+    roe = col("ROE")
+    eq = col("Equity Latest")
+    n_roe_neg_pos_eq = int((roe.notna() & (roe < 0) & eq.notna() & (eq > 0)).sum())
+    lg.warning(
+        "[structural sanity] ROE<0 with Equity Latest>0: %s rows (expected >0 in real data; observed underperformance, not structural_skip)",
+        n_roe_neg_pos_eq,
+    )
+
+    ocfni = col("OCF/NI")
+    ni_d = col("OCF/NI Denominator NI")
+    n_ocf_neg_pos_ni = int((ocfni.notna() & (ocfni < 0) & ni_d.notna() & (ni_d > 0)).sum())
+    lg.warning(
+        "[structural sanity] OCF/NI<0 with OCF/NI Denominator NI>0: %s rows (expected >0 in real data; weak cash conversion, not structural_skip)",
+        n_ocf_neg_pos_ni,
+    )
+
+
+if __name__ == "__main__":
+    import logging
+    import sys
+    from pathlib import Path
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    _log = logging.getLogger(__name__)
+    _log.info(
+        "Structural diagnostics: run build_factors_latest.py to log counts on a full build, "
+        "or: python score_primitives.py <factors.parquet|.csv>"
+    )
+    if len(sys.argv) > 1:
+        import pandas as pd
+
+        path = Path(sys.argv[1])
+        if not path.exists():
+            _log.warning("File not found: %s", path)
+        else:
+            if path.suffix.lower() == ".parquet":
+                _df = pd.read_parquet(path)
+            elif path.suffix.lower() == ".csv":
+                _df = pd.read_csv(path)
+            else:
+                _log.warning("Unsupported suffix %s (use .parquet or .csv)", path.suffix)
+                _df = None
+            if _df is not None:
+                log_structural_missing_build_diagnostics(_df, log=_log)
 
 
 # Donor helpers (factor-score dimension; optional for downstream batch wiring).

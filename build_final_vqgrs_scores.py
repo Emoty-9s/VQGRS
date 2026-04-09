@@ -8,15 +8,16 @@ Input:
 Output:
   - output/scoring/final_vqgrs_scores_latest.(parquet|csv)
 
-Evidence-first final scoring:
-  factor adjusted_evidence -> category final_evidence_{V/Q/G/R/S} -> track-weighted final evidence
-  -> one-shot evidence_to_score() at final stage.
+Category-level ``final_evidence_{V/Q/G/R/S}`` and ``final_evidence_track_*`` are retained for
+diagnostics and backward compatibility only — **not used for the final numeric score decision**.
 
-Category score columns (score_V..score_S) are retained for reporting/diagnostics and backward
-compatibility, but final decision uses category evidence, not category scores.
+The final score is **only** a function of ``score_V``, ``score_Q``, ``score_G``, ``score_R``, and
+``score_S`` (filled to 0.0 when absent in the row). Each ``final_score_track_*`` is a strict weighted
+sum ``sum_c w_c * score_c`` with **no** renormalization over “available” categories; coverage and
+missing-structure effects are assumed to be embedded in those category scores upstream.
 
-``final_score`` is selected from track-weighted LTI profiles (A/B/C/N), with missing-aware
-weight renormalization and placeholder penalty/hard-stop stage.
+``lti_pre_penalty`` picks the track-appropriate weighted sum; ``final_score`` equals ``lti_pre_penalty``
+with no additional final-stage penalties.
 """
 from __future__ import annotations
 
@@ -31,7 +32,7 @@ from score_primitives import evidence_to_score
 
 
 CORE_CATS = ["V", "Q", "G", "R", "S"]
-FINAL_METHOD_LABEL = "track_weighted_lti_v1"
+FINAL_METHOD_LABEL = "track_weighted_category_scores_v1"
 
 
 def _read_df(path: Path) -> pd.DataFrame:
@@ -312,19 +313,37 @@ def _simple_mean_category_evidences(df: pd.DataFrame) -> pd.Series:
 
 
 def _simple_mean_category_scores(df: pd.DataFrame) -> pd.Series:
-    """Mean of ``score_V``…``score_S``; 50.0 if all five are missing."""
+    """Equal-weight mean of the five category scores: (V+Q+G+R+S)/5, with NaNs treated as 0."""
     cols = [f"score_{c}" for c in CORE_CATS]
-    m = pd.concat([pd.to_numeric(df[c], errors="coerce") for c in cols], axis=1)
+    m = pd.concat([pd.to_numeric(df[c], errors="coerce").fillna(0.0) for c in cols], axis=1)
     m.columns = cols
-    has_any = m.notna().any(axis=1)
-    mean_v = m.mean(axis=1, skipna=True)
-    return mean_v.where(has_any, 50.0).astype(float)
+    return (m.sum(axis=1) / 5.0).clip(lower=0.0, upper=100.0).astype(float)
+
+
+def _compute_track_weighted_score(df: pd.DataFrame, weights: dict[str, float]) -> pd.Series:
+    """
+    Strict weighted sum of score_V..score_S (0–100 scale).
+
+    final_score track columns must be a function of **all five** category scores, not only those
+    that happen to be non-NaN in the row. Missing categories are represented as low scores upstream;
+    here any remaining NaNs are coerced to 0.0 before applying weights. **No denominator
+    renormalization** — weights always apply to the full five-vector.
+    """
+    score_cols = {c: f"score_{c}" for c in CORE_CATS}
+    s = pd.DataFrame(
+        {c: pd.to_numeric(df[col], errors="coerce").fillna(0.0).clip(0.0, 100.0) for c, col in score_cols.items()}
+    )
+    w = pd.Series({c: float(weights.get(c, 0.0)) for c in CORE_CATS}, dtype=float)
+    out = (s.mul(w, axis=1)).sum(axis=1)
+    return out.clip(lower=0.0, upper=100.0).astype(float)
 
 
 def _compute_track_weighted_evidence(df: pd.DataFrame, weights: dict[str, float]) -> pd.Series:
     """
-    Track-weighted final category evidence with missing-aware renormalization.
-    If all core category evidences are missing, return 0.0 (neutral evidence).
+    Track-weighted blend of final category evidences (diagnostic / backward compatibility).
+
+    **Not used for final score decision** — see ``_compute_track_weighted_score`` and ``final_score``.
+    Retains missing-aware renormalization for evidence-only reporting.
     """
     ev_cols = {c: f"final_evidence_{c}" for c in CORE_CATS}
     s = pd.DataFrame({c: pd.to_numeric(df[col], errors="coerce") for c, col in ev_cols.items()})
@@ -333,7 +352,7 @@ def _compute_track_weighted_evidence(df: pd.DataFrame, weights: dict[str, float]
     denom = valid.mul(w, axis=1).sum(axis=1)
     num = s.fillna(0.0).mul(w, axis=1).sum(axis=1)
     out = num / denom.replace(0.0, np.nan)
-    return out.where(denom > 0.0, 0.0).astype(float)
+    return out.where(denom > 0.0, np.nan).astype(float)
 
 
 def _compute_weighted_confidence_for_profile(
@@ -356,17 +375,73 @@ def _compute_weighted_confidence_for_profile(
     return out.where(denom > 0.0, 0.0).clip(lower=0.0, upper=1.0).astype(float)
 
 
+def _add_core_category_diagnostics(out: pd.DataFrame) -> None:
+    """
+    Core diagnostics from ``category_missing_class_{V..S}`` (one label per category column).
+
+    Count rules per category column:
+      observed_only -> valid_core_count += 1
+      partial_observed -> valid_core_count += 1, partial_observed_core_count += 1
+      structural_only -> structural_only_core_count += 1
+      incidental_only -> incidental_only_core_count += 1
+      mixed_missing -> mixed_missing_core_count += 1
+
+    Downstream aliases (legacy names): structural_missing_core_count == structural_only_core_count,
+    incidental_missing_core_count == incidental_only_core_count (mixed/partial not folded in).
+    """
+    idx = out.index
+    valid_n = pd.Series(0, index=idx, dtype=np.int64)
+    struct_only_n = pd.Series(0, index=idx, dtype=np.int64)
+    inc_only_n = pd.Series(0, index=idx, dtype=np.int64)
+    mixed_n = pd.Series(0, index=idx, dtype=np.int64)
+    partial_n = pd.Series(0, index=idx, dtype=np.int64)
+    for c in CORE_CATS:
+        col = f"category_missing_class_{c}"
+        if col not in out.columns:
+            continue
+        cls = out[col].astype(str).str.strip().str.lower().replace({"nan": "", "none": "", "<na>": ""})
+        valid_n = valid_n + (cls.eq("observed_only") | cls.eq("partial_observed")).astype(np.int64)
+        partial_n = partial_n + cls.eq("partial_observed").astype(np.int64)
+        struct_only_n = struct_only_n + cls.eq("structural_only").astype(np.int64)
+        inc_only_n = inc_only_n + cls.eq("incidental_only").astype(np.int64)
+        mixed_n = mixed_n + cls.eq("mixed_missing").astype(np.int64)
+
+    out["valid_core_count"] = valid_n.astype(int)
+    out["structural_only_core_count"] = struct_only_n.astype(int)
+    out["incidental_only_core_count"] = inc_only_n.astype(int)
+    out["mixed_missing_core_count"] = mixed_n.astype(int)
+    out["partial_observed_core_count"] = partial_n.astype(int)
+    out["structural_missing_core_count"] = out["structural_only_core_count"]
+    out["incidental_missing_core_count"] = out["incidental_only_core_count"]
+
+    cov_parts: list[pd.Series] = []
+    for c in CORE_CATS:
+        sc = pd.to_numeric(out[f"score_{c}"], errors="coerce")
+        mc = (
+            pd.to_numeric(out[f"main_coverage_{c}"], errors="coerce")
+            if f"main_coverage_{c}" in out.columns
+            else pd.Series(np.nan, index=out.index, dtype=float)
+        )
+        cov_parts.append(mc.where(sc.notna(), np.nan))
+    cov_df = pd.concat(cov_parts, axis=1)
+    mcf = cov_df.min(axis=1, skipna=True)
+    out["main_cov_floor"] = mcf.fillna(1.0).astype(float)
+
+
 def _apply_penalties_and_hard_stop(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Placeholder penalty/hard-stop stage.
-    Keep this isolated so later penalty wiring only touches this helper.
+    Final score equals track-selected category weighted sum only.
+
+    Coverage / incidental / confidence effects are assumed embedded in category scores upstream;
+    this stage does not subtract additional penalties. ``penalty_total`` is kept at 0 for legacy
+    column compatibility; ``hard_stop_triggered`` defaults false (no NaN final_score from this step).
     """
     out = df.copy()
+    lti = pd.to_numeric(out["lti_pre_penalty"], errors="coerce").fillna(0.0).clip(0.0, 100.0)
+    out["final_score"] = lti.astype(float)
     out["penalty_total"] = 0.0
     out["hard_stop_triggered"] = False
     out["investment_warning"] = ""
-    # Current phase: no penalty applied yet.
-    out["final_score"] = pd.to_numeric(out["lti_pre_penalty"], errors="coerce").clip(lower=0.0, upper=100.0).astype(float)
     return out
 
 
@@ -557,9 +632,15 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         out[f"final_evidence_{c}"] = pd.to_numeric(df_cat[f"final_evidence_{c}"], errors="coerce")
         score_col = f"score_{c}"
         if score_col in df_cat.columns:
-            out[score_col] = pd.to_numeric(df_cat[score_col], errors="coerce").clip(lower=0.0, upper=100.0).astype(float)
+            out[score_col] = (
+                pd.to_numeric(df_cat[score_col], errors="coerce").fillna(0.0).clip(lower=0.0, upper=100.0).astype(float)
+            )
         else:
-            out[score_col] = _evidence_series_to_score(out[f"final_evidence_{c}"])
+            out[score_col] = (
+                pd.to_numeric(_evidence_series_to_score(out[f"final_evidence_{c}"]), errors="coerce")
+                .fillna(0.0)
+                .clip(0.0, 100.0)
+            )
 
         # Debug passthroughs (when present).
         mc = f"main_coverage_{c}"
@@ -578,6 +659,11 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
             out[cc] = pd.to_numeric(df_cat[cc], errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0).astype(float)
         else:
             out[cc] = pd.to_numeric(df_cat.get(f"conf_{c}"), errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0).astype(float)
+        cmc = f"category_missing_class_{c}"
+        if cmc in df_cat.columns:
+            out[cmc] = df_cat[cmc].astype(object)
+        else:
+            out[cmc] = pd.NA
 
     # Track inputs from factors_latest raw-source join, injected in main().
     for c in (
@@ -617,8 +703,7 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
     # 1) Track candidate assignment
     out = _assign_track_from_raw_inputs(out)
 
-    # 2) Track-weighted LTI (evidence-first decision path)
-    # category scores are retained for reporting; final decision uses category evidence.
+    # 2) Track diagnostics (evidence blends) vs strict score tracks (used for final_score only)
     ev_agg = _simple_mean_category_evidences(out)
     out["final_evidence_equal"] = ev_agg
     out["final_evidence_track_A"] = _compute_track_weighted_evidence(out, {"V": 0.40, "Q": 0.20, "G": 0.10, "R": 0.20, "S": 0.10})
@@ -627,20 +712,19 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
     out["final_evidence_track_N"] = _compute_track_weighted_evidence(out, {"V": 0.20, "Q": 0.20, "G": 0.20, "R": 0.20, "S": 0.20})
     out["final_evidence_track_method"] = "track_weighted_category_evidence_v1"
 
-    # Reporting-only aggregate from category scores (kept for backward compatibility / dashboards).
-    # Not used in final decision path.
+    # Equal-weight mean of five category scores (all NaNs -> 0); reporting only.
     score_agg = _simple_mean_category_scores(out)
     out["final_score_equal"] = score_agg
     w_a = {"V": 0.40, "Q": 0.20, "G": 0.10, "R": 0.20, "S": 0.10}
     w_b = {"V": 0.25, "Q": 0.30, "G": 0.10, "R": 0.15, "S": 0.20}
     w_c = {"V": 0.20, "Q": 0.20, "G": 0.35, "R": 0.15, "S": 0.10}
     w_n = {"V": 0.20, "Q": 0.20, "G": 0.20, "R": 0.20, "S": 0.20}
-    # One-shot transform at final stage only: track evidence -> track score.
-    out["final_score_track_A"] = _evidence_series_to_score(out["final_evidence_track_A"]).fillna(50.0).astype(float)
-    out["final_score_track_B"] = _evidence_series_to_score(out["final_evidence_track_B"]).fillna(50.0).astype(float)
-    out["final_score_track_C"] = _evidence_series_to_score(out["final_evidence_track_C"]).fillna(50.0).astype(float)
-    out["final_score_track_N"] = _evidence_series_to_score(out["final_evidence_track_N"]).fillna(50.0).astype(float)
-    out["final_score_transform_stage"] = "one_shot_final_only"
+    # Strict weighted sums of score_V..score_S (no renormalization); sole input to lti_pre_penalty / final_score.
+    out["final_score_track_A"] = _compute_track_weighted_score(out, w_a)
+    out["final_score_track_B"] = _compute_track_weighted_score(out, w_b)
+    out["final_score_track_C"] = _compute_track_weighted_score(out, w_c)
+    out["final_score_track_N"] = _compute_track_weighted_score(out, w_n)
+    out["final_score_transform_stage"] = "track_weighted_category_scores_v1"
     out["lti_confidence_track_A"] = _compute_weighted_confidence_for_profile(out, w_a, conf_col_prefix="final_conf_")
     out["lti_confidence_track_B"] = _compute_weighted_confidence_for_profile(out, w_b, conf_col_prefix="final_conf_")
     out["lti_confidence_track_C"] = _compute_weighted_confidence_for_profile(out, w_c, conf_col_prefix="final_conf_")
@@ -662,6 +746,7 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         default=pd.to_numeric(out["final_score_track_N"], errors="coerce"),
     )
     out["lti_pre_penalty"] = pd.to_numeric(out["lti_pre_penalty"], errors="coerce").clip(lower=0.0, upper=100.0).astype(float)
+
     out["lti_confidence"] = np.select(
         [
             selected_profile == "A",
@@ -681,21 +766,42 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         ["HIGH", "MEDIUM"],
         default="LOW",
     ).astype(object)
-    missing_core = pd.DataFrame({c: pd.to_numeric(out[f"final_evidence_{c}"], errors="coerce") for c in CORE_CATS}).isna().sum(axis=1)
-    low_main_cov = pd.DataFrame(
-        {c: pd.to_numeric(out.get(f"main_coverage_{c}"), errors="coerce") for c in CORE_CATS}
-    ).fillna(1.0).min(axis=1) < 0.67
-    low_factor_conf = out["lti_confidence"] < 0.45
-    donor_heavy = pd.Series(False, index=out.index, dtype=bool)  # reserved for future donor-aware expansion
-    reasons = np.full(len(out), "", dtype=object)
-    reasons = np.where(missing_core > 0, "missing_core_categories", reasons)
-    reasons = np.where(low_main_cov, np.where(reasons == "", "low_main_coverage", reasons + "|low_main_coverage"), reasons)
-    reasons = np.where(low_factor_conf, np.where(reasons == "", "low_factor_confidence", reasons + "|low_factor_confidence"), reasons)
-    reasons = np.where(donor_heavy, np.where(reasons == "", "donor_heavy", reasons + "|donor_heavy"), reasons)
-    out["lti_uncertainty_reason"] = pd.Series(reasons, index=out.index).replace("", "none").astype(object)
+
+    _add_core_category_diagnostics(out)
+
+    lti_pre_nan = pd.to_numeric(out["lti_pre_penalty"], errors="coerce").isna()
+    missing_core = pd.DataFrame(
+        {c: pd.to_numeric(out[f"final_evidence_{c}"], errors="coerce") for c in CORE_CATS}
+    ).isna().sum(axis=1)
+    io_cnt = pd.to_numeric(out["incidental_only_core_count"], errors="coerce").fillna(0.0)
+    mm_cnt = pd.to_numeric(out["mixed_missing_core_count"], errors="coerce").fillna(0.0)
+    po_cnt = pd.to_numeric(out["partial_observed_core_count"], errors="coerce").fillna(0.0)
+    mcfloor = pd.to_numeric(out["main_cov_floor"], errors="coerce").fillna(1.0)
+    low_main_cov = mcfloor < 0.67
+    low_factor_conf = pd.to_numeric(out["lti_confidence"], errors="coerce").fillna(0.0) < 0.45
+
+    reason_parts: list[str] = []
+    for ix in out.index:
+        parts: list[str] = []
+        if bool(lti_pre_nan.loc[ix]):
+            parts.append("insufficient_core_data")
+        if int(missing_core.loc[ix]) > 0:
+            parts.append("missing_core_categories")
+        if float(io_cnt.loc[ix]) > 0.0:
+            parts.append("incidental_missing_core")
+        if float(mm_cnt.loc[ix]) > 0.0:
+            parts.append("mixed_missing_core")
+        if float(po_cnt.loc[ix]) > 0.0:
+            parts.append("partial_observed_core")
+        if bool(low_main_cov.loc[ix]):
+            parts.append("low_main_coverage")
+        if bool(low_factor_conf.loc[ix]):
+            parts.append("low_factor_confidence")
+        reason_parts.append("|".join(parts) if parts else "none")
+    out["lti_uncertainty_reason"] = pd.Series(reason_parts, index=out.index, dtype=object)
     out["lti_confidence_model_version"] = "lti_conf_weighted_final_conf_v1"
 
-    # 3) Penalty / hard-stop placeholder application
+    # 3) final_score := lti_pre_penalty (no additional final-stage penalty)
     out = _apply_penalties_and_hard_stop(out)
     out["final_score_method"] = FINAL_METHOD_LABEL
 
@@ -726,6 +832,14 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         "lti_confidence_bucket",
         "lti_uncertainty_reason",
         "lti_confidence_model_version",
+        "valid_core_count",
+        "structural_only_core_count",
+        "incidental_only_core_count",
+        "mixed_missing_core_count",
+        "partial_observed_core_count",
+        "structural_missing_core_count",
+        "incidental_missing_core_count",
+        "main_cov_floor",
         "score_V",
         "score_Q",
         "score_G",
@@ -739,7 +853,6 @@ def build_final_vqgrs_scores_df(df_cat: pd.DataFrame) -> pd.DataFrame:
         "track_reason",
         "lti_pre_penalty",
         "penalty_total",
-        "selected_weight_profile",
         "track_B_quality_count",
         "track_B_risk_count",
         "track_B_stability_count",
@@ -967,13 +1080,52 @@ def main(input_dir: str | Path = "output", output_dir: str | Path = "output/scor
     print(f"Output final-score rows: {len(out)}")
     cat_cols = [f"score_{c}" for c in CORE_CATS if f"score_{c}" in out.columns]
     if cat_cols:
-        all_missing_cat_rows = int(out[cat_cols].isna().all(axis=1).sum())
-        print(f"Sanity: category score all-missing rows={all_missing_cat_rows}")
+        sc_m = pd.concat([pd.to_numeric(out[c], errors="coerce") for c in cat_cols], axis=1)
+        n_any_nan = int(sc_m.isna().any(axis=1).sum())
+        print(f"Sanity: rows with any NaN in score_V..score_S (expect 0): {n_any_nan}")
+        z = (sc_m.fillna(0.0) == 0.0)
+        n_any_zero = int(z.any(axis=1).sum())
+        n_ge2_zero = int((z.sum(axis=1) >= 2).sum())
+        print(f"Sanity: rows with any category score == 0: {n_any_zero}")
+        print(f"Sanity: rows with >=2 category scores == 0: {n_ge2_zero}")
     final_missing_rows = int(pd.to_numeric(out.get("final_score"), errors="coerce").isna().sum())
-    print(f"Sanity: final_score missing rows={final_missing_rows}")
+    print(f"Sanity: final_score missing rows (expect 0): {final_missing_rows}")
     if "assigned_track" in out.columns:
         dist = out["assigned_track"].astype(str).value_counts(dropna=False).to_dict()
         print(f"Sanity: A/B/C/N distribution={dist}")
+
+    if len(out) > 0:
+        print("Diagnostic — final layer (score-only; no final-stage penalty):")
+        fs_num = pd.to_numeric(out.get("final_score"), errors="coerce")
+        print(f"  final_score isna mean: {fs_num.isna().mean():.6f}")
+        print(
+            f"  final_score min/median/max: {fs_num.min():.4f} / {fs_num.median():.4f} / {fs_num.max():.4f}"
+        )
+        if cat_cols:
+            sc_m = pd.concat([pd.to_numeric(out[c], errors="coerce").fillna(0.0) for c in cat_cols], axis=1)
+            z = sc_m == 0.0
+            giw = (z.sum(axis=1) >= 2) & fs_num.ge(70.0).fillna(False)
+            print(f"  rows with >=2 zero category scores AND final_score>=70 (GIW-style check): {int(giw.sum())}")
+        if "lti_uncertainty_reason" in out.columns:
+            print("  lti_uncertainty_reason value_counts (top 12):")
+            print(out["lti_uncertainty_reason"].astype(str).value_counts(dropna=False).head(12).to_string())
+        def _diag_count_mean(name: str, series: pd.Series) -> None:
+            s = pd.to_numeric(series, errors="coerce").fillna(0).astype(int)
+            print(f"  {name} value_counts (top 16):")
+            vc = s.value_counts().sort_index()
+            print(vc.head(16).to_string())
+            print(f"  {name} mean: {s.mean():.6f}")
+
+        if "incidental_only_core_count" in out.columns:
+            _diag_count_mean("incidental_only_core_count", out["incidental_only_core_count"])
+        if "mixed_missing_core_count" in out.columns:
+            _diag_count_mean("mixed_missing_core_count", out["mixed_missing_core_count"])
+        if "partial_observed_core_count" in out.columns:
+            _diag_count_mean("partial_observed_core_count", out["partial_observed_core_count"])
+
+        if "penalty_total" in out.columns:
+            pt = pd.to_numeric(out["penalty_total"], errors="coerce")
+            print(f"  penalty_total (legacy diagnostic, fixed 0): min={pt.min():.4f} max={pt.max():.4f}")
 
     parquet_out = output_dir / "final_vqgrs_scores_latest.parquet"
     csv_out = output_dir / "final_vqgrs_scores_latest.csv"

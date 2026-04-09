@@ -889,47 +889,76 @@ def get_eps_yoy_from_eps_ttm_series(
         return np.nan
 
 
+def pit_ocf_ni_compute(
+    symbol: Any,
+    as_of_date: Any,
+    financials: pd.DataFrame,
+) -> tuple[float, float, float]:
+    """
+    PIT OCF/NI: operatingCashFlow_ttm / netIncome_ttm (same 4-quarter window as legacy).
+
+    Structural invalidity is tied only to the earnings denominator: TTM NI <= 0 makes the
+    ratio an ambiguous scale (sign/magnitude vs losses). Negative OCF with NI > 0 is a valid
+    economic outcome (cash conversion failure) and must remain a negative ratio, not NaN.
+
+    Returns:
+        (ocf_ni_ratio, ni_ttm_used_as_denominator, valid_base) where valid_base is
+        1.0 (computed), 0.0 (NI structural invalid), or NaN (insufficient data).
+    """
+    elig = get_financial_rows_available_by_as_of(symbol=symbol, as_of_date=as_of_date, financials=financials)
+    if len(elig) < 4:
+        return (np.nan, np.nan, np.nan)
+    if "operatingCashFlow" not in elig.columns or "netIncome" not in elig.columns:
+        return (np.nan, np.nan, np.nan)
+    g4 = elig.head(4)
+    ocf_4 = pd.to_numeric(g4["operatingCashFlow"], errors="coerce")
+    ni_4 = pd.to_numeric(g4["netIncome"], errors="coerce")
+    if ocf_4.notna().sum() < 4 or ni_4.notna().sum() < 4:
+        return (np.nan, np.nan, np.nan)
+    ocf_ttm = ocf_4.sum()
+    ni_ttm = ni_4.sum()
+    if pd.isna(ni_ttm):
+        return (np.nan, np.nan, np.nan)
+    ni_f = float(ni_ttm)
+    if ni_f <= 0:
+        return (np.nan, ni_f, 0.0)
+    if pd.isna(ocf_ttm):
+        return (np.nan, ni_f, np.nan)
+    try:
+        ratio = float(ocf_ttm) / ni_f
+        return (float(np.clip(ratio, OCF_NI_CLIP_LOW, OCF_NI_CLIP_HIGH)), ni_f, 1.0)
+    except Exception:
+        return (np.nan, ni_f, np.nan)
+
+
 def get_ocf_ni_at(
     symbol: Any,
     as_of_date: Any,
     financials: pd.DataFrame,
 ) -> float:
-    # OCF/NI is only meaningful for positive NI and positive OCF
-    elig = get_financial_rows_available_by_as_of(symbol=symbol, as_of_date=as_of_date, financials=financials)
-    if len(elig) < 4:
-        return np.nan
-    if "operatingCashFlow" not in elig.columns or "netIncome" not in elig.columns:
-        return np.nan
-    g4 = elig.head(4)
-    ocf_4 = pd.to_numeric(g4["operatingCashFlow"], errors="coerce")
-    ni_4 = pd.to_numeric(g4["netIncome"], errors="coerce")
-    if ocf_4.notna().sum() < 4 or ni_4.notna().sum() < 4:
-        return np.nan
-    ocf_ttm = ocf_4.sum()
-    ni_ttm = ni_4.sum()
-    if pd.isna(ni_ttm) or pd.isna(ocf_ttm):
-        return np.nan
-    if float(ni_ttm) <= 0 or float(ocf_ttm) <= 0:
-        return np.nan
-    try:
-        ratio = float(ocf_ttm) / float(ni_ttm)
-        return float(np.clip(ratio, OCF_NI_CLIP_LOW, OCF_NI_CLIP_HIGH))
-    except Exception:
-        return np.nan
+    return pit_ocf_ni_compute(symbol, as_of_date, financials)[0]
 
 
-def get_interest_coverage_at(
+def pit_interest_coverage_compute(
     symbol: Any,
     as_of_date: Any,
     financials: pd.DataFrame,
     *,
     interest_col: Optional[str] = None,
-) -> float:
+) -> tuple[float, float, float]:
+    """
+    Interest coverage = operatingIncome_ttm / abs(interest_denominator_ttm), same as legacy.
+
+    Returns:
+        (coverage, interest_expense_ref, valid_base) where interest_expense_ref is the
+        positive magnitude used as divisor (abs of summed interest / fallback), and
+        valid_base is 1.0 / 0.0 / NaN.
+    """
     elig = get_financial_rows_available_by_as_of(symbol=symbol, as_of_date=as_of_date, financials=financials)
     if len(elig) < 4:
-        return np.nan
+        return (np.nan, np.nan, np.nan)
     if "operatingIncome" not in elig.columns or "incomeBeforeTax" not in elig.columns:
-        return np.nan
+        return (np.nan, np.nan, np.nan)
 
     use_fallback = interest_col is None
     if interest_col is None:
@@ -939,22 +968,35 @@ def get_interest_coverage_at(
     g4 = elig.head(4)
     oi_ttm = pd.to_numeric(g4["operatingIncome"], errors="coerce").sum(min_count=1)
     if pd.isna(oi_ttm):
-        return np.nan
+        return (np.nan, np.nan, np.nan)
 
     if use_fallback:
         ibt_ttm = pd.to_numeric(g4["incomeBeforeTax"], errors="coerce").sum(min_count=1)
         interest_ttm = oi_ttm - ibt_ttm if not pd.isna(ibt_ttm) else np.nan
     else:
         if interest_col not in g4.columns:
-            return np.nan
+            return (np.nan, np.nan, np.nan)
         interest_ttm = pd.to_numeric(g4[interest_col], errors="coerce").sum(min_count=1)
 
-    if pd.isna(interest_ttm) or abs(float(interest_ttm)) < 1e-12:
-        return np.nan
+    if pd.isna(interest_ttm):
+        return (np.nan, np.nan, np.nan)
+    denom = abs(float(interest_ttm))
+    if denom <= 1e-12:
+        return (np.nan, denom, 0.0)
     try:
-        return float(oi_ttm) / abs(float(interest_ttm))
+        return (float(oi_ttm) / denom, denom, 1.0)
     except Exception:
-        return np.nan
+        return (np.nan, denom, np.nan)
+
+
+def get_interest_coverage_at(
+    symbol: Any,
+    as_of_date: Any,
+    financials: pd.DataFrame,
+    *,
+    interest_col: Optional[str] = None,
+) -> float:
+    return pit_interest_coverage_compute(symbol, as_of_date, financials, interest_col=interest_col)[0]
 
 
 def get_opm_volatility_at(
@@ -2339,6 +2381,9 @@ def build_financial_indicators(
             "ROIC Cash Buffer Latest", "ROIC Cash Buffer Prev",
             "ROIC Excess Cash Latest", "ROIC Excess Cash Prev", "ROIC Calc Source",
             "Gross Margin", "Oper. Margin", "Profit Margin", "Shs Outstand",
+            "Equity Latest",
+            "P/B Valid Base", "P/S Valid Base", "EV/Sales Valid Base",
+            "ROE Valid Base", "Debt/Eq Valid Base", "LT Debt/Eq Valid Base",
         ]:
             out[k] = np.nan if k != "ROIC Calc Source" else ""
         return out
@@ -2362,6 +2407,7 @@ def build_financial_indicators(
     sh = out["Shs Outstand"]
     out["Book/sh"] = safe_div(eq_l, sh)
     out["Cash/sh"] = safe_div(cash_l, sh)
+    out["Equity Latest"] = eq_l
 
     if row_ttm:
         ni_ttm = _float_or_nan(row_ttm.get("netIncome"))
@@ -2413,9 +2459,42 @@ def build_financial_indicators(
         and not np.isnan(price)
     ):
         out["P/E"] = float(price) / float(eps_ttm)
-    out["P/S"] = safe_div(price, safe_div(rev_ttm, sh)) if row_ttm and sh and rev_ttm is not None else np.nan
-    out["P/B"] = safe_div(price, safe_div(eq_l, sh)) if sh else np.nan
-    out["P/C"] = safe_div(price, safe_div(cash_l, sh)) if sh else np.nan
+    # --- Price / capital multiples: NaN only when the economic base is non-positive (not merely "negative is ugly") ---
+    # P/B, Debt/Eq, LT Debt/Eq, ROE: when totalStockholdersEquity <= 0, book value is not a stable positive scale;
+    # ratios flip sign and magnitude in ways that are not comparable to healthy-capital peers, so we mark structural NaN.
+    # (Negative ROA / margins / revenue-based returns on positive denominators stay finite: they encode real underperformance.)
+    out["P/B"] = np.nan
+    out["P/B Valid Base"] = np.nan
+    book_ps = out["Book/sh"]
+    sh_ok = (
+        sh is not None
+        and not (isinstance(sh, float) and np.isnan(sh))
+        and float(sh) > 0
+    )
+    if sh_ok:
+        if book_ps is not None and not (isinstance(book_ps, float) and np.isnan(book_ps)):
+            if float(book_ps) <= 0:
+                out["P/B Valid Base"] = 0.0
+            else:
+                out["P/B Valid Base"] = 1.0
+                if price is not None and not (isinstance(price, float) and np.isnan(price)):
+                    out["P/B"] = float(price) / float(book_ps)
+    out["P/S"] = np.nan
+    out["P/S Valid Base"] = np.nan
+    if (
+        row_ttm
+        and sh_ok
+        and rev_ttm is not None
+        and not (isinstance(rev_ttm, float) and np.isnan(rev_ttm))
+    ):
+        rv = float(rev_ttm)
+        if rv <= 0:
+            out["P/S Valid Base"] = 0.0
+        else:
+            out["P/S Valid Base"] = 1.0
+            if price is not None and not (isinstance(price, float) and np.isnan(price)):
+                out["P/S"] = float(price) / (rv / float(sh))
+    out["P/C"] = safe_div(price, safe_div(cash_l, sh)) if sh_ok else np.nan
     # P/FCF: require positive TTM FCF and positive shares; negative FCF => NaN (not a valid multiple).
     out["P/FCF"] = np.nan
     if (
@@ -2466,15 +2545,50 @@ def build_financial_indicators(
     out["EV/EBITDA (Reported)"] = (
         float(ev) / float(ebitda_reported_ttm) if (row_ttm and ev_pos and ebitda_rep_ok) else np.nan
     )
-    out["EV/Sales"] = safe_div(ev, rev_ttm) if row_ttm and ev is not None else np.nan
+    out["EV/Sales"] = np.nan
+    out["EV/Sales Valid Base"] = np.nan
+    if row_ttm and rev_ttm is not None and not (isinstance(rev_ttm, float) and np.isnan(rev_ttm)):
+        if ev is None or (isinstance(ev, float) and np.isnan(ev)):
+            out["EV/Sales Valid Base"] = np.nan
+        else:
+            rv = float(rev_ttm)
+            if rv <= 0:
+                out["EV/Sales Valid Base"] = 0.0
+            else:
+                out["EV/Sales Valid Base"] = 1.0
+                out["EV/Sales"] = float(ev) / rv
 
     out["Quick Ratio"] = safe_div(cash_l + rec_l, cl_l) if cl_l else np.nan
     out["Current Ratio"] = safe_div(ca_l, cl_l) if cl_l else np.nan
-    out["Debt/Eq"] = safe_div(debt_l, eq_l) if eq_l else np.nan
-    out["LT Debt/Eq"] = safe_div(ltd_l, eq_l) if eq_l else np.nan
+    out["Debt/Eq"] = np.nan
+    out["LT Debt/Eq"] = np.nan
+    out["Debt/Eq Valid Base"] = np.nan
+    out["LT Debt/Eq Valid Base"] = np.nan
+    if eq_l is not None and not (isinstance(eq_l, float) and np.isnan(eq_l)):
+        eqv = float(eq_l)
+        if eqv <= 0:
+            out["Debt/Eq Valid Base"] = 0.0
+            out["LT Debt/Eq Valid Base"] = 0.0
+        else:
+            out["Debt/Eq Valid Base"] = 1.0
+            out["LT Debt/Eq Valid Base"] = 1.0
+            if debt_l is not None and not (isinstance(debt_l, float) and np.isnan(debt_l)):
+                out["Debt/Eq"] = float(debt_l) / eqv
+            if ltd_l is not None and not (isinstance(ltd_l, float) and np.isnan(ltd_l)):
+                out["LT Debt/Eq"] = float(ltd_l) / eqv
 
+    # ROA / margins: negative numerators on positive revenue or assets remain valid (losses, not broken bases).
     out["ROA"] = safe_div(ni_ttm, ta_l) if row_ttm and ta_l else np.nan
-    out["ROE"] = safe_div(ni_ttm, eq_l) if row_ttm and eq_l else np.nan
+    out["ROE"] = np.nan
+    out["ROE Valid Base"] = np.nan
+    if row_ttm and eq_l is not None and not (isinstance(eq_l, float) and np.isnan(eq_l)):
+        eqv = float(eq_l)
+        if eqv <= 0:
+            out["ROE Valid Base"] = 0.0
+        else:
+            out["ROE Valid Base"] = 1.0
+            if ni_ttm is not None and not (isinstance(ni_ttm, float) and np.isnan(ni_ttm)):
+                out["ROE"] = float(ni_ttm) / eqv
 
     # ROIC = NOPAT_TTM / average operating invested capital (excess cash only + denominator floor; see compute_operating_invested_capital).
     # Denominator: mean(latest quarter IC, prior quarter IC) when both exist; else latest only. TTM revenue drives buffer for both.
@@ -2573,6 +2687,8 @@ def build_financial_indicators(
             out["ROIC Calc Source"] = roic_src
 
     # Finviz: margins from TTM (grossProfit_ttm/revenue_ttm etc.); fallback to latest quarter
+    # Gross / operating / profit margins: negative values on positive revenue remain interpretable (margin compression
+    # or losses); do not strip them to NaN the way we do for equity-scaled valuation multiples.
     out["Gross Margin"] = safe_div(gp_ttm, rev_ttm) if row_ttm else (safe_div(gp_l, rev_l) if rev_l else np.nan)
     out["Oper. Margin"] = safe_div(oi_ttm, rev_ttm) if row_ttm else (safe_div(oi_l, rev_l) if rev_l else np.nan)
     out["Profit Margin"] = safe_div(ni_ttm, rev_ttm) if row_ttm else (safe_div(ni_l, rev_l) if rev_l else np.nan)
@@ -2961,6 +3077,18 @@ OUTPUT_COLUMNS = [
     # PIT diagnostics (appended to avoid downstream schema breakage).
     "financials_public_date_source",
     "financials_used_fiscaldate_fallback",
+    # Structural ratio / base diagnostics (appended after PIT block).
+    "Equity Latest",
+    "Interest Expense Ref",
+    "OCF/NI Denominator NI",
+    "P/B Valid Base",
+    "P/S Valid Base",
+    "EV/Sales Valid Base",
+    "ROE Valid Base",
+    "Debt/Eq Valid Base",
+    "LT Debt/Eq Valid Base",
+    "Interest Coverage Valid Base",
+    "EPS This Y Valid Base",
 ]
 
 # Unique key for snapshot accumulation: (asOfDate, symbol).
@@ -3598,8 +3726,8 @@ def main() -> None:
             # PIT financial factors derived from eligible quarterly pool.
             revenue_yoy_val = get_revenue_yoy_at(sym, as_of, fin_sym_df)
             ocf_yoy_val = get_ocf_yoy_at(sym, as_of, fin_sym_df)
-            ocf_ni_val = get_ocf_ni_at(sym, as_of, fin_sym_df)
-            interest_coverage_val = get_interest_coverage_at(
+            ocf_ni_val, ocf_ni_denominator_ni, _ = pit_ocf_ni_compute(sym, as_of, fin_sym_df)
+            interest_coverage_val, interest_expense_ref, interest_coverage_valid_base = pit_interest_coverage_compute(
                 sym, as_of, fin_sym_df, interest_col=interest_col
             )
             opm_volatility_val = get_opm_volatility_at(sym, as_of, fin_sym_df)
@@ -3663,6 +3791,9 @@ def main() -> None:
                     gr5_pct = np.nan
 
             fin_inds = build_financial_indicators(row_latest, row_ttm, shares_out, price, row_prev_quarter=row_prev)
+            fin_inds["OCF/NI Denominator NI"] = ocf_ni_denominator_ni
+            fin_inds["Interest Expense Ref"] = interest_expense_ref
+            fin_inds["Interest Coverage Valid Base"] = interest_coverage_valid_base
 
             # Debug-only: print minimal factor row evidence around EV/EBITDA.
             try:
@@ -3780,6 +3911,8 @@ def main() -> None:
                 g_fwd = (float(eps_next_y_est) / float(eps_this_y_est)) - 1.0
 
             # EPS This Y (factor) = implied growth vs prior fiscal year actual (TTM near prior FY-end).
+            # Structural NaN: only when EPS This Y Base Actual (prior FY TTM EPS) is <= 0 — same multiple logic as P/B
+            # (non-positive base breaks ratio interpretation). Negative forward estimate also -> invalid_nonpositive_base.
             eps_this_y_calc_source = "missing_estimate"
             eps_this_y_growth = np.nan
             has_est = eps_this_y_est is not None and not (isinstance(eps_this_y_est, float) and np.isnan(eps_this_y_est))
@@ -3804,6 +3937,16 @@ def main() -> None:
                 except (TypeError, ValueError, ZeroDivisionError):
                     eps_this_y_growth = np.nan
                     eps_this_y_calc_source = "missing_prior_actual"
+
+            eps_this_y_valid_base = np.nan
+            if prior_actual_eps is not None:
+                if float(prior_actual_eps) <= 0:
+                    eps_this_y_valid_base = 0.0
+                elif eps_this_y_calc_source == "invalid_nonpositive_base":
+                    eps_this_y_valid_base = 0.0
+                elif eps_this_y_calc_source == "derived_from_estimate_and_prior_actual":
+                    eps_this_y_valid_base = 1.0
+            fin_inds["EPS This Y Valid Base"] = eps_this_y_valid_base
 
             # Historical EPS CAGR (5Y with 3Y fallback) from EPS(TTM) time series
             g_hist = np.nan
@@ -4135,6 +4278,11 @@ def main() -> None:
             financials_fallback_max_ratio,
         )
 
+    _log_structural_factor_build_population_diagnostics(out_df)
+    from score_primitives import log_structural_missing_build_diagnostics
+
+    log_structural_missing_build_diagnostics(out_df, log=log)
+
     violations_df = validate_pit_leakage_rows(out_df, mode=leakage_validation_mode)
     if mode in {"backfill", "snapshot"} and as_of_dates_schedule:
         log_backfill_diagnostic_samples(out_df, as_of_dates=as_of_dates_schedule, sample_size=5)
@@ -4337,6 +4485,75 @@ def main() -> None:
         fb_out.to_parquet(fb_path_pq, index=False)
         fb_out.to_csv(fb_path_csv, index=False, encoding="utf-8-sig")
         log.info("Wrote financials fallback rows diagnostics: %s and %s (rows=%s)", fb_path_pq, fb_path_csv, len(fb_out))
+
+
+def _log_structural_factor_build_population_diagnostics(df: pd.DataFrame) -> None:
+    """
+    Info-level counts: structural bases (equity/book/sales/interest ref/EPS base) and,
+    within those regimes, how often the corresponding factor is NaN (aligns with build-time guards).
+    """
+    if df is None or df.empty:
+        log.info("[structural build] empty dataframe; skip population diagnostics")
+        return
+
+    n_total = len(df)
+
+    def s(name: str) -> pd.Series:
+        if name not in df.columns:
+            return pd.Series(np.nan, index=df.index, dtype=float)
+        return pd.to_numeric(df[name], errors="coerce")
+
+    eq = s("Equity Latest")
+    book = s("Book/sh")
+    sales = s("Sales (Rev)")
+    int_ref = s("Interest Expense Ref")
+    eps_base = s("EPS This Y Base Actual")
+
+    m_eq = eq.notna() & (eq <= 0)
+    m_book = book.notna() & (book <= 0)
+    m_sales = sales.notna() & (sales <= 0)
+    m_int = int_ref.notna() & (int_ref <= 0)
+    m_epsb = eps_base.notna() & (eps_base <= 0)
+
+    log.info("[structural build] rows with Equity Latest<=0: %s / %s", int(m_eq.sum()), n_total)
+    log.info("[structural build] rows with Book/sh<=0: %s / %s", int(m_book.sum()), n_total)
+    log.info("[structural build] rows with Sales (Rev)<=0: %s / %s", int(m_sales.sum()), n_total)
+    log.info("[structural build] rows with Interest Expense Ref<=0: %s / %s", int(m_int.sum()), n_total)
+    log.info("[structural build] rows with EPS This Y Base Actual<=0: %s / %s", int(m_epsb.sum()), n_total)
+
+    pb, roe, de, ltd, ps, evs, icov, eps_ty = (
+        s("P/B"),
+        s("ROE"),
+        s("Debt/Eq"),
+        s("LT Debt/Eq"),
+        s("P/S"),
+        s("EV/Sales"),
+        s("Interest Coverage"),
+        s("EPS This Y"),
+    )
+
+    nb = int(m_book.sum())
+    ne = int(m_eq.sum())
+    ns = int(m_sales.sum())
+    ni = int(m_int.sum())
+    nx = int(m_epsb.sum())
+
+    log.info("[structural build] P/B isna among Book/sh<=0: %s / %s", int((m_book & pb.isna()).sum()), nb)
+    log.info("[structural build] ROE isna among Equity Latest<=0: %s / %s", int((m_eq & roe.isna()).sum()), ne)
+    log.info("[structural build] Debt/Eq isna among Equity Latest<=0: %s / %s", int((m_eq & de.isna()).sum()), ne)
+    log.info("[structural build] LT Debt/Eq isna among Equity Latest<=0: %s / %s", int((m_eq & ltd.isna()).sum()), ne)
+    log.info("[structural build] P/S isna among Sales (Rev)<=0: %s / %s", int((m_sales & ps.isna()).sum()), ns)
+    log.info("[structural build] EV/Sales isna among Sales (Rev)<=0: %s / %s", int((m_sales & evs.isna()).sum()), ns)
+    log.info(
+        "[structural build] Interest Coverage isna among Interest Expense Ref<=0: %s / %s",
+        int((m_int & icov.isna()).sum()),
+        ni,
+    )
+    log.info(
+        "[structural build] EPS This Y isna among EPS This Y Base Actual<=0: %s / %s",
+        int((m_epsb & eps_ty.isna()).sum()),
+        nx,
+    )
 
 
 if __name__ == "__main__":

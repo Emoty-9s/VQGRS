@@ -21,7 +21,7 @@ from score_factor_config import GROUP_BASE_WEIGHTS, FACTOR_SPECS
 from score_primitives import evidence_to_score
 
 GROUP_TYPES = ["A", "B", "C", "D", "E"]
-AGGREGATION_MODEL_VERSION = "factor_agg_conf_weight_v1"
+AGGREGATION_MODEL_VERSION = "factor_agg_conf_weight_v2"
 
 # From group_factor_scores (score_one_factor_one_group); carried through aggregation when present.
 HYBRID_TRANSPARENCY_COLS: tuple[str, ...] = (
@@ -41,6 +41,80 @@ def _row_is_valid_for_aggregate(series: pd.Series) -> bool:
     if pd.isna(conf) or float(conf) <= 0.0:
         return False
     return True
+
+
+def _structural_missing_mask(df: pd.DataFrame) -> pd.Series:
+    """Row is structurally missing (no meaningful factor value); uses new columns or legacy fields."""
+    idx = df.index
+    base = pd.Series(False, index=idx)
+    if "structural_missing_flag" in df.columns:
+        col = df["structural_missing_flag"]
+        if getattr(col.dtype, "name", str(col.dtype)) == "bool":
+            base = base | col.fillna(False).astype(bool)
+        else:
+            v = pd.to_numeric(col, errors="coerce")
+            base = base | v.fillna(0.0).astype(bool)
+    if "missing_class" in df.columns:
+        mc = df["missing_class"].astype(str).str.strip().str.lower()
+        base = base | (mc == "structural")
+    if "evidence_source" in df.columns:
+        es = df["evidence_source"].astype(str).str.strip().str.lower()
+        base = base | es.eq("structural_skip")
+    if "missing_reason" in df.columns:
+        mr = df["missing_reason"].astype(str).str.strip().str.lower()
+        base = base | mr.eq("structural_missing")
+    return base
+
+
+def _incidental_missing_mask(df: pd.DataFrame, valid: pd.Series, structural: pd.Series) -> pd.Series:
+    """Non-structural rows that do not contribute valid weighted evidence."""
+    eligible = ~valid & ~structural
+    if "incidental_missing_flag" in df.columns:
+        inc_b = pd.to_numeric(df["incidental_missing_flag"], errors="coerce").fillna(1.0) != 0.0
+        return eligible & inc_b
+    if "missing_class" in df.columns:
+        mc = df["missing_class"].astype(str).str.strip().str.lower()
+        return eligible & mc.eq("incidental")
+    return eligible
+
+
+def _final_factor_source(og: pd.Series, sm: pd.Series, im: pd.Series) -> pd.Series:
+    ogv = np.asarray(og, dtype=np.int64)
+    smv = np.asarray(sm, dtype=np.int64)
+    imv = np.asarray(im, dtype=np.int64)
+    msum = smv + imv
+    result = np.full(len(ogv), "missing_incidental", dtype=object)
+    result[(ogv >= 1) & (msum == 0)] = "observed"
+    result[(ogv >= 1) & (msum > 0)] = "observed_partial"
+    result[(ogv == 0) & (smv > 0) & (imv == 0)] = "missing_structural"
+    result[(ogv == 0) & (imv > 0)] = "missing_incidental"
+    return pd.Series(result, index=og.index, dtype=object)
+
+
+def _factor_missing_class(og: pd.Series, sm: pd.Series, im: pd.Series) -> pd.Series:
+    ogv = np.asarray(og, dtype=np.int64)
+    smv = np.asarray(sm, dtype=np.int64)
+    imv = np.asarray(im, dtype=np.int64)
+    msum = smv + imv
+    result = np.full(len(ogv), "incidental_only", dtype=object)
+    result[(ogv >= 1) & (msum == 0)] = "observed_only"
+    result[(ogv >= 1) & (msum > 0)] = "partial_observed"
+    result[(ogv == 0) & (smv > 0) & (imv == 0)] = "structural_only"
+    result[(ogv == 0) & (imv > 0) & (smv == 0)] = "incidental_only"
+    result[(ogv == 0) & (smv > 0) & (imv > 0)] = "mixed_missing"
+    return pd.Series(result, index=og.index, dtype=object)
+
+
+def _evidence_to_score_or_nan(x: Any) -> float:
+    if x is None:
+        return float(np.nan)
+    try:
+        if pd.isna(x):
+            return float(np.nan)
+    except (ValueError, TypeError):
+        return float(np.nan)
+    s = evidence_to_score(float(x))
+    return float(np.nan) if s is None else float(s)
 
 
 def _read_df(path: Path) -> pd.DataFrame:
@@ -103,6 +177,13 @@ def _aggregate_symbol_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     valid_mask = df.apply(_row_is_valid_for_aggregate, axis=1)
+    raw_structural = _structural_missing_mask(df)
+    incidental_mask = _incidental_missing_mask(df, valid_mask, raw_structural)
+    structural_for_count = raw_structural & ~valid_mask
+    uncounted_missing = ~valid_mask & ~structural_for_count & ~incidental_mask
+    df["_observed_int"] = valid_mask.astype(np.int64)
+    df["_structural_int"] = structural_for_count.astype(np.int64)
+    df["_incidental_int"] = (incidental_mask | uncounted_missing).astype(np.int64)
 
     df["category_valid"] = df["category"].where(valid_mask, other=pd.NA)
     df["confidence_valid"] = df["confidence"].where(valid_mask, other=pd.NA)
@@ -128,6 +209,9 @@ def _aggregate_symbol_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
         "category_valid": "first",
         "confidence_valid": "mean",
         "prior_evidence_factor": "first",
+        "_observed_int": "sum",
+        "_structural_int": "sum",
+        "_incidental_int": "sum",
     }
     for c in HYBRID_TRANSPARENCY_COLS:
         if c not in df.columns:
@@ -144,6 +228,13 @@ def _aggregate_symbol_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
         agg_spec[f"group_confidence_{g}"] = "mean"
 
     grouped = df.groupby(key_cols, dropna=False, as_index=False).agg(agg_spec)
+    grouped = grouped.rename(
+        columns={
+            "_observed_int": "observed_group_count",
+            "_structural_int": "structural_missing_group_count",
+            "_incidental_int": "incidental_missing_group_count",
+        }
+    )
 
     weight_sum = None
     for g in GROUP_TYPES:
@@ -169,7 +260,9 @@ def _aggregate_symbol_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
     for g in GROUP_TYPES:
         s_col = f"group_evidence_{g}"
         w_col = f"weight_{g}"
-        term = grouped[s_col].fillna(0.0).astype(float) * grouped[w_col].astype(float)
+        w_part = grouped[w_col].astype(float)
+        s_part = grouped[s_col].astype(float)
+        term = np.where(w_part > 0.0, s_part * w_part, 0.0).astype(float)
         num = term if num is None else (num + term)
 
     tw = grouped["total_effective_weight"].astype(float)
@@ -194,16 +287,14 @@ def _aggregate_symbol_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
     grouped["confidence_min"] = conf_frame.min(axis=1, skipna=True).fillna(0.0).astype(float)
 
     grouped["prior_evidence"] = pd.to_numeric(grouped["prior_evidence_factor"], errors="coerce").fillna(0.0).astype(float)
-    grouped["final_factor_evidence"] = np.where(
-        has_weight,
-        grouped["raw_observed_factor_evidence"].astype(float),
-        0.0,
-    ).astype(float)
-    grouped["final_factor_score"] = grouped["final_factor_evidence"].map(
-        lambda x: evidence_to_score(float(x)) if pd.notna(x) else 50.0
-    )
+    grouped["final_factor_evidence"] = grouped["raw_observed_factor_evidence"].where(has_weight, np.nan)
+    grouped["final_factor_score"] = grouped["final_factor_evidence"].map(_evidence_to_score_or_nan).astype(float)
 
-    grouped["factor_source"] = np.where(grouped["valid_group_count"] >= 1, "observed", "neutral")
+    og = pd.to_numeric(grouped["observed_group_count"], errors="coerce").fillna(0).astype(np.int64)
+    sm = pd.to_numeric(grouped["structural_missing_group_count"], errors="coerce").fillna(0).astype(np.int64)
+    im = pd.to_numeric(grouped["incidental_missing_group_count"], errors="coerce").fillna(0).astype(np.int64)
+    grouped["factor_source"] = _final_factor_source(og, sm, im)
+    grouped["factor_missing_class"] = _factor_missing_class(og, sm, im)
 
     grouped["category"] = grouped["category_valid"]
     grouped = grouped.drop(columns=["category_valid"], errors="ignore")
@@ -220,6 +311,10 @@ def _aggregate_symbol_factor_scores(df: pd.DataFrame) -> pd.DataFrame:
         "factor_name",
         "category",
         "factor_source",
+        "factor_missing_class",
+        "observed_group_count",
+        "structural_missing_group_count",
+        "incidental_missing_group_count",
         "raw_observed_factor_evidence",
         "prior_evidence",
         "donor_evidence",
@@ -305,6 +400,36 @@ def main(input_dir: str | Path = "output", output_dir: str | Path = "output/scor
 
     print(f"Input rows: {len(df)} | Aggregated rows: {len(scores_df)}")
     print(f"Factor coverage (computed/expected): {len(have_factors)}/{len(expected_factors)} = {factor_coverage:.2%}")
+
+    if len(scores_df) > 0 and "factor_source" in scores_df.columns:
+        print("Missing / provenance summary — factor_source:")
+        vc_src = scores_df["factor_source"].value_counts(dropna=False)
+        for k, v in vc_src.items():
+            print(f"  {k}: {int(v)}")
+    if len(scores_df) > 0 and "factor_missing_class" in scores_df.columns:
+        print("Missing / provenance summary — factor_missing_class:")
+        vc_mc = scores_df["factor_missing_class"].value_counts(dropna=False)
+        for k, v in vc_mc.items():
+            print(f"  {k}: {int(v)}")
+
+    if len(scores_df) > 0:
+        print("Diagnostic — factor aggregation (missing must not become neutral score 50):")
+        if "factor_source" in scores_df.columns:
+            print("  factor_source value_counts:")
+            print(scores_df["factor_source"].value_counts(dropna=False).to_string())
+        ev = pd.to_numeric(scores_df.get("final_factor_evidence"), errors="coerce")
+        fs = pd.to_numeric(scores_df.get("final_factor_score"), errors="coerce")
+        print(f"  final_factor_evidence isna mean: {ev.isna().mean():.6f}")
+        miss_ev = ev.isna()
+        bad_50 = miss_ev & fs.notna() & (np.abs(fs - 50.0) < 1e-6)
+        n_bad = int(bad_50.sum())
+        if n_bad > 0:
+            print(
+                f"  WARNING: rows with missing final_factor_evidence but final_factor_score==50: {n_bad} "
+                "(expected 0)"
+            )
+        else:
+            print("  OK: no rows with missing final_factor_evidence and final_factor_score==50")
 
     parquet_out = out_dir / "symbol_factor_scores_latest.parquet"
     csv_out = out_dir / "symbol_factor_scores_latest.csv"

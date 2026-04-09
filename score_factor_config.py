@@ -272,6 +272,9 @@ MAIN_AUX_WEIGHT_POLICY = {
 }
 
 # Canonical mains per category; all other factors in CATEGORY_TO_FACTORS for that category are aux.
+# ROE and Debt/Eq remain listed as mains for layout / weighting, but when the issuer is in a structural-invalid
+# regime (e.g. nonpositive equity), build_factors_latest leaves the raw factor as NaN and scoring treats that as
+# structural_skip—not a neutral “missing donor” and not good/bad—because the ratio is not economically interpretable.
 MAIN_FACTORS_BY_CATEGORY: dict[str, list[str]] = {
     "V": ["P/E", "EV/EBITDA", "P/S"],
     "Q": ["ROIC", "Oper. Margin", "ROE"],
@@ -331,6 +334,7 @@ FACTOR_SPECS: dict[str, FactorSpec] = {}
 
 # V: all lower_better, core, log-scale
 for n in _V_FACTORS:
+    _notes: str | None = None
     if n == "P/E":
         _mp, _smr = "structural_skip", "pe_nonpositive_eps"
     elif n == "PEG":
@@ -341,6 +345,13 @@ for n in _V_FACTORS:
         _mp, _smr = "structural_skip", "pfcf_nonpositive_or_invalid"
     elif n == "EV/EBITDA":
         _mp, _smr = "structural_skip", "ev_ebitda_nonpositive_or_invalid"
+    elif n == "P/B":
+        _mp, _smr = "structural_skip", "pb_nonpositive_book_value"
+        _notes = "Negative or zero book value makes P/B economically non-interpretable."
+    elif n == "P/S":
+        _mp, _smr = "structural_skip", "ps_nonpositive_sales"
+    elif n == "EV/Sales":
+        _mp, _smr = "structural_skip", "ev_sales_nonpositive_sales"
     else:
         _mp, _smr = "donor_shrink", None
     FACTOR_SPECS[n] = _spec(
@@ -352,7 +363,7 @@ for n in _V_FACTORS:
         enabled=True,
         use_log_scale=n in {"P/E", "P/S", "EV/EBITDA", "EV/Sales", "P/B", "P/FCF", "Forward P/E", "PEG"},
         neutral_on_missing=True,
-        notes=None,
+        notes=_notes,
         missing_policy=_mp,
         structural_missing_rule=_smr,
     )
@@ -391,6 +402,36 @@ for n in _Q_FACTORS:
             ),
             missing_policy="structural_skip",
             structural_missing_rule="roic_invalid_invested_capital",
+        )
+    elif n == "ROE":
+        FACTOR_SPECS[n] = _spec(
+            name=n,
+            category="Q",
+            direction="higher_better",
+            tier="core",
+            weight=_CORE_W,
+            enabled=True,
+            use_log_scale=False,
+            neutral_on_missing=True,
+            notes=(
+                "ROE with nonpositive equity is structurally invalid; negative ROE with positive equity remains observed."
+            ),
+            missing_policy="structural_skip",
+            structural_missing_rule="roe_nonpositive_equity",
+        )
+    elif n == "OCF/NI":
+        FACTOR_SPECS[n] = _spec(
+            name=n,
+            category="Q",
+            direction="higher_better",
+            tier="core",
+            weight=_CORE_W,
+            enabled=True,
+            use_log_scale=False,
+            neutral_on_missing=True,
+            notes="OCF/NI is only meaningful when denominator NI is positive.",
+            missing_policy="structural_skip",
+            structural_missing_rule="ocfni_nonpositive_net_income",
         )
     else:
         FACTOR_SPECS[n] = _spec(
@@ -440,6 +481,20 @@ for n in _G_FACTORS:
             missing_policy="structural_skip",
             structural_missing_rule="eps_yoy_nonpositive_regime",
         )
+    elif n == "EPS This Y":
+        FACTOR_SPECS[n] = _spec(
+            name=n,
+            category="G",
+            direction="higher_better",
+            tier="core",
+            weight=_CORE_W,
+            enabled=True,
+            use_log_scale=False,
+            neutral_on_missing=True,
+            notes="Growth rate requires positive base actual EPS.",
+            missing_policy="structural_skip",
+            structural_missing_rule="eps_this_y_nonpositive_base_actual",
+        )
     else:
         FACTOR_SPECS[n] = _spec(
             name=n,
@@ -455,7 +510,7 @@ for n in _G_FACTORS:
 
 # R: mixed directions, aux for Cash/sh + Shs Outstand
 for n in _R_FACTORS:
-    if n in {"Debt/Eq", "LT Debt/Eq"}:
+    if n == "Debt/Eq":
         FACTOR_SPECS[n] = _spec(
             name=n,
             category="R",
@@ -465,8 +520,23 @@ for n in _R_FACTORS:
             enabled=True,
             use_log_scale=False,
             neutral_on_missing=True,
+            missing_policy="structural_skip",
+            structural_missing_rule="de_ratio_nonpositive_equity",
         )
-    elif n in {"Quick Ratio", "Current Ratio", "Interest Coverage"}:
+    elif n == "LT Debt/Eq":
+        FACTOR_SPECS[n] = _spec(
+            name=n,
+            category="R",
+            direction="lower_better",
+            tier="core",
+            weight=_CORE_W,
+            enabled=True,
+            use_log_scale=False,
+            neutral_on_missing=True,
+            missing_policy="structural_skip",
+            structural_missing_rule="lt_de_ratio_nonpositive_equity",
+        )
+    elif n in {"Quick Ratio", "Current Ratio"}:
         # Liquidity / coverage ratios are highly skewed; log-scale relative scoring compresses extremes.
         # This reduces outsized advantage from cash-heavy pre-revenue names vs typical operating balance sheets.
         FACTOR_SPECS[n] = _spec(
@@ -478,6 +548,19 @@ for n in _R_FACTORS:
             enabled=True,
             use_log_scale=True,
             neutral_on_missing=True,
+        )
+    elif n == "Interest Coverage":
+        FACTOR_SPECS[n] = _spec(
+            name=n,
+            category="R",
+            direction="higher_better",
+            tier="core",
+            weight=_CORE_W,
+            enabled=True,
+            use_log_scale=True,
+            neutral_on_missing=True,
+            missing_policy="structural_skip",
+            structural_missing_rule="interest_coverage_nonpositive_interest_expense",
         )
     elif n == "Cash/sh":
         # Cash/sh is also listed under Q; this spec matches the Q aux rule.
